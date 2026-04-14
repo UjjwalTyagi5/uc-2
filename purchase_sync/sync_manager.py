@@ -69,7 +69,11 @@ class PurchaseSyncManager(BaseSyncManager):
 
     def sync_single_table(self, etl_id: int, source_table: str, target_table: str, sync_hours: int):
         sync_time = datetime.now()
+        staging_table = self._get_staging_name(target_table)
         logger.info(f"Syncing '{source_table}' → '{target_table}' (ETLId={etl_id})")
+
+        # Clean up any leftover staging table from a previous failed run
+        self._drop_table_if_exists(staging_table)
 
         try:
             # Get total source row count upfront for progress reporting
@@ -82,16 +86,18 @@ class PurchaseSyncManager(BaseSyncManager):
                 self.conn.commit()
                 return
 
-            # TRUNCATE once at the start — guarantees no duplicate rows
-            self.truncate_table(target_table)
+            # Step 1 — create staging table with same schema as target (empty)
+            self._create_staging_table(target_table, staging_table)
             self.conn.commit()
+            logger.info(f"  Created staging table '{staging_table}'")
 
             total_rows = 0
             insert_sql = None
 
+            # Step 2 — stream ALL batches into staging (no commit between batches)
             for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
                 if insert_sql is None:
-                    insert_sql = self._build_insert_sql(target_table, columns)
+                    insert_sql = self._build_insert_sql(staging_table, columns)
                     self.cursor.fast_executemany = True
 
                 # Compute actual max string length per column in this batch.
@@ -109,26 +115,70 @@ class PurchaseSyncManager(BaseSyncManager):
                 self.cursor.setinputsizes(input_sizes)
 
                 self.cursor.executemany(insert_sql, batch_rows)
-                self.conn.commit()
+                # No commit here — keep everything in the transaction
                 total_rows += len(batch_rows)
                 pct = (total_rows / total_source * 100) if total_source else 0
-                logger.info(f"  '{target_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
+                logger.info(f"  '{staging_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
 
-            logger.info(f"Synced {total_rows} rows into '{target_table}'")
+            # Step 3 — all batches loaded into staging successfully.
+            # Now atomically swap: TRUNCATE target + copy from staging in ONE commit.
+            logger.info(f"  All {total_rows:,} rows in staging — swapping into '{target_table}'...")
+            self.truncate_table(target_table)
+            quoted_target = _quote_table(target_table)
+            quoted_staging = _quote_table(staging_table)
+            self.execute_query(f"INSERT INTO {quoted_target} SELECT * FROM {quoted_staging}")
             self._log_sync_status(etl_id, sync_time, "SUCCESS", total_rows, None)
+            self.conn.commit()  # single commit: staging insert + truncate + copy + status log
+            logger.info(f"  Synced {total_rows:,} rows into '{target_table}' — committed.")
+
+            # Step 4 — drop staging (cleanup; not part of data transaction)
+            self._drop_table_if_exists(staging_table)
             self.conn.commit()
 
         except Exception as e:
             self.conn.rollback()
+            # Drop staging so it doesn't block the next run
+            try:
+                self._drop_table_if_exists(staging_table)
+                self.conn.commit()
+            except Exception:
+                pass
+
             error_msg = (repr(e) or str(e) or "unknown error").replace("\n", " ")[:500]
             logger.error(f"Error syncing '{source_table}' → '{target_table}': {error_msg}")
             logger.error(traceback.format_exc())
+            logger.warning(f"  Target table '{target_table}' was NOT truncated — old data is intact.")
             try:
                 self._log_sync_status(etl_id, sync_time, "FAILED", 0, error_msg)
                 self.conn.commit()
             except Exception as log_err:
                 self.conn.rollback()
                 logger.critical(f"Failed to write error status for ETLId={etl_id}: {log_err}")
+
+    def _get_staging_name(self, table_name: str) -> str:
+        """Returns staging table name, preserving schema if present.
+        e.g. 'dbo.purchase_req_mst' → 'dbo.purchase_req_mst_staging'
+             'purchase_req_mst'      → 'purchase_req_mst_staging'
+        """
+        if "." in table_name:
+            schema, name = table_name.rsplit(".", 1)
+            return f"{schema}.{name}_staging"
+        return f"{table_name}_staging"
+
+    def _create_staging_table(self, source_table: str, staging_table: str):
+        """Creates an empty staging table mirroring the target table's schema."""
+        quoted_source = _quote_table(source_table)
+        quoted_staging = _quote_table(staging_table)
+        self.execute_query(f"SELECT TOP 0 * INTO {quoted_staging} FROM {quoted_source}")
+
+    def _drop_table_if_exists(self, table_name: str):
+        """Drops a table only if it exists (safe to call even if absent)."""
+        quoted = _quote_table(table_name)
+        # OBJECT_ID with 'U' checks for user tables only
+        self.execute_query(
+            f"IF OBJECT_ID(N'{table_name.replace(chr(39), chr(39)+chr(39))}', N'U') IS NOT NULL "
+            f"DROP TABLE {quoted}"
+        )
 
     def _build_insert_sql(self, table_name: str, columns: list) -> str:
         col_list = ", ".join(f"[{col}]" for col in columns)
