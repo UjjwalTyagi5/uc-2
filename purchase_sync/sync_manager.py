@@ -81,7 +81,7 @@ class PurchaseSyncManager(BaseSyncManager):
             self.truncate_table(target_table)
 
             insert_sql = self._build_insert_sql(target_table, columns)
-            self.cursor.fast_executemany = True
+            self.cursor.fast_executemany = False
             self.cursor.executemany(insert_sql, rows)
             self.conn.commit()
 
@@ -108,13 +108,18 @@ class PurchaseSyncManager(BaseSyncManager):
 
     def _toggle_fk_constraints(self, table_name: str, enable: bool):
         quoted = _quote_table(table_name)
-        if enable:
-            self.execute_query(f"ALTER TABLE {quoted} WITH CHECK CHECK CONSTRAINT ALL")
-            logger.info(f"Re-enabled FK constraints on '{table_name}'")
-        else:
-            self.execute_query(f"ALTER TABLE {quoted} NOCHECK CONSTRAINT ALL")
-            logger.info(f"Disabled FK constraints on '{table_name}'")
-        self.conn.commit()
+        action = "WITH CHECK CHECK CONSTRAINT ALL" if enable else "NOCHECK CONSTRAINT ALL"
+        label = "Re-enabled" if enable else "Disabled"
+        try:
+            self.execute_query(f"ALTER TABLE {quoted} {action}")
+            self.conn.commit()
+            logger.info(f"{label} FK constraints on '{table_name}'")
+        except Exception as e:
+            self.conn.rollback()
+            logger.warning(
+                f"Could not toggle FK constraints on '{table_name}' (skipping — "
+                f"no FK constraints defined or insufficient permissions): {e}"
+            )
 
     def _log_sync_status(self, etl_id: int, sync_time: datetime,
                          status: str, record_count: int, error_msg):
