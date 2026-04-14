@@ -81,16 +81,22 @@ class PurchaseSyncManager(BaseSyncManager):
             for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(target_table, columns)
-                    # Fix fast_executemany string truncation: explicitly set max size
-                    # for all string columns so pyodbc doesn't infer from first row.
-                    # SQL_WVARCHAR with 4000 covers nvarchar(n); SQL_WLONGVARCHAR
-                    # with 1073741823 covers nvarchar(max).
-                    input_sizes = [
-                        (pyodbc.SQL_WLONGVARCHAR, 1073741823, 0) if t == str else None
-                        for t in col_types
-                    ]
-                    self.cursor.setinputsizes(input_sizes)
                     self.cursor.fast_executemany = True
+
+                # Compute actual max string length per column in this batch.
+                # Using the real max avoids OOM (from over-allocating huge buffers)
+                # and avoids truncation (buffer is sized to the actual longest value).
+                input_sizes = []
+                for i, t in enumerate(col_types):
+                    if t == str:
+                        max_len = max(
+                            (len(row[i]) for row in batch_rows if row[i] is not None),
+                            default=1
+                        )
+                        input_sizes.append((pyodbc.SQL_WVARCHAR, max_len, 0))
+                    else:
+                        input_sizes.append(None)
+                self.cursor.setinputsizes(input_sizes)
 
                 self.cursor.executemany(insert_sql, batch_rows)
                 self.conn.commit()
