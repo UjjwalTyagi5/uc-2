@@ -106,17 +106,23 @@ class PurchaseSyncManager(BaseSyncManager):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(staging_table, columns)
 
-                # Compute actual max string length per column in this batch.
-                input_sizes = []
-                for i, t in enumerate(col_types):
-                    if t == str:
-                        max_len = max(
-                            (len(row[i]) for row in batch_rows if row[i] is not None),
-                            default=1
-                        )
-                        input_sizes.append((pyodbc.SQL_WVARCHAR, max_len, 0))
-                    else:
-                        input_sizes.append(None)
+                # fast_executemany=True uses the first row to size string buffers.
+                # Swap the row with the longest strings to position 0 so pyodbc
+                # allocates the right buffer for every subsequent row.
+                # Do NOT use setinputsizes — it forces SQLParamData (slow row-by-row
+                # streaming) which takes ~39s for 100K rows and triggers Azure timeouts.
+                str_cols = [i for i, t in enumerate(col_types) if t == str]
+                if str_cols:
+                    batch_rows = list(batch_rows)
+                    widest = max(
+                        range(len(batch_rows)),
+                        key=lambda j: sum(
+                            len(batch_rows[j][i]) for i in str_cols
+                            if batch_rows[j][i] is not None
+                        ),
+                    )
+                    if widest != 0:
+                        batch_rows[0], batch_rows[widest] = batch_rows[widest], batch_rows[0]
 
                 # Retry loop — reconnects and retries the batch on transient
                 # TCP errors (e.g. Azure forcibly closes idle/long connections).
@@ -125,7 +131,6 @@ class PurchaseSyncManager(BaseSyncManager):
                     try:
                         self._ensure_connected()
                         self.cursor.fast_executemany = True
-                        self.cursor.setinputsizes(input_sizes)
                         self.cursor.executemany(insert_sql, batch_rows)
                         self.conn.commit()
                         break  # success — move to next batch
