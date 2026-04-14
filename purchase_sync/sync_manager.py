@@ -20,6 +20,14 @@ _COLUMN_EXCLUSIONS: dict[str, set[str]] = {
     "purchase_req_mst": {"priority_id", "priority_reason", "copy_req", "copy_req_id"},
 }
 
+# Optional WHERE filter per source table (case-insensitive table name match).
+# SQL fragment only — no "WHERE" keyword. Applied to both COUNT and SELECT queries.
+_TABLE_FILTERS: dict[str, str] = {
+    "purchase_req_mst":     "C_DATETIME > '2020-01-01'",
+    "purchase_req_detail":  "C_DATETIME > '2020-01-01'",
+    "purchase_attachments": "UPLOADED_ON > '2020-01-01'",
+}
+
 GET_SYNC_CONTROL_DATA = f"""
     SELECT ETLId, Source, Destination, SyncHours
     FROM {_CTRL}
@@ -138,7 +146,7 @@ class PurchaseSyncManager(BaseSyncManager):
 
     def _load_staging_parallel(self, source_table: str, staging_table: str,
                                total_source: int, insert_sql: str,
-                               columns: list) -> int:
+                               columns: list, filter_condition: str = None) -> int:
         """Loads all source rows into staging using PARALLEL_WORKERS threads.
 
         Each worker gets an exclusive row slice (by OFFSET/FETCH), opens its
@@ -170,8 +178,10 @@ class PurchaseSyncManager(BaseSyncManager):
                 try:
                     fetch_size = min(BATCH_SIZE, remaining)
                     select_cols = ", ".join(f"[{c}]" for c in columns)
+                    where_sql = f"WHERE {filter_condition} " if filter_condition else ""
                     src.cursor.execute(
                         f"SELECT {select_cols} FROM {_quote_table(source_table)} "
+                        f"{where_sql}"
                         f"ORDER BY (SELECT NULL) "
                         f"OFFSET {current_offset} ROWS FETCH NEXT {fetch_size} ROWS ONLY"
                     )
@@ -266,8 +276,13 @@ class PurchaseSyncManager(BaseSyncManager):
         self._drop_table_if_exists(staging_table)
 
         try:
+            # Resolve optional WHERE filter for this table
+            filter_condition = _TABLE_FILTERS.get(source_table.lower())
+            if filter_condition:
+                logger.info(f"  Applying filter: WHERE {filter_condition}")
+
             # Get total source row count upfront for progress reporting
-            total_source = self.source_manager.get_row_count(source_table)
+            total_source = self.source_manager.get_row_count(source_table, filter_condition)
             logger.info(f"  Source has {total_source:,} rows — batch size: {BATCH_SIZE:,}")
 
             if total_source == 0:
@@ -299,7 +314,8 @@ class PurchaseSyncManager(BaseSyncManager):
                 f"(Azure batch: {AZURE_BATCH_SIZE:,} rows each)..."
             )
             total_rows = self._load_staging_parallel(
-                source_table, staging_table, total_source, insert_sql, columns
+                source_table, staging_table, total_source, insert_sql, columns,
+                filter_condition=filter_condition
             )
 
             # Step 3 — all batches loaded into staging successfully.

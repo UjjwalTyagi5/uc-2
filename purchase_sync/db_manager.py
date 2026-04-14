@@ -44,9 +44,10 @@ class BaseSyncManager(ABC):
             pass
         self.cursor = self.conn.cursor()
 
-    def get_row_count(self, table_name: str) -> int:
-        """Returns total row count for a table."""
-        self.cursor.execute(f"SELECT COUNT(1) FROM {_quote_table(table_name)}")
+    def get_row_count(self, table_name: str, where_clause: str = None) -> int:
+        """Returns total row count for a table, with an optional WHERE filter."""
+        where_sql = f" WHERE {where_clause}" if where_clause else ""
+        self.cursor.execute(f"SELECT COUNT(1) FROM {_quote_table(table_name)}{where_sql}")
         return self.cursor.fetchone()[0]
 
     def get_columns(self, table_name: str) -> list:
