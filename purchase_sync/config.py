@@ -1,4 +1,5 @@
 import os
+import pyodbc
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -12,8 +13,31 @@ def _require_env(key: str) -> str:
     return value
 
 
-def _optional_env(key: str, default: str) -> str:
-    return os.getenv(key) or default
+def _detect_sql_driver() -> str:
+    """
+    Returns the driver from ODBC_DRIVER env var if set,
+    otherwise auto-detects the best available SQL Server ODBC driver.
+    """
+    from_env = os.getenv("ODBC_DRIVER")
+    if from_env:
+        return from_env
+
+    preferred = [
+        "ODBC Driver 18 for SQL Server",
+        "ODBC Driver 17 for SQL Server",
+        "ODBC Driver 13 for SQL Server",
+    ]
+    installed = pyodbc.drivers()
+    for driver in preferred:
+        if driver in installed:
+            logger.info(f"Auto-detected ODBC driver: {driver}")
+            return driver
+
+    raise EnvironmentError(
+        f"No SQL Server ODBC driver found on this machine.\n"
+        f"Installed drivers: {installed}\n"
+        f"Download from: https://learn.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server"
+    )
 
 
 SYNC_CONTROL_TABLE = _require_env("SYNC_CONTROL_TABLE")
@@ -30,8 +54,8 @@ class DBConfig:
         self.AZURE_DB = _require_env("AZURE_DB")
         self.AZURE_USER = _require_env("AZURE_USER")
         self.AZURE_PASS = _require_env("AZURE_PASS")
-        # Configurable driver — set ODBC_DRIVER in .env if the machine has Driver 18
-        self.ODBC_DRIVER = _optional_env("ODBC_DRIVER", "ODBC Driver 17 for SQL Server")
+        self.ODBC_DRIVER = _detect_sql_driver()
+        logger.info(f"Using ODBC driver: {self.ODBC_DRIVER}")
 
     def get_onprem_conn_str(self) -> str:
         return (
