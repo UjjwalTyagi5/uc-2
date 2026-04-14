@@ -49,24 +49,36 @@ class BaseSyncManager(ABC):
         self.cursor.execute(f"SELECT COUNT(1) FROM {_quote_table(table_name)}")
         return self.cursor.fetchone()[0]
 
-    def get_table_data_in_batches(self, table_name: str, batch_size: int = 5000):
+    def get_columns(self, table_name: str) -> list:
+        """Returns column names for a table without fetching any rows."""
+        self.cursor.execute(f"SELECT TOP 0 * FROM {_quote_table(table_name)}")
+        return [desc[0] for desc in self.cursor.description]
+
+    def get_table_data_in_batches(self, table_name: str, batch_size: int = 5000,
+                                   start_offset: int = 0, max_rows: int = None):
         """Fetches rows in batches using OFFSET/FETCH pagination.
 
-        Each batch is a separate short-lived query instead of one streaming
-        cursor held open for the full table duration. This prevents on-prem
-        server timeouts on large tables (a streaming SELECT * on 575K rows
-        can run for 4+ minutes and get killed by the server).
+        Each batch is a separate short-lived query — no long-running cursor.
+        start_offset and max_rows allow parallel workers to each own a slice.
         """
         quoted = _quote_table(table_name)
-        offset = 0
+        offset = start_offset
+        rows_yielded = 0
         columns = None
         col_types = None
 
         while True:
+            fetch_size = batch_size
+            if max_rows is not None:
+                remaining = max_rows - rows_yielded
+                if remaining <= 0:
+                    break
+                fetch_size = min(batch_size, remaining)
+
             self.cursor.execute(
                 f"SELECT * FROM {quoted} "
                 f"ORDER BY (SELECT NULL) "
-                f"OFFSET {offset} ROWS FETCH NEXT {batch_size} ROWS ONLY"
+                f"OFFSET {offset} ROWS FETCH NEXT {fetch_size} ROWS ONLY"
             )
             rows = self.cursor.fetchall()
             if not rows:
@@ -76,6 +88,7 @@ class BaseSyncManager(ABC):
                 col_types = [desc[1] for desc in self.cursor.description]
             yield rows, columns, col_types
             offset += len(rows)
+            rows_yielded += len(rows)
 
     def execute_query(self, query: str, params=None):
         if params:

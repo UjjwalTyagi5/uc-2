@@ -1,11 +1,12 @@
 import pyodbc
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from loguru import logger
 
 from .db_manager import BaseSyncManager, _quote_table
-from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE, AZURE_BATCH_SIZE
+from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE, AZURE_BATCH_SIZE, PARALLEL_WORKERS
 
 _CTRL = _quote_table(SYNC_CONTROL_TABLE)
 _STAT = _quote_table(SYNC_STATUS_TABLE)
@@ -129,6 +130,95 @@ class PurchaseSyncManager(BaseSyncManager):
                 except Exception:
                     pass
 
+    def _load_staging_parallel(self, source_table: str, staging_table: str,
+                               total_source: int, insert_sql: str) -> int:
+        """Loads all source rows into staging using PARALLEL_WORKERS threads.
+
+        Each worker gets an exclusive row slice (by OFFSET/FETCH), opens its
+        own fresh source + Azure connections, and inserts via AZURE_BATCH_SIZE
+        commits with retry. No shared connection means no idle timeouts.
+        Returns total rows inserted.
+        """
+        segment_size = max(1, (total_source + PARALLEL_WORKERS - 1) // PARALLEL_WORKERS)
+        total_inserted = 0
+        lock = threading.Lock()
+
+        def worker(start_offset: int, max_rows: int):
+            nonlocal total_inserted
+
+            # Each worker creates its own brand-new connections
+            src = BaseSyncManager(self.source_manager.conn_str)
+            src.connect()
+            az_conn = pyodbc.connect(self.conn_str, autocommit=False)
+            az_conn.timeout = 0
+            az_cur = az_conn.cursor()
+
+            try:
+                for batch_rows, _, _ in src.get_table_data_in_batches(
+                    source_table, BATCH_SIZE,
+                    start_offset=start_offset, max_rows=max_rows
+                ):
+                    for ci in range(0, len(batch_rows), AZURE_BATCH_SIZE):
+                        chunk = batch_rows[ci:ci + AZURE_BATCH_SIZE]
+
+                        for attempt in range(1, _MAX_RETRIES + 1):
+                            try:
+                                az_cur.fast_executemany = True
+                                az_cur.executemany(insert_sql, chunk)
+                                az_conn.commit()
+                                break
+                            except pyodbc.OperationalError as e:
+                                try:
+                                    az_conn.rollback()
+                                except Exception:
+                                    pass
+                                if attempt < _MAX_RETRIES:
+                                    logger.warning(
+                                        f"  Worker chunk retry "
+                                        f"{attempt}/{_MAX_RETRIES}: {e}"
+                                    )
+                                    try:
+                                        az_conn.close()
+                                    except Exception:
+                                        pass
+                                    az_conn = pyodbc.connect(
+                                        self.conn_str, autocommit=False
+                                    )
+                                    az_conn.timeout = 0
+                                    az_cur = az_conn.cursor()
+                                else:
+                                    raise
+
+                        with lock:
+                            total_inserted += len(chunk)
+                            pct = total_inserted / total_source * 100
+                            logger.info(
+                                f"  '{staging_table}' — "
+                                f"{total_inserted:,} / {total_source:,} "
+                                f"rows ({pct:.1f}%)"
+                            )
+            finally:
+                try:
+                    src.close()
+                except Exception:
+                    pass
+                try:
+                    az_conn.close()
+                except Exception:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+            futures = []
+            for i in range(PARALLEL_WORKERS):
+                start = i * segment_size
+                rows = min(segment_size, total_source - start)
+                if rows > 0:
+                    futures.append(executor.submit(worker, start, rows))
+            for f in as_completed(futures):
+                f.result()  # re-raise any worker exception
+
+        return total_inserted
+
     def sync_single_table(self, etl_id: int, source_table: str, target_table: str, sync_hours: int):
         sync_time = datetime.now()
         staging_table = self._get_staging_name(target_table)
@@ -158,58 +248,19 @@ class PurchaseSyncManager(BaseSyncManager):
             self.conn.commit()
             logger.info(f"  Created staging table '{staging_table}'")
 
-            total_rows = 0
-            insert_sql = None
-
-            # Step 2 — stream ALL batches into staging, one commit per batch.
-            # BATCH_SIZE (from .env) controls both on-prem fetch size and Azure
-            # insert size. If Azure drops the connection mid-transfer, the batch
-            # is retried on a fresh connection (safe: nothing committed yet for
-            # that batch). Staging is temporary so partial data there is fine —
-            # atomicity is only required for the final swap into the target table.
-            for batch_rows, columns, _ in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
-                if insert_sql is None:
-                    insert_sql = self._build_insert_sql(staging_table, columns)
-
-                # Tables with nvarchar(max)/varchar(max) columns force pyodbc into
-                # SQLParamData (row-by-row streaming) regardless of fast_executemany.
-                # 50K+ rows via SQLParamData takes ~25s+ and Azure kills the connection.
-                # Fix: split each on-prem batch into AZURE_BATCH_SIZE chunks so each
-                # executemany finishes in ~1s. BATCH_SIZE stays large for fast on-prem
-                # fetching; AZURE_BATCH_SIZE independently controls Azure commit size.
-                for chunk_start in range(0, len(batch_rows), AZURE_BATCH_SIZE):
-                    chunk = batch_rows[chunk_start:chunk_start + AZURE_BATCH_SIZE]
-
-                    # Retry loop — reconnects and retries on transient TCP errors.
-                    # Safe to retry because nothing is committed until conn.commit().
-                    for attempt in range(1, _MAX_RETRIES + 1):
-                        try:
-                            self._ensure_connected()
-                            self.cursor.fast_executemany = True
-                            self.cursor.executemany(insert_sql, chunk)
-                            self.conn.commit()
-                            break  # success — next chunk
-                        except pyodbc.OperationalError as e:
-                            try:
-                                self.conn.rollback()
-                            except Exception:
-                                pass
-                            if attempt < _MAX_RETRIES:
-                                logger.warning(
-                                    f"  Chunk insert failed (attempt {attempt}/{_MAX_RETRIES}), "
-                                    f"reconnecting and retrying: {e}"
-                                )
-                                try:
-                                    self.conn.close()
-                                except Exception:
-                                    pass
-                                self.connect()
-                            else:
-                                raise  # all retries exhausted
-
-                    total_rows += len(chunk)
-                    pct = (total_rows / total_source * 100) if total_source else 0
-                    logger.info(f"  '{staging_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
+            # Step 2 — load all rows into staging using parallel workers.
+            # Each worker owns an independent slice of rows (by OFFSET), opens
+            # its own fresh source + Azure connections, and inserts via small
+            # AZURE_BATCH_SIZE commits. No shared connection = no idle timeouts.
+            columns = self.source_manager.get_columns(source_table)
+            insert_sql = self._build_insert_sql(staging_table, columns)
+            logger.info(
+                f"  Loading into staging with {PARALLEL_WORKERS} parallel workers "
+                f"(Azure batch: {AZURE_BATCH_SIZE:,} rows each)..."
+            )
+            total_rows = self._load_staging_parallel(
+                source_table, staging_table, total_source, insert_sql
+            )
 
             # Step 3 — all batches loaded into staging successfully.
             # Now atomically swap: TRUNCATE target + copy from staging in ONE commit.
