@@ -81,9 +81,11 @@ class PurchaseSyncManager(BaseSyncManager):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(target_table, columns)
                     # Fix fast_executemany string truncation: explicitly set max size
-                    # for all string columns so pyodbc doesn't infer from first row
+                    # for all string columns so pyodbc doesn't infer from first row.
+                    # SQL_WVARCHAR with 4000 covers nvarchar(n); SQL_WLONGVARCHAR
+                    # with 1073741823 covers nvarchar(max).
                     input_sizes = [
-                        (pyodbc.SQL_WLONGVARCHAR, 0, 0) if t == str else None
+                        (pyodbc.SQL_WLONGVARCHAR, 1073741823, 0) if t == str else None
                         for t in col_types
                     ]
                     self.cursor.setinputsizes(input_sizes)
