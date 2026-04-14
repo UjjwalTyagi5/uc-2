@@ -22,9 +22,9 @@ class BaseSyncManager(ABC):
 
     def connect(self):
         try:
-            self.conn = pyodbc.connect(self.conn_str, autocommit=False, timeout=0)
+            self.conn = pyodbc.connect(self.conn_str, autocommit=False)
+            self.conn.timeout = 0  # no query execution timeout
             self.cursor = self.conn.cursor()
-            self.cursor.timeout = 0  # no query timeout
             logger.info("Connected to DB")
         except Exception as e:
             logger.error(f"Error while making connection with database: {e}")
