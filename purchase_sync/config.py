@@ -13,6 +13,10 @@ def _require_env(key: str) -> str:
     return value
 
 
+def _optional_env(key: str, default: str) -> str:
+    return os.getenv(key) or default
+
+
 def _detect_sql_driver() -> str:
     """
     Returns the driver from ODBC_DRIVER env var if set,
