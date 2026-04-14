@@ -9,6 +9,11 @@ from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE
 _CTRL = _quote_table(SYNC_CONTROL_TABLE)
 _STAT = _quote_table(SYNC_STATUS_TABLE)
 
+# Maximum rows per executemany call to Azure SQL.
+# BATCH_SIZE controls on-prem fetch size; this caps each Azure write so
+# no single call runs long enough for Azure to forcibly close the TCP connection.
+_AZURE_CHUNK = 5000
+
 GET_SYNC_CONTROL_DATA = f"""
     SELECT ETLId, Source, Destination, SyncHours
     FROM {_CTRL}
@@ -94,23 +99,19 @@ class PurchaseSyncManager(BaseSyncManager):
             total_rows = 0
             insert_sql = None
 
-            # Step 2 — stream ALL batches into staging, committing each batch.
+            # Step 2 — stream ALL batches into staging, committing each chunk.
+            # BATCH_SIZE controls how many rows are fetched from on-prem at once.
+            # Each fetched batch is then split into _AZURE_CHUNK-sized pieces before
+            # sending to Azure so that no single executemany call runs long enough
+            # for Azure SQL to forcibly close the TCP connection (~10-46s threshold).
             # Staging is temporary so partial data there is safe — atomicity is
             # only required for the final swap (target is never touched here).
             for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(staging_table, columns)
 
-                # The on-prem SELECT can take 30+ seconds before the first batch
-                # arrives. Azure SQL drops idle TCP connections in that window.
-                # Ping Azure before every batch write; reconnect transparently if
-                # the connection was dropped. Previously committed batches remain
-                # in the staging table and are not lost on reconnect.
-                self._ensure_connected()
-                self.cursor.fast_executemany = True
-
-                # Compute actual max string length per column in this batch.
-                # Avoids OOM (no huge pre-allocation) and truncation (buffer = real max).
+                # Compute max string lengths once over the whole fetched batch.
+                # Re-used for every chunk below — slightly conservative but correct.
                 input_sizes = []
                 for i, t in enumerate(col_types):
                     if t == str:
@@ -121,13 +122,21 @@ class PurchaseSyncManager(BaseSyncManager):
                         input_sizes.append((pyodbc.SQL_WVARCHAR, max_len, 0))
                     else:
                         input_sizes.append(None)
-                self.cursor.setinputsizes(input_sizes)
 
-                self.cursor.executemany(insert_sql, batch_rows)
-                self.conn.commit()  # commit each batch — keeps transaction small, avoids Azure timeout
-                total_rows += len(batch_rows)
-                pct = (total_rows / total_source * 100) if total_source else 0
-                logger.info(f"  '{staging_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
+                # Insert in small chunks so each executemany finishes in seconds.
+                for chunk_start in range(0, len(batch_rows), _AZURE_CHUNK):
+                    chunk = batch_rows[chunk_start:chunk_start + _AZURE_CHUNK]
+
+                    # Ping Azure before each chunk; reconnect if the idle/dropped
+                    # connection was killed while we were reading from on-prem.
+                    self._ensure_connected()
+                    self.cursor.fast_executemany = True
+                    self.cursor.setinputsizes(input_sizes)
+                    self.cursor.executemany(insert_sql, chunk)
+                    self.conn.commit()
+                    total_rows += len(chunk)
+                    pct = (total_rows / total_source * 100) if total_source else 0
+                    logger.info(f"  '{staging_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
 
             # Step 3 — all batches loaded into staging successfully.
             # Now atomically swap: TRUNCATE target + copy from staging in ONE commit.
