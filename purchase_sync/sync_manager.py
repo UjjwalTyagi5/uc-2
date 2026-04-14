@@ -94,7 +94,9 @@ class PurchaseSyncManager(BaseSyncManager):
             total_rows = 0
             insert_sql = None
 
-            # Step 2 — stream ALL batches into staging (no commit between batches)
+            # Step 2 — stream ALL batches into staging, committing each batch.
+            # Staging is temporary so partial data there is safe — atomicity is
+            # only required for the final swap (target is never touched here).
             for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(staging_table, columns)
@@ -115,7 +117,7 @@ class PurchaseSyncManager(BaseSyncManager):
                 self.cursor.setinputsizes(input_sizes)
 
                 self.cursor.executemany(insert_sql, batch_rows)
-                # No commit here — keep everything in the transaction
+                self.conn.commit()  # commit each batch — keeps transaction small, avoids Azure timeout
                 total_rows += len(batch_rows)
                 pct = (total_rows / total_source * 100) if total_source else 0
                 logger.info(f"  '{staging_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
