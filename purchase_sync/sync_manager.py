@@ -14,6 +14,12 @@ _STAT = _quote_table(SYNC_STATUS_TABLE)
 _MAX_RETRIES = 3        # retry a single chunk on transient connection failure
 _MAX_TABLE_RETRIES = 2  # retry a full table sync on connection failure
 
+# Columns to exclude per source table (case-insensitive table name match).
+# Add entries here when the source has columns that don't exist on the target.
+_COLUMN_EXCLUSIONS: dict[str, set[str]] = {
+    "purchase_req_mst": {"priority_id", "priority_reason", "copy_req", "copy_req_id"},
+}
+
 GET_SYNC_CONTROL_DATA = f"""
     SELECT ETLId, Source, Destination, SyncHours
     FROM {_CTRL}
@@ -131,7 +137,8 @@ class PurchaseSyncManager(BaseSyncManager):
                     pass
 
     def _load_staging_parallel(self, source_table: str, staging_table: str,
-                               total_source: int, insert_sql: str) -> int:
+                               total_source: int, insert_sql: str,
+                               columns: list) -> int:
         """Loads all source rows into staging using PARALLEL_WORKERS threads.
 
         Each worker gets an exclusive row slice (by OFFSET/FETCH), opens its
@@ -162,8 +169,9 @@ class PurchaseSyncManager(BaseSyncManager):
 
                 try:
                     fetch_size = min(BATCH_SIZE, remaining)
+                    select_cols = ", ".join(f"[{c}]" for c in columns)
                     src.cursor.execute(
-                        f"SELECT * FROM {_quote_table(source_table)} "
+                        f"SELECT {select_cols} FROM {_quote_table(source_table)} "
                         f"ORDER BY (SELECT NULL) "
                         f"OFFSET {current_offset} ROWS FETCH NEXT {fetch_size} ROWS ONLY"
                     )
@@ -277,14 +285,21 @@ class PurchaseSyncManager(BaseSyncManager):
             # Each worker owns an independent slice of rows (by OFFSET), opens
             # its own fresh source + Azure connections, and inserts via small
             # AZURE_BATCH_SIZE commits. No shared connection = no idle timeouts.
-            columns = self.source_manager.get_columns(source_table)
+            # Resolve columns: start from source, drop any in _COLUMN_EXCLUSIONS
+            # for this table (case-insensitive match on source table name).
+            all_source_cols = self.source_manager.get_columns(source_table)
+            excluded = _COLUMN_EXCLUSIONS.get(source_table.lower(), set())
+            columns = [c for c in all_source_cols if c.lower() not in excluded]
+            if excluded:
+                dropped = [c for c in all_source_cols if c.lower() in excluded]
+                logger.info(f"  Excluding source columns not in target: {dropped}")
             insert_sql = self._build_insert_sql(staging_table, columns)
             logger.info(
                 f"  Loading into staging with {PARALLEL_WORKERS} parallel workers "
                 f"(Azure batch: {AZURE_BATCH_SIZE:,} rows each)..."
             )
             total_rows = self._load_staging_parallel(
-                source_table, staging_table, total_source, insert_sql
+                source_table, staging_table, total_source, insert_sql, columns
             )
 
             # Step 3 — all batches loaded into staging successfully.
