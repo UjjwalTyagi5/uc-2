@@ -4,7 +4,7 @@ from datetime import datetime
 from loguru import logger
 
 from .db_manager import BaseSyncManager, _quote_table
-from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE
+from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE, AZURE_BATCH_SIZE
 
 _CTRL = _quote_table(SYNC_CONTROL_TABLE)
 _STAT = _quote_table(SYNC_STATUS_TABLE)
@@ -102,59 +102,49 @@ class PurchaseSyncManager(BaseSyncManager):
             # is retried on a fresh connection (safe: nothing committed yet for
             # that batch). Staging is temporary so partial data there is fine —
             # atomicity is only required for the final swap into the target table.
-            for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
+            for batch_rows, columns, _ in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(staging_table, columns)
 
-                # fast_executemany=True uses the first row to size string buffers.
-                # Swap the row with the longest strings to position 0 so pyodbc
-                # allocates the right buffer for every subsequent row.
-                # Do NOT use setinputsizes — it forces SQLParamData (slow row-by-row
-                # streaming) which takes ~39s for 100K rows and triggers Azure timeouts.
-                str_cols = [i for i, t in enumerate(col_types) if t == str]
-                if str_cols:
-                    batch_rows = list(batch_rows)
-                    widest = max(
-                        range(len(batch_rows)),
-                        key=lambda j: sum(
-                            len(batch_rows[j][i]) for i in str_cols
-                            if batch_rows[j][i] is not None
-                        ),
-                    )
-                    if widest != 0:
-                        batch_rows[0], batch_rows[widest] = batch_rows[widest], batch_rows[0]
+                # Tables with nvarchar(max)/varchar(max) columns force pyodbc into
+                # SQLParamData (row-by-row streaming) regardless of fast_executemany.
+                # 50K+ rows via SQLParamData takes ~25s+ and Azure kills the connection.
+                # Fix: split each on-prem batch into AZURE_BATCH_SIZE chunks so each
+                # executemany finishes in ~1s. BATCH_SIZE stays large for fast on-prem
+                # fetching; AZURE_BATCH_SIZE independently controls Azure commit size.
+                for chunk_start in range(0, len(batch_rows), AZURE_BATCH_SIZE):
+                    chunk = batch_rows[chunk_start:chunk_start + AZURE_BATCH_SIZE]
 
-                # Retry loop — reconnects and retries the batch on transient
-                # TCP errors (e.g. Azure forcibly closes idle/long connections).
-                # The batch hasn't been committed so retry is always safe.
-                for attempt in range(1, _MAX_RETRIES + 1):
-                    try:
-                        self._ensure_connected()
-                        self.cursor.fast_executemany = True
-                        self.cursor.executemany(insert_sql, batch_rows)
-                        self.conn.commit()
-                        break  # success — move to next batch
-                    except pyodbc.OperationalError as e:
+                    # Retry loop — reconnects and retries on transient TCP errors.
+                    # Safe to retry because nothing is committed until conn.commit().
+                    for attempt in range(1, _MAX_RETRIES + 1):
                         try:
-                            self.conn.rollback()
-                        except Exception:
-                            pass
-                        if attempt < _MAX_RETRIES:
-                            logger.warning(
-                                f"  Batch insert failed (attempt {attempt}/{_MAX_RETRIES}), "
-                                f"reconnecting and retrying: {e}"
-                            )
+                            self._ensure_connected()
+                            self.cursor.fast_executemany = True
+                            self.cursor.executemany(insert_sql, chunk)
+                            self.conn.commit()
+                            break  # success — next chunk
+                        except pyodbc.OperationalError as e:
                             try:
-                                self.conn.close()
+                                self.conn.rollback()
                             except Exception:
                                 pass
-                            self.connect()
-                        else:
-                            raise  # all retries exhausted — propagate to outer except
+                            if attempt < _MAX_RETRIES:
+                                logger.warning(
+                                    f"  Chunk insert failed (attempt {attempt}/{_MAX_RETRIES}), "
+                                    f"reconnecting and retrying: {e}"
+                                )
+                                try:
+                                    self.conn.close()
+                                except Exception:
+                                    pass
+                                self.connect()
+                            else:
+                                raise  # all retries exhausted
 
-                total_rows += len(batch_rows)
-                pct = (total_rows / total_source * 100) if total_source else 0
-                logger.info(f"  '{staging_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
+                    total_rows += len(chunk)
+                    pct = (total_rows / total_source * 100) if total_source else 0
+                    logger.info(f"  '{staging_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
 
             # Step 3 — all batches loaded into staging successfully.
             # Now atomically swap: TRUNCATE target + copy from staging in ONE commit.

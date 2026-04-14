@@ -45,8 +45,9 @@ def _detect_sql_driver() -> str:
 
 
 SYNC_CONTROL_TABLE = _require_env("SYNC_CONTROL_TABLE")
-SYNC_STATUS_TABLE = _require_env("SYNC_STATUS_TABLE")
-BATCH_SIZE = int(_optional_env("BATCH_SIZE", "5000"))
+SYNC_STATUS_TABLE  = _require_env("SYNC_STATUS_TABLE")
+BATCH_SIZE         = int(_optional_env("BATCH_SIZE", "100000"))   # rows fetched from on-prem per cursor.fetchmany()
+AZURE_BATCH_SIZE   = int(_optional_env("AZURE_BATCH_SIZE", "2000"))  # rows per Azure executemany commit
 
 
 class DBConfig:
