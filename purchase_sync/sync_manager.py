@@ -1,5 +1,6 @@
 import pyodbc
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from loguru import logger
 
@@ -9,7 +10,8 @@ from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE, AZURE_BAT
 _CTRL = _quote_table(SYNC_CONTROL_TABLE)
 _STAT = _quote_table(SYNC_STATUS_TABLE)
 
-_MAX_RETRIES = 3  # retry a batch this many times on transient connection failure
+_MAX_RETRIES = 3        # retry a single chunk on transient connection failure
+_MAX_TABLE_RETRIES = 2  # retry a full table sync on connection failure
 
 GET_SYNC_CONTROL_DATA = f"""
     SELECT ETLId, Source, Destination, SyncHours
@@ -41,7 +43,6 @@ class PurchaseSyncManager(BaseSyncManager):
     def sync_all_tables(self):
         try:
             self.connect()
-            self.source_manager.connect()
             self.cursor.execute(GET_SYNC_CONTROL_DATA)
             configs = self.cursor.fetchall()
             if not configs:
@@ -50,13 +51,24 @@ class PurchaseSyncManager(BaseSyncManager):
 
             target_tables = [cfg[2] for cfg in configs]
 
-            # Disable FK constraints on all target tables before any truncate/insert
+            # Disable FK constraints on all target tables (sequential, main connection)
             for table in target_tables:
                 self._toggle_fk_constraints(table, enable=False)
 
-            # Sync in ETLId order (parent table first, children after)
-            for cfg in configs:
-                self.sync_single_table(*cfg)
+            # Sync all tables in parallel — each worker gets its own DB connections
+            with ThreadPoolExecutor(max_workers=len(configs)) as executor:
+                futures = {
+                    executor.submit(self._sync_table_worker, cfg): cfg
+                    for cfg in configs
+                }
+                for future in as_completed(futures):
+                    cfg = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(
+                            f"Worker failed for '{cfg[1]}' → '{cfg[2]}': {e}"
+                        )
 
             # Re-enable and validate FK constraints after all tables are loaded
             for table in target_tables:
@@ -66,8 +78,56 @@ class PurchaseSyncManager(BaseSyncManager):
             logger.error(f"Error in sync_all_tables: {e}")
             raise e
         finally:
-            self.source_manager.close()
             self.close()
+
+    def _sync_table_worker(self, cfg):
+        """Runs sync_single_table in its own thread with dedicated DB connections.
+
+        Retries the full table up to _MAX_TABLE_RETRIES times on connection
+        failures. Before each retry the staging table is explicitly dropped and
+        logged so we always start from a clean state.
+        """
+        etl_id, source_table, target_table, sync_hours = cfg
+        staging_table = self._get_staging_name(target_table)
+
+        for attempt in range(1, _MAX_TABLE_RETRIES + 1):
+            worker_source = BaseSyncManager(self.source_manager.conn_str)
+            worker = PurchaseSyncManager(self.conn_str, worker_source)
+            try:
+                worker.connect()
+                worker_source.connect()
+
+                # Ensure any leftover staging from a previous attempt is gone
+                worker._drop_table_if_exists(staging_table)
+                worker.conn.commit()
+
+                worker.sync_single_table(etl_id, source_table, target_table, sync_hours)
+                return  # success — exit retry loop
+
+            except pyodbc.OperationalError as e:
+                err = (repr(e) or str(e)).replace("\n", " ")[:300]
+                if attempt < _MAX_TABLE_RETRIES:
+                    logger.warning(
+                        f"[ETLId={etl_id}] Table sync failed "
+                        f"(attempt {attempt}/{_MAX_TABLE_RETRIES}), will retry "
+                        f"'{source_table}' → '{target_table}': {err}"
+                    )
+                else:
+                    logger.error(
+                        f"[ETLId={etl_id}] All {_MAX_TABLE_RETRIES} attempts failed "
+                        f"for '{source_table}' → '{target_table}': {err}"
+                    )
+                    raise
+
+            finally:
+                try:
+                    worker_source.close()
+                except Exception:
+                    pass
+                try:
+                    worker.close()
+                except Exception:
+                    pass
 
     def sync_single_table(self, etl_id: int, source_table: str, target_table: str, sync_hours: int):
         sync_time = datetime.now()
@@ -231,13 +291,17 @@ class PurchaseSyncManager(BaseSyncManager):
         self.execute_query(f"SELECT TOP 0 * INTO {quoted_staging} FROM {quoted_source}")
 
     def _drop_table_if_exists(self, table_name: str):
-        """Drops a table only if it exists (safe to call even if absent)."""
+        """Drops a table if it exists and logs when it actually does."""
         quoted = _quote_table(table_name)
-        # OBJECT_ID with 'U' checks for user tables only
-        self.execute_query(
-            f"IF OBJECT_ID(N'{table_name.replace(chr(39), chr(39)+chr(39))}', N'U') IS NOT NULL "
-            f"DROP TABLE {quoted}"
+        safe_name = table_name.replace(chr(39), chr(39) + chr(39))
+        # Check existence first so we can log accurately
+        self.cursor.execute(
+            f"SELECT 1 WHERE OBJECT_ID(N'{safe_name}', N'U') IS NOT NULL"
         )
+        exists = self.cursor.fetchone() is not None
+        if exists:
+            self.execute_query(f"DROP TABLE {quoted}")
+            logger.info(f"  Dropped staging table '{table_name}'")
 
     def _build_insert_sql(self, table_name: str, columns: list) -> str:
         col_list = ", ".join(f"[{col}]" for col in columns)
