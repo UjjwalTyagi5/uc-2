@@ -1,4 +1,5 @@
 import pyodbc
+import traceback
 from datetime import datetime
 from loguru import logger
 
@@ -105,8 +106,9 @@ class PurchaseSyncManager(BaseSyncManager):
 
         except Exception as e:
             self.conn.rollback()
-            error_msg = str(e).replace("\n", " ")[:300]
+            error_msg = (repr(e) or str(e) or "unknown error").replace("\n", " ")[:500]
             logger.error(f"Error syncing '{source_table}' → '{target_table}': {error_msg}")
+            logger.error(traceback.format_exc())
             try:
                 self._log_sync_status(etl_id, sync_time, "FAILED", 0, error_msg)
                 self.conn.commit()
