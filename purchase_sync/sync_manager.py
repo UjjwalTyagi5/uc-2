@@ -100,7 +100,14 @@ class PurchaseSyncManager(BaseSyncManager):
             for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(staging_table, columns)
-                    self.cursor.fast_executemany = True
+
+                # The on-prem SELECT can take 30+ seconds before the first batch
+                # arrives. Azure SQL drops idle TCP connections in that window.
+                # Ping Azure before every batch write; reconnect transparently if
+                # the connection was dropped. Previously committed batches remain
+                # in the staging table and are not lost on reconnect.
+                self._ensure_connected()
+                self.cursor.fast_executemany = True
 
                 # Compute actual max string length per column in this batch.
                 # Avoids OOM (no huge pre-allocation) and truncation (buffer = real max).
@@ -138,7 +145,11 @@ class PurchaseSyncManager(BaseSyncManager):
             self.conn.commit()
 
         except Exception as e:
-            self.conn.rollback()
+            # Connection may be dead — rollback only if it's still alive
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             # Drop staging so it doesn't block the next run
             try:
                 self._drop_table_if_exists(staging_table)
@@ -156,6 +167,26 @@ class PurchaseSyncManager(BaseSyncManager):
             except Exception as log_err:
                 self.conn.rollback()
                 logger.critical(f"Failed to write error status for ETLId={etl_id}: {log_err}")
+
+    def _ensure_connected(self):
+        """Ping the Azure connection; silently reconnect if it has been dropped.
+
+        Azure SQL / the intervening load-balancer can kill idle TCP connections
+        in as little as ~4 minutes (and sometimes sooner). This is called before
+        every Azure write so a dropped connection is recovered transparently.
+        Previously committed staging batches survive the reconnect because they
+        are already persisted in the staging table.
+        """
+        try:
+            self.cursor.execute("SELECT 1")
+            self.cursor.fetchone()
+        except Exception:
+            logger.warning("Azure connection lost — reconnecting...")
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.connect()
 
     def _get_staging_name(self, table_name: str) -> str:
         """Returns staging table name, preserving schema if present.
