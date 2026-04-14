@@ -35,7 +35,12 @@ class BaseSyncManager(ABC):
             self.conn.close()
             logger.info("DB connection closed")
 
-    def get_table_data_in_batches(self, table_name: str, batch_size: int = 2000):
+    def get_row_count(self, table_name: str) -> int:
+        """Returns total row count for a table."""
+        self.cursor.execute(f"SELECT COUNT(1) FROM {_quote_table(table_name)}")
+        return self.cursor.fetchone()[0]
+
+    def get_table_data_in_batches(self, table_name: str, batch_size: int = 5000):
         """Fetches rows in batches. Also yields Python type per column for setinputsizes."""
         self.cursor.execute(f"SELECT * FROM {_quote_table(table_name)}")
         columns = [desc[0] for desc in self.cursor.description]

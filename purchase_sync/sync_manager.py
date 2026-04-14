@@ -4,7 +4,7 @@ from datetime import datetime
 from loguru import logger
 
 from .db_manager import BaseSyncManager, _quote_table
-from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE
+from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE
 
 _CTRL = _quote_table(SYNC_CONTROL_TABLE)
 _STAT = _quote_table(SYNC_STATUS_TABLE)
@@ -72,20 +72,30 @@ class PurchaseSyncManager(BaseSyncManager):
         logger.info(f"Syncing '{source_table}' → '{target_table}' (ETLId={etl_id})")
 
         try:
+            # Get total source row count upfront for progress reporting
+            total_source = self.source_manager.get_row_count(source_table)
+            logger.info(f"  Source has {total_source:,} rows — batch size: {BATCH_SIZE:,}")
+
+            if total_source == 0:
+                logger.warning(f"No data in source '{source_table}', skipping.")
+                self._log_sync_status(etl_id, sync_time, "SUCCESS", 0, None)
+                self.conn.commit()
+                return
+
+            # TRUNCATE once at the start — guarantees no duplicate rows
             self.truncate_table(target_table)
             self.conn.commit()
 
             total_rows = 0
             insert_sql = None
 
-            for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table):
+            for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table, BATCH_SIZE):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(target_table, columns)
                     self.cursor.fast_executemany = True
 
                 # Compute actual max string length per column in this batch.
-                # Using the real max avoids OOM (from over-allocating huge buffers)
-                # and avoids truncation (buffer is sized to the actual longest value).
+                # Avoids OOM (no huge pre-allocation) and truncation (buffer = real max).
                 input_sizes = []
                 for i, t in enumerate(col_types):
                     if t == str:
@@ -101,10 +111,8 @@ class PurchaseSyncManager(BaseSyncManager):
                 self.cursor.executemany(insert_sql, batch_rows)
                 self.conn.commit()
                 total_rows += len(batch_rows)
-                logger.info(f"  '{target_table}' — {total_rows} rows inserted so far...")
-
-            if total_rows == 0:
-                logger.warning(f"No data found in source table '{source_table}', skipping.")
+                pct = (total_rows / total_source * 100) if total_source else 0
+                logger.info(f"  '{target_table}' — {total_rows:,} / {total_source:,} rows ({pct:.1f}%)")
 
             logger.info(f"Synced {total_rows} rows into '{target_table}'")
             self._log_sync_status(etl_id, sync_time, "SUCCESS", total_rows, None)
