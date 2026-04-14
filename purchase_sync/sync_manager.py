@@ -74,6 +74,11 @@ class PurchaseSyncManager(BaseSyncManager):
         staging_table = self._get_staging_name(target_table)
         logger.info(f"Syncing '{source_table}' → '{target_table}' (ETLId={etl_id})")
 
+        # Fresh cursors for every table — prevents stale state from a previous
+        # table's error (e.g. Invalid cursor state, leftover result sets)
+        self.reset_cursor()
+        self.source_manager.reset_cursor()
+
         # Clean up any leftover staging table from a previous failed run
         self._drop_table_if_exists(staging_table)
 
@@ -178,16 +183,6 @@ class PurchaseSyncManager(BaseSyncManager):
             logger.error(f"Error syncing '{source_table}' → '{target_table}': {error_msg}")
             logger.error(traceback.format_exc())
             logger.warning(f"  Target table '{target_table}' was NOT truncated — old data is intact.")
-
-            # Reset source connection so the next table doesn't inherit a broken cursor
-            try:
-                self.source_manager.close()
-            except Exception:
-                pass
-            try:
-                self.source_manager.connect()
-            except Exception as reconnect_err:
-                logger.critical(f"Failed to reconnect source after error: {reconnect_err}")
 
             try:
                 self._log_sync_status(etl_id, sync_time, "FAILED", 0, error_msg)

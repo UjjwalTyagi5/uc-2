@@ -35,6 +35,15 @@ class BaseSyncManager(ABC):
             self.conn.close()
             logger.info("DB connection closed")
 
+    def reset_cursor(self):
+        """Close the current cursor and open a fresh one on the same connection."""
+        try:
+            if self.cursor:
+                self.cursor.close()
+        except Exception:
+            pass
+        self.cursor = self.conn.cursor()
+
     def get_row_count(self, table_name: str) -> int:
         """Returns total row count for a table."""
         self.cursor.execute(f"SELECT COUNT(1) FROM {_quote_table(table_name)}")
