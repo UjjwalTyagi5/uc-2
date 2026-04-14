@@ -146,18 +146,32 @@ class PurchaseSyncManager(BaseSyncManager):
         def worker(start_offset: int, max_rows: int):
             nonlocal total_inserted
 
-            # Each worker creates its own brand-new connections
-            src = BaseSyncManager(self.source_manager.conn_str)
-            src.connect()
-            az_conn = pyodbc.connect(self.conn_str, autocommit=False)
-            az_conn.timeout = 0
-            az_cur = az_conn.cursor()
+            current_offset = start_offset
+            rows_done = 0
 
-            try:
-                for batch_rows, _, _ in src.get_table_data_in_batches(
-                    source_table, BATCH_SIZE,
-                    start_offset=start_offset, max_rows=max_rows
-                ):
+            while rows_done < max_rows:
+                remaining = max_rows - rows_done
+
+                # Fresh source + Azure connections for every batch —
+                # guarantees no stale/idle connection can time out
+                src = BaseSyncManager(self.source_manager.conn_str)
+                src.connect()
+                az_conn = pyodbc.connect(self.conn_str, autocommit=False)
+                az_conn.timeout = 0
+                az_cur = az_conn.cursor()
+
+                try:
+                    fetch_size = min(BATCH_SIZE, remaining)
+                    src.cursor.execute(
+                        f"SELECT * FROM {_quote_table(source_table)} "
+                        f"ORDER BY (SELECT NULL) "
+                        f"OFFSET {current_offset} ROWS FETCH NEXT {fetch_size} ROWS ONLY"
+                    )
+                    batch_rows = src.cursor.fetchall()
+
+                    if not batch_rows:
+                        break  # no more rows
+
                     for ci in range(0, len(batch_rows), AZURE_BATCH_SIZE):
                         chunk = batch_rows[ci:ci + AZURE_BATCH_SIZE]
 
@@ -174,7 +188,7 @@ class PurchaseSyncManager(BaseSyncManager):
                                     pass
                                 if attempt < _MAX_RETRIES:
                                     logger.warning(
-                                        f"  Worker chunk retry "
+                                        f"  Azure chunk retry "
                                         f"{attempt}/{_MAX_RETRIES}: {e}"
                                     )
                                     try:
@@ -197,15 +211,26 @@ class PurchaseSyncManager(BaseSyncManager):
                                 f"{total_inserted:,} / {total_source:,} "
                                 f"rows ({pct:.1f}%)"
                             )
-            finally:
-                try:
-                    src.close()
-                except Exception:
-                    pass
-                try:
-                    az_conn.close()
-                except Exception:
-                    pass
+
+                    current_offset += len(batch_rows)
+                    rows_done += len(batch_rows)
+
+                except pyodbc.OperationalError as e:
+                    logger.warning(
+                        f"  On-prem connection lost at offset {current_offset}, "
+                        f"reconnecting and retrying batch: {e}"
+                    )
+                    # current_offset is unchanged — next loop iteration
+                    # reopens connections and retries the same batch
+                finally:
+                    try:
+                        src.close()
+                    except Exception:
+                        pass
+                    try:
+                        az_conn.close()
+                    except Exception:
+                        pass
 
         with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
             futures = []
