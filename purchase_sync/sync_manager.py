@@ -1,3 +1,4 @@
+import pyodbc
 from datetime import datetime
 from loguru import logger
 
@@ -76,11 +77,18 @@ class PurchaseSyncManager(BaseSyncManager):
             total_rows = 0
             insert_sql = None
 
-            for batch_rows, columns in self.source_manager.get_table_data_in_batches(source_table):
+            for batch_rows, columns, col_types in self.source_manager.get_table_data_in_batches(source_table):
                 if insert_sql is None:
                     insert_sql = self._build_insert_sql(target_table, columns)
+                    # Fix fast_executemany string truncation: explicitly set max size
+                    # for all string columns so pyodbc doesn't infer from first row
+                    input_sizes = [
+                        (pyodbc.SQL_WLONGVARCHAR, 0, 0) if t == str else None
+                        for t in col_types
+                    ]
+                    self.cursor.setinputsizes(input_sizes)
+                    self.cursor.fast_executemany = True
 
-                self.cursor.fast_executemany = False
                 self.cursor.executemany(insert_sql, batch_rows)
                 self.conn.commit()
                 total_rows += len(batch_rows)

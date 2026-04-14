@@ -36,14 +36,15 @@ class BaseSyncManager(ABC):
             logger.info("DB connection closed")
 
     def get_table_data_in_batches(self, table_name: str, batch_size: int = 2000):
-        """Fetches rows in batches to avoid memory overload and TCP timeouts on large tables."""
+        """Fetches rows in batches. Also yields Python type per column for setinputsizes."""
         self.cursor.execute(f"SELECT * FROM {_quote_table(table_name)}")
         columns = [desc[0] for desc in self.cursor.description]
+        col_types = [desc[1] for desc in self.cursor.description]  # Python type objects
         while True:
             rows = self.cursor.fetchmany(batch_size)
             if not rows:
                 break
-            yield rows, columns
+            yield rows, columns, col_types
 
     def execute_query(self, query: str, params=None):
         if params:
