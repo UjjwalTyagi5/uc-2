@@ -178,11 +178,25 @@ class PurchaseSyncManager(BaseSyncManager):
             logger.error(f"Error syncing '{source_table}' → '{target_table}': {error_msg}")
             logger.error(traceback.format_exc())
             logger.warning(f"  Target table '{target_table}' was NOT truncated — old data is intact.")
+
+            # Reset source connection so the next table doesn't inherit a broken cursor
+            try:
+                self.source_manager.close()
+            except Exception:
+                pass
+            try:
+                self.source_manager.connect()
+            except Exception as reconnect_err:
+                logger.critical(f"Failed to reconnect source after error: {reconnect_err}")
+
             try:
                 self._log_sync_status(etl_id, sync_time, "FAILED", 0, error_msg)
                 self.conn.commit()
             except Exception as log_err:
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
                 logger.critical(f"Failed to write error status for ETLId={etl_id}: {log_err}")
 
     def _ensure_connected(self):

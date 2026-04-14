@@ -41,15 +41,32 @@ class BaseSyncManager(ABC):
         return self.cursor.fetchone()[0]
 
     def get_table_data_in_batches(self, table_name: str, batch_size: int = 5000):
-        """Fetches rows in batches. Also yields Python type per column for setinputsizes."""
-        self.cursor.execute(f"SELECT * FROM {_quote_table(table_name)}")
-        columns = [desc[0] for desc in self.cursor.description]
-        col_types = [desc[1] for desc in self.cursor.description]  # Python type objects
+        """Fetches rows in batches using OFFSET/FETCH pagination.
+
+        Each batch is a separate short-lived query instead of one streaming
+        cursor held open for the full table duration. This prevents on-prem
+        server timeouts on large tables (a streaming SELECT * on 575K rows
+        can run for 4+ minutes and get killed by the server).
+        """
+        quoted = _quote_table(table_name)
+        offset = 0
+        columns = None
+        col_types = None
+
         while True:
-            rows = self.cursor.fetchmany(batch_size)
+            self.cursor.execute(
+                f"SELECT * FROM {quoted} "
+                f"ORDER BY (SELECT NULL) "
+                f"OFFSET {offset} ROWS FETCH NEXT {batch_size} ROWS ONLY"
+            )
+            rows = self.cursor.fetchall()
             if not rows:
                 break
+            if columns is None:
+                columns = [desc[0] for desc in self.cursor.description]
+                col_types = [desc[1] for desc in self.cursor.description]
             yield rows, columns, col_types
+            offset += len(rows)
 
     def execute_query(self, query: str, params=None):
         if params:
