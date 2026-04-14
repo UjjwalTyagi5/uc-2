@@ -70,24 +70,27 @@ class PurchaseSyncManager(BaseSyncManager):
         logger.info(f"Syncing '{source_table}' → '{target_table}' (ETLId={etl_id})")
 
         try:
-            rows, columns = self.source_manager.get_table_data(source_table)
-
-            if not rows:
-                logger.warning(f"No data found in source table '{source_table}', skipping.")
-                self._log_sync_status(etl_id, sync_time, "SUCCESS", 0, None)
-                self.conn.commit()
-                return
-
             self.truncate_table(target_table)
-
-            insert_sql = self._build_insert_sql(target_table, columns)
-            self.cursor.fast_executemany = False
-            self.cursor.executemany(insert_sql, rows)
             self.conn.commit()
 
-            logger.info(f"Synced {len(rows)} rows into '{target_table}'")
+            total_rows = 0
+            insert_sql = None
 
-            self._log_sync_status(etl_id, sync_time, "SUCCESS", len(rows), None)
+            for batch_rows, columns in self.source_manager.get_table_data_in_batches(source_table):
+                if insert_sql is None:
+                    insert_sql = self._build_insert_sql(target_table, columns)
+
+                self.cursor.fast_executemany = False
+                self.cursor.executemany(insert_sql, batch_rows)
+                self.conn.commit()
+                total_rows += len(batch_rows)
+                logger.info(f"  '{target_table}' — {total_rows} rows inserted so far...")
+
+            if total_rows == 0:
+                logger.warning(f"No data found in source table '{source_table}', skipping.")
+
+            logger.info(f"Synced {total_rows} rows into '{target_table}'")
+            self._log_sync_status(etl_id, sync_time, "SUCCESS", total_rows, None)
             self.conn.commit()
 
         except Exception as e:

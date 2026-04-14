@@ -22,8 +22,9 @@ class BaseSyncManager(ABC):
 
     def connect(self):
         try:
-            self.conn = pyodbc.connect(self.conn_str, autocommit=False)
+            self.conn = pyodbc.connect(self.conn_str, autocommit=False, timeout=0)
             self.cursor = self.conn.cursor()
+            self.cursor.timeout = 0  # no query timeout
             logger.info("Connected to DB")
         except Exception as e:
             logger.error(f"Error while making connection with database: {e}")
@@ -34,11 +35,15 @@ class BaseSyncManager(ABC):
             self.conn.close()
             logger.info("DB connection closed")
 
-    def get_table_data(self, table_name: str):
+    def get_table_data_in_batches(self, table_name: str, batch_size: int = 2000):
+        """Fetches rows in batches to avoid memory overload and TCP timeouts on large tables."""
         self.cursor.execute(f"SELECT * FROM {_quote_table(table_name)}")
-        rows = self.cursor.fetchall()
         columns = [desc[0] for desc in self.cursor.description]
-        return rows, columns
+        while True:
+            rows = self.cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            yield rows, columns
 
     def execute_query(self, query: str, params=None):
         if params:
