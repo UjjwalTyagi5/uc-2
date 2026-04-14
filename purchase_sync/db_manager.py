@@ -3,6 +3,16 @@ from abc import ABC
 from loguru import logger
 
 
+def _quote_table(table_name: str) -> str:
+    """
+    Wraps each part of a schema-qualified table name in square brackets.
+    Handles both plain names and schema.table format.
+    e.g. 'my-schema.my-table' → '[my-schema].[my-table]'
+         'purchase_req_mst'   → '[purchase_req_mst]'
+    """
+    return ".".join(f"[{part.strip('[]')}]" for part in table_name.split("."))
+
+
 class BaseSyncManager(ABC):
 
     def __init__(self, conn_str: str):
@@ -25,7 +35,7 @@ class BaseSyncManager(ABC):
             logger.info("DB connection closed")
 
     def get_table_data(self, table_name: str):
-        self.cursor.execute(f"SELECT * FROM {table_name}")
+        self.cursor.execute(f"SELECT * FROM {_quote_table(table_name)}")
         rows = self.cursor.fetchall()
         columns = [desc[0] for desc in self.cursor.description]
         return rows, columns
@@ -37,5 +47,5 @@ class BaseSyncManager(ABC):
             self.cursor.execute(query)
 
     def truncate_table(self, table_name: str):
-        self.cursor.execute(f"TRUNCATE TABLE {table_name}")
+        self.cursor.execute(f"TRUNCATE TABLE {_quote_table(table_name)}")
         logger.info(f"Truncated table: {table_name}")

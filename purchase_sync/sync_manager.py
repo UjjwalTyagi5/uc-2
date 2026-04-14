@@ -1,26 +1,28 @@
 from datetime import datetime
 from loguru import logger
 
-from .db_manager import BaseSyncManager
+from .db_manager import BaseSyncManager, _quote_table
 from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE
 
+_CTRL = _quote_table(SYNC_CONTROL_TABLE)
+_STAT = _quote_table(SYNC_STATUS_TABLE)
 
 GET_SYNC_CONTROL_DATA = f"""
     SELECT ETLId, Source, Destination, SyncHours
-    FROM {SYNC_CONTROL_TABLE}
+    FROM {_CTRL}
     WHERE EnableSync = 1
     ORDER BY ETLId ASC
 """
 
 GET_SYNC_STATUS_BY_ID = f"""
     SELECT TOP 1 LastSyncTime
-    FROM {SYNC_STATUS_TABLE}
+    FROM {_STAT}
     WHERE ETLId = ?
     ORDER BY LastSyncTime DESC
 """
 
 INSERT_SYNC_STATUS = f"""
-    INSERT INTO {SYNC_STATUS_TABLE}
+    INSERT INTO {_STAT}
         (ETLId, LastSyncTime, SyncStatus, NumberOfRecordFetched, ErrorMessage)
     VALUES (?, ?, ?, ?, ?)
 """
@@ -102,14 +104,15 @@ class PurchaseSyncManager(BaseSyncManager):
     def _build_insert_sql(self, table_name: str, columns: list) -> str:
         col_list = ", ".join(f"[{col}]" for col in columns)
         placeholders = ", ".join("?" for _ in columns)
-        return f"INSERT INTO {table_name} ({col_list}) VALUES ({placeholders})"
+        return f"INSERT INTO {_quote_table(table_name)} ({col_list}) VALUES ({placeholders})"
 
     def _toggle_fk_constraints(self, table_name: str, enable: bool):
+        quoted = _quote_table(table_name)
         if enable:
-            self.execute_query(f"ALTER TABLE {table_name} WITH CHECK CHECK CONSTRAINT ALL")
+            self.execute_query(f"ALTER TABLE {quoted} WITH CHECK CHECK CONSTRAINT ALL")
             logger.info(f"Re-enabled FK constraints on '{table_name}'")
         else:
-            self.execute_query(f"ALTER TABLE {table_name} NOCHECK CONSTRAINT ALL")
+            self.execute_query(f"ALTER TABLE {quoted} NOCHECK CONSTRAINT ALL")
             logger.info(f"Disabled FK constraints on '{table_name}'")
         self.conn.commit()
 
