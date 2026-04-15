@@ -89,7 +89,7 @@ class PipelineTracker:
 
     # Gets the PK of the tracker row so we can FK to it from the exception table
     _GET_TRACKER_ID_SQL = """
-        SELECT [rass_uuid_pk]
+        SELECT [ras_uuid_pk]
         FROM   [ras_procurement].[ras_tracker]
         WHERE  [purchase_req_no_fk] = ?
     """
