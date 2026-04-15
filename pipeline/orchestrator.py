@@ -33,7 +33,7 @@ from typing import List, Optional
 from loguru import logger
 
 from attachment_blob_sync.config import BlobSyncConfig
-from pipeline.models import PRResult, StageResult, StageStatus
+from pipeline.models import PRResult, StageResult
 from pipeline.repository import PipelineRepository
 from pipeline.stage_registry import StageRegistry
 from pipeline.stages.base import BaseStage
@@ -137,32 +137,23 @@ class PipelineOrchestrator:
 
     def _process_pr(self, pr_no: str) -> PRResult:
         """
-        Runs all stages for a single PR in registration order.
+        Runs stages in order for a single PR.
 
-        - On stage success → continue to next stage.
-        - On stage failure → mark remaining stages as SKIPPED, stop early.
+        On stage failure:
+          - Writes to ras_pipeline_exceptions + marks ras_tracker = EXCEPTION
+          - Immediately stops all further stages for this PR  (break)
+          - Returns so the caller loop can continue to the next PR
         """
         stage_results: List[StageResult] = []
-        pipeline_failed = False
 
         for stage in self._stages:
-            if pipeline_failed:
-                self._log.warning(
-                    f"Skipping stage={stage.NAME!r} for PR={pr_no!r} "
-                    f"(previous stage failed)"
-                )
-                stage_results.append(
-                    StageResult(stage_name=stage.NAME, status=StageStatus.SKIPPED)
-                )
-                continue
-
             result = stage.run(pr_no)
             stage_results.append(result)
 
             if not result.succeeded:
-                pipeline_failed = True
-                # Move PR to EXCEPTION stage and write to exception table
+                # Record in exception table then stop — no further stages for this PR
                 self._handle_stage_failure(pr_no, result)
+                break
 
         pr_result = PRResult(purchase_req_no=pr_no, stage_results=stage_results)
         if pr_result.succeeded:
@@ -170,7 +161,7 @@ class PipelineOrchestrator:
         else:
             failed = pr_result.failed_stage
             self._log.opt(exception=failed.error).error(
-                f"PR={pr_no!r} failed at stage={failed.stage_name!r}: {failed.error}"
+                f"PR={pr_no!r} stopped at stage={failed.stage_name!r}: {failed.error}"
             )
         return pr_result
 
