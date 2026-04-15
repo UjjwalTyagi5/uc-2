@@ -120,7 +120,7 @@ class EmbedDocExtractionStage(BaseStage):
                 try:
                     parent_pk = self._att_repo.upsert_parent(
                         purchase_req_no     = purchase_req_no,
-                        rass_uuid_pk        = rass_uuid,
+                        ras_uuid_pk        = rass_uuid,
                         attachment_id       = att_id,
                         file_path           = parent_blob_path,
                         embedded_file_flag  = delta > 0,

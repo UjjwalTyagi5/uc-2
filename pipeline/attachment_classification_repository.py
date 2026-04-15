@@ -57,7 +57,7 @@ class AttachmentClassificationRepository:
         WHEN NOT MATCHED THEN
             INSERT (
                 [purchase_req_no_fk],
-                [rass_uuid_pk],
+                [ras_uuid_pk],
                 [attachment_id],
                 [file_path],
                 [embedded_file_flag],
@@ -108,7 +108,7 @@ class AttachmentClassificationRepository:
 
     def get_tracker_uuid(self, purchase_req_no: str) -> str | None:
         """
-        Returns the rass_uuid_pk from ras_tracker for the given PR,
+        Returns the ras_uuid_pk from ras_tracker for the given PR,
         or None if the row doesn't exist yet.
         """
         conn = self._connect()
@@ -129,7 +129,7 @@ class AttachmentClassificationRepository:
     def upsert_parent(
         self,
         purchase_req_no: str,
-        rass_uuid_pk: str,
+        ras_uuid_pk: str,
         attachment_id: str,
         file_path: str,
         embedded_file_flag: bool,
@@ -139,7 +139,7 @@ class AttachmentClassificationRepository:
         INSERT or UPDATE a row in AttachmentClassification.
 
         Matched on (purchase_req_no_fk, attachment_id).
-        On INSERT: populates rass_uuid_pk FK to ras_tracker.
+        On INSERT: populates ras_uuid_pk FK to ras_tracker.
         On UPDATE: refreshes file_path, embedded_file_flag, embedded_file_count.
 
         Returns
@@ -168,7 +168,7 @@ class AttachmentClassificationRepository:
                 # WHEN MATCHED UPDATE
                 file_path, embedded_file_flag, embedded_file_count,
                 # WHEN NOT MATCHED INSERT
-                purchase_req_no, rass_uuid_pk, attachment_id,
+                purchase_req_no, ras_uuid_pk, attachment_id,
                 file_path, embedded_file_flag, embedded_file_count,
             )
 
