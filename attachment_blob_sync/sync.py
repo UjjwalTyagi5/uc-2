@@ -175,21 +175,49 @@ class AttachmentBlobSync:
 
     def _upsert_tracker(self, conn: pyodbc.Connection, purchase_req_no: str) -> None:
         """
-        UPSERT ras_tracker: set current_stage_fk = 'blob_uploadation_done'.
-        Inserts a minimal row if no tracker entry exists yet for this PR.
+        UPSERT ras_tracker for the given PR.
+        - If row exists: update current_stage_fk = 'blob_uploadation_done'.
+        - If row is new: insert with data pulled directly from purchase_req_mst
+          (justification, currency, c_datetime, u_datetime, purchasefinalapprovalstatus).
         """
         sql = """
             MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
-            USING (SELECT ? AS purchase_req_no_fk) AS src
+            USING (
+                SELECT
+                    [PURCHASE_REQ_NO]            AS purchase_req_no_fk,
+                    [JUSTIFICATION]              AS ras_justification,
+                    [CURRENCY]                   AS currency,
+                    [C_DATETIME]                 AS ras_created_at,
+                    [U_DATETIME]                 AS ras_updated_at,
+                    [PURCHASEFINALAPPROVALSTATUS] AS ras_status
+                FROM [ras_procurement].[purchase_req_mst]
+                WHERE [PURCHASE_REQ_NO] = ?
+            ) AS src
               ON target.[purchase_req_no_fk] = src.[purchase_req_no_fk]
             WHEN MATCHED THEN
                 UPDATE SET
                     [current_stage_fk] = 'blob_uploadation_done',
                     [updated_at]       = GETUTCDATE()
             WHEN NOT MATCHED THEN
-                INSERT ([purchase_req_no_fk], [current_stage_fk])
-                VALUES (?, 'blob_uploadation_done');
+                INSERT (
+                    [purchase_req_no_fk],
+                    [ras_justification],
+                    [currency],
+                    [ras_created_at],
+                    [ras_updated_at],
+                    [ras_status],
+                    [current_stage_fk]
+                )
+                VALUES (
+                    src.[purchase_req_no_fk],
+                    src.[ras_justification],
+                    src.[currency],
+                    src.[ras_created_at],
+                    src.[ras_updated_at],
+                    src.[ras_status],
+                    'blob_uploadation_done'
+                );
         """
         cursor = conn.cursor()
-        cursor.execute(sql, purchase_req_no, purchase_req_no)
+        cursor.execute(sql, purchase_req_no)
         cursor.close()
