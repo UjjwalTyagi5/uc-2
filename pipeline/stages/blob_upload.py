@@ -13,14 +13,16 @@ DB stage reference  (pipeline_stages table)
 
 Responsibility
 --------------
-Downloads all binary attachments for the PR from the DB and saves them
-to the local work/ directory:
+Uploads the entire work/procurement/{safe_pr_no}/ folder to Azure Blob
+Storage in one go — parent attachment files AND any embedded files
+extracted by EMBED_DOC_EXTRACTION are included together.
 
-    work/procurement/{safe_pr_no}/{att_id}/{filename}
+Blob path mirrors the local path relative to work/:
+    work/procurement/R_1_2020/452205/invoice.pdf
+    → blob: procurement/R_1_2020/452205/invoice.pdf
 
-Does NOT upload to Azure Blob — that happens in EmbedDocExtractionStage
-AFTER embedded files have been extracted, so the entire folder (parent
-files + extracted files) is uploaded in one go.
+    work/procurement/R_1_2020/452205/extracted/invoice__embed.pdf
+    → blob: procurement/R_1_2020/452205/extracted/invoice__embed.pdf
 
 On success, advances ras_tracker.current_stage_fk to 'BLOB_UPLOAD'.
 """
@@ -35,11 +37,12 @@ from pipeline.tracker import PipelineTracker
 
 class BlobUploadStage(BaseStage):
     """
-    ATTACHMENT domain — stage 3 (runs second in execution order).
+    ATTACHMENT domain — stage 3.
 
-    Prerequisites : INGESTION (stage 1) completed
+    Prerequisites : EMBED_DOC_EXTRACTION (stage 2) completed
+                    (local work/ folder with all files must exist)
     Completion    : ras_tracker.current_stage_fk = 'BLOB_UPLOAD'
-    Next stage    : EMBED_DOC_EXTRACTION (stage 2, runs third)
+    Next stage    : CLASSIFICATION (stage 4)
     """
 
     NAME     = "BLOB_UPLOAD"
@@ -51,13 +54,10 @@ class BlobUploadStage(BaseStage):
         self._tracker = PipelineTracker(config.get_azure_conn_str())
 
     def execute(self, purchase_req_no: str) -> None:
-        """
-        Saves all binary attachments to work/ directory.
-        The actual Azure Blob upload is deferred to EmbedDocExtractionStage
-        so extracted files are included in the same upload batch.
-        """
-        saved = AttachmentBlobSync(self._config).save_locally(purchase_req_no)
+        uploaded = AttachmentBlobSync(self._config).upload_work_folder_to_blob(
+            purchase_req_no
+        )
         self._log.info(
-            f"Saved {saved} attachment(s) locally for PR={purchase_req_no!r}"
+            f"Uploaded {uploaded} file(s) to blob for PR={purchase_req_no!r}"
         )
         self._tracker.advance_stage(purchase_req_no, self.NAME)

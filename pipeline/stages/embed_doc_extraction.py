@@ -13,30 +13,19 @@ DB stage reference  (pipeline_stages table)
 
 Responsibility
 --------------
-Runs in two phases:
+  1. Download binary attachments from the DB and save to work/:
+         work/procurement/{safe_pr_no}/{att_id}/{filename}
 
-  Phase 1 — Extract
-    For each attachment in work/{pr_no}/, scan for embedded documents
-    (Office or PDF) and write extracted files to {att_id}/extracted/.
-    Records results in AttachmentClassification and
-    EmbeddedAttachmentClassification tables.
+  2. For each saved file, scan for embedded documents (Office / PDF) and
+     extract them to a sibling extracted/ folder:
+         work/procurement/{safe_pr_no}/{att_id}/extracted/{parent_stem}__{embedded}
 
-  Phase 2 — Upload
-    Uploads the entire work/procurement/{safe_pr_no}/ folder to Azure Blob
-    in one go — parent files AND all extracted files together.
-
-    Blob path = path relative to work/:
-        work/procurement/R_1_2020/452205/invoice.pdf
-        → blob: procurement/R_1_2020/452205/invoice.pdf
-
-        work/procurement/R_1_2020/452205/extracted/invoice__embed.pdf
-        → blob: procurement/R_1_2020/452205/extracted/invoice__embed.pdf
+  3. Record parent attachment and embedded file metadata in DB:
+         AttachmentClassification          — one row per parent file
+         EmbeddedAttachmentClassification  — one row per extracted file
 
 On success, advances ras_tracker.current_stage_fk to 'EMBED_DOC_EXTRACTION'.
-
-NOTE: This stage runs AFTER BLOB_UPLOAD in the execution list (even though
-its STAGE_ID is lower). BLOB_UPLOAD saves files locally; this stage extracts
-then uploads everything together. STAGE_ID is for DB identification only.
+Next stage (BLOB_UPLOAD) uploads the complete work folder to Azure Blob.
 """
 
 from __future__ import annotations
@@ -57,11 +46,11 @@ _WORK_DIR = Path("work")
 
 class EmbedDocExtractionStage(BaseStage):
     """
-    ATTACHMENT domain — stage 2 (runs after BLOB_UPLOAD in execution order).
+    ATTACHMENT domain — stage 2.
 
-    Prerequisites : BLOB_UPLOAD completed (local work/ files must exist)
+    Prerequisites : INGESTION (stage 1) completed
     Completion    : ras_tracker.current_stage_fk = 'EMBED_DOC_EXTRACTION'
-    Next stage    : CLASSIFICATION (stage 4)
+    Next stage    : BLOB_UPLOAD (stage 3) — uploads the work folder to blob
     """
 
     NAME     = "EMBED_DOC_EXTRACTION"
@@ -77,15 +66,20 @@ class EmbedDocExtractionStage(BaseStage):
         safe_pr     = purchase_req_no.replace("/", "_")
         pr_work_dir = _WORK_DIR / "procurement" / safe_pr
 
-        if not pr_work_dir.exists():
+        # ── Step 1: Download attachments to local work/ ────────────────────
+        saved = AttachmentBlobSync(self._config).save_locally(purchase_req_no)
+        self._log.info(
+            f"Saved {saved} attachment(s) to work/ for PR={purchase_req_no!r}"
+        )
+
+        if not pr_work_dir.exists() or saved == 0:
             self._log.warning(
-                f"No local files for PR={purchase_req_no!r} at {pr_work_dir} "
-                f"— skipping embed extraction"
+                f"No local files for PR={purchase_req_no!r} — skipping embed extraction"
             )
             self._tracker.advance_stage(purchase_req_no, self.NAME)
             return
 
-        # ── Phase 1: Extract + record in DB ───────────────────────────────
+        # ── Step 2: Extract embedded files + record in DB ─────────────────
         rass_uuid = self._att_repo.get_tracker_uuid(purchase_req_no)
         if rass_uuid is None:
             raise RuntimeError(
@@ -116,7 +110,6 @@ class EmbedDocExtractionStage(BaseStage):
                 delta = extractor.extracted_count - count_before
                 total_extracted += delta
 
-                # Embedded files added in this call (matched by prefix)
                 new_embedded = sorted(
                     f for f in output_dir.iterdir()
                     if f.is_file() and f.stem.startswith(extractor.parent_prefix)
@@ -124,7 +117,6 @@ class EmbedDocExtractionStage(BaseStage):
 
                 parent_blob_path = f"procurement/{safe_pr}/{att_id}/{file_path.name}"
 
-                # Upsert parent row
                 try:
                     parent_pk = self._att_repo.upsert_parent(
                         purchase_req_no     = purchase_req_no,
@@ -136,26 +128,24 @@ class EmbedDocExtractionStage(BaseStage):
                     )
                 except Exception as exc:
                     self._log.opt(exception=True).error(
-                        f"Failed to upsert AttachmentClassification for "
+                        f"Failed to upsert AttachmentClassification "
                         f"att_id={att_id!r} file={file_path.name!r}: {exc}"
                     )
                     continue
 
-                # Upsert each extracted file
                 for emb_file in new_embedded:
-                    embedded_blob_path = (
-                        f"procurement/{safe_pr}/{att_id}/extracted/{emb_file.name}"
-                    )
                     try:
                         self._att_repo.upsert_embedded(
                             attachment_classify_uuid_pk = parent_pk,
                             parent_attachment_id        = att_id,
-                            file_path                   = embedded_blob_path,
+                            file_path = (
+                                f"procurement/{safe_pr}/{att_id}/extracted/{emb_file.name}"
+                            ),
                         )
                     except Exception as exc:
                         self._log.opt(exception=True).error(
                             f"Failed to upsert EmbeddedAttachmentClassification "
-                            f"for file={emb_file.name!r}: {exc}"
+                            f"file={emb_file.name!r}: {exc}"
                         )
 
                 if delta:
@@ -168,14 +158,4 @@ class EmbedDocExtractionStage(BaseStage):
             f"Embed extraction complete: {total_extracted} embedded file(s) "
             f"for PR={purchase_req_no!r}"
         )
-
-        # ── Phase 2: Upload entire PR folder to blob ───────────────────────
-        # Uploads work/procurement/{safe_pr}/ only — parent files + extracted files.
-        uploaded = AttachmentBlobSync(self._config).upload_work_folder_to_blob(
-            purchase_req_no
-        )
-        self._log.info(
-            f"Blob upload complete: {uploaded} file(s) for PR={purchase_req_no!r}"
-        )
-
         self._tracker.advance_stage(purchase_req_no, self.NAME)

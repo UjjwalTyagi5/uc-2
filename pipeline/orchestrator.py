@@ -229,12 +229,8 @@ class PipelineOrchestrator:
         """
         return [
             IngestionStage(config),            # stage 1  — creates tracker row
-            BlobUploadStage(config),           # stage 3  — uploads to blob + saves local files
-            EmbedDocExtractionStage(config),   # stage 2  — extracts embedded docs from local files
+            EmbedDocExtractionStage(config),   # stage 2  — saves locally + extracts embedded docs
+            BlobUploadStage(config),           # stage 3  — uploads complete work folder to blob
             ClassificationStage(config),       # stage 4  — stub
             # MetadataExtractionStage(config), # stage 5  — add when ready
-            #
-            # NOTE: BLOB_UPLOAD (ID=3) intentionally runs before EMBED_DOC_EXTRACTION (ID=2)
-            # because extraction reads local files that blob upload writes to work/.
-            # STAGE_ID is for DB identification only — execution order is this list.
         ]
