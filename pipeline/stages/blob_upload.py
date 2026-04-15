@@ -4,6 +4,16 @@ pipeline.stages.blob_upload
 Pipeline stage: upload purchase requisition attachments to Azure Blob Storage
 and sync the BI dashboard view for the given PR.
 
+DB stage reference
+------------------
+  STAGE_ID : 3
+  STAGE_NAME: BLOB_UPLOAD
+  STAGE_DESC: File Uploading on blob
+  DOMAIN    : ATTACHMENT
+  SEQUENCE  : 3
+
+Completion marker: ras_tracker.current_stage_fk = 'BLOB_UPLOAD'
+
 Delegates all business logic to AttachmentBlobSync — this class is purely a
 pipeline adapter (thin wrapper that conforms to the BaseStage contract).
 """
@@ -12,20 +22,21 @@ from __future__ import annotations
 
 from attachment_blob_sync.config import BlobSyncConfig
 from attachment_blob_sync.sync import AttachmentBlobSync
+from pipeline.models import PipelineStage
 from pipeline.stages.base import BaseStage
 
 
 class BlobUploadStage(BaseStage):
     """
-    Stage 1 — Blob upload + BI dashboard sync.
+    ATTACHMENT domain — stage 3 of 5.
 
-    Completion marker: ras_tracker.current_stage_fk = 'blob_uploadation_done'
-
-    To skip this stage for a PR that was already processed, the orchestrator's
-    repository query filters it out via the LEFT JOIN on ras_tracker.
+    Prerequisites : EMBED_DOC_EXTRACTION (stage 2) done  [or pipeline entry point]
+    Completion    : ras_tracker.current_stage_fk = PipelineStage.BLOB_UPLOAD
+    Next stage    : CLASSIFICATION (stage 4)
     """
 
-    NAME = "blob_upload"
+    NAME     = PipelineStage.BLOB_UPLOAD   # "BLOB_UPLOAD"
+    STAGE_ID = 3
 
     def __init__(self, config: BlobSyncConfig) -> None:
         super().__init__()

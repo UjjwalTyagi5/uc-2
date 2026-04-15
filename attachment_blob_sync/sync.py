@@ -73,7 +73,7 @@ class AttachmentBlobSync:
                         self._upsert_tracker(primary_conn, purchase_req_no)
                         primary_conn.commit()
                         logger.info(
-                            f"Tracker updated: current_stage_fk = 'blob_uploadation_done' "
+                            f"Tracker updated: current_stage_fk = 'BLOB_UPLOAD' "
                             f"for PR {purchase_req_no}"
                         )
                     else:
@@ -234,7 +234,7 @@ class AttachmentBlobSync:
     def _upsert_tracker(self, conn: pyodbc.Connection, purchase_req_no: str) -> None:
         """
         UPSERT ras_tracker for the given PR.
-        - If row exists: update current_stage_fk = 'blob_uploadation_done'.
+        - If row exists: update current_stage_fk = 'BLOB_UPLOAD'.
         - If row is new: insert with data pulled directly from purchase_req_mst
           (justification, currency, c_datetime, u_datetime, purchasefinalapprovalstatus).
         """
@@ -254,7 +254,7 @@ class AttachmentBlobSync:
               ON target.[purchase_req_no_fk] = src.[purchase_req_no_fk]
             WHEN MATCHED THEN
                 UPDATE SET
-                    [current_stage_fk] = 'blob_uploadation_done',
+                    [current_stage_fk] = 'BLOB_UPLOAD',
                     [updated_at]       = GETUTCDATE()
             WHEN NOT MATCHED THEN
                 INSERT (
@@ -273,7 +273,7 @@ class AttachmentBlobSync:
                     src.[ras_created_at],
                     src.[ras_updated_at],
                     src.[ras_status],
-                    'blob_uploadation_done'
+                    'BLOB_UPLOAD'
                 );
         """
         cursor = conn.cursor()

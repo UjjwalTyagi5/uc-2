@@ -28,20 +28,26 @@ class BaseStage(ABC):
     """
     Abstract pipeline stage.
 
-    Subclasses MUST:
-        - set a unique class-level NAME string
-        - implement execute(purchase_req_no)
+    Subclasses MUST define:
+        NAME     (str) — matches STAGE_NAME in the pipeline_stages DB table
+                         e.g. "BLOB_UPLOAD", "CLASSIFICATION"
+        STAGE_ID (int) — matches STAGE_ID  in the pipeline_stages DB table
+                         e.g. 3, 4
 
-    execute() should raise on any unrecoverable failure; the exception
-    will be caught by run() and surfaced as a FAILED StageResult.
+    Subclasses MUST implement:
+        execute(purchase_req_no) — raises on failure, returns on success.
+
+    The public run() method here adds timing, structured logging, and
+    converts exceptions into StageResult objects.
     """
 
-    NAME: str = ""          # overridden by each subclass
+    NAME:     str = ""   # overridden by each subclass — matches DB STAGE_NAME
+    STAGE_ID: int = 0    # overridden by each subclass — matches DB STAGE_ID
 
     def __init__(self) -> None:
         if not self.NAME:
             raise NotImplementedError(f"{type(self).__name__} must define a non-empty NAME")
-        self._log = logger.bind(stage=self.NAME)
+        self._log = logger.bind(stage=self.NAME, stage_id=self.STAGE_ID)
 
     # ------------------------------------------------------------------
     # Public interface
