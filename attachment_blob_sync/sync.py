@@ -1,3 +1,30 @@
+"""
+attachment_blob_sync.sync
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Core logic for downloading attachments and uploading them to Azure Blob.
+
+Public API (used by pipeline stages)
+--------------------------------------
+save_locally(pr_no)
+    Downloads all binary attachments for the PR from the on-prem DB and
+    saves them to work/procurement/{safe_pr}/{att_id}/{filename}.
+    Does NOT upload to blob, does NOT touch ras_tracker.
+    Called by BlobUploadStage.
+
+upload_work_folder_to_blob(pr_no)
+    Walks work/procurement/{safe_pr}/ recursively and uploads every file
+    to Azure Blob at the same relative path (blob path mirrors local path
+    under work/).  Includes parent files AND any extracted sub-files added
+    by EmbedDocExtractionStage.
+    Does NOT touch ras_tracker.
+    Called by EmbedDocExtractionStage after extraction is complete.
+
+run(pr_no)                           [CLI / standalone use]
+    Convenience method that calls save_locally() + upload_work_folder_to_blob()
+    + updates ras_tracker + syncs BI dashboard.
+    Used by `python -m attachment_blob_sync --pr-no <PR>`.
+"""
+
 from pathlib import Path
 
 import pyodbc
@@ -8,22 +35,91 @@ from azure.core.exceptions import AzureError
 from attachment_blob_sync.config import BlobSyncConfig
 
 _MAX_RETRIES = 3
-_WORK_DIR    = Path("work")   # local mirror root — relative to cwd
+_WORK_DIR    = Path("work")
 
 
 class AttachmentBlobSync:
     def __init__(self, config: BlobSyncConfig):
         self._config = config
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────────────────
 
-    def run(self, purchase_req_no: str) -> None:
-        logger.info(f"=== attachment_blob_sync started for PR: {purchase_req_no} ===")
+    def save_locally(self, purchase_req_no: str) -> int:
+        """
+        Downloads all attachments for the PR from the DB and saves them to:
+            work/procurement/{safe_pr}/{att_id}/{filename}
 
+        Returns the number of files saved.
+        Does NOT upload to blob and does NOT update ras_tracker.
+
+        Raises on any unrecoverable DB error.
+        """
+        logger.info(f"Saving attachments locally for PR: {purchase_req_no}")
         primary_conn = pyodbc.connect(self._config.get_azure_conn_str(), autocommit=False, timeout=0)
         ras_conn     = pyodbc.connect(self._config.get_ras_conn_str(),     autocommit=False, timeout=0)
+        try:
+            attachments = self._fetch_attachments(primary_conn, purchase_req_no)
+            if not attachments:
+                logger.warning(f"No attachments found for PR: {purchase_req_no}")
+                return 0
+
+            logger.info(f"Found {len(attachments)} attachment(s) for PR: {purchase_req_no}")
+            attachment_ids = [att_id for att_id, _ in attachments]
+            binary_docs    = self._fetch_binary_docs(ras_conn, attachment_ids)
+
+            if not binary_docs:
+                logger.warning(
+                    f"No binary data found in ras_attachments for PR: {purchase_req_no} "
+                    f"(attachment_ids: {attachment_ids})"
+                )
+                return 0
+
+            saved = 0
+            for att_id, files_name in attachments:
+                doc_bytes = binary_docs.get(att_id)
+                if doc_bytes is None:
+                    logger.warning(
+                        f"Skipping attachment_id={att_id} ({files_name}) — no binary doc found"
+                    )
+                    continue
+                self._save_local(purchase_req_no, att_id, files_name, doc_bytes)
+                saved += 1
+
+            logger.info(f"Saved {saved} file(s) locally for PR: {purchase_req_no}")
+            return saved
+
+        finally:
+            primary_conn.close()
+            ras_conn.close()
+
+    def upload_work_folder_to_blob(self, purchase_req_no: str) -> int:
+        """
+        Uploads the entire work/procurement/{safe_pr}/ folder to Azure Blob,
+        preserving directory structure.
+
+        Blob path = file path relative to work/:
+            local:  work/procurement/R_134984_2020/452205/invoice.pdf
+            blob:   procurement/R_134984_2020/452205/invoice.pdf
+
+            local:  work/procurement/R_134984_2020/452205/extracted/doc__embed.pdf
+            blob:   procurement/R_134984_2020/452205/extracted/doc__embed.pdf
+
+        Returns the number of files uploaded.
+        Does NOT update ras_tracker.
+
+        Raises RuntimeError if the local folder doesn't exist or any upload fails.
+        """
+        safe_pr      = self._sanitize_pr_no(purchase_req_no)
+        local_folder = _WORK_DIR / "procurement" / safe_pr
+
+        if not local_folder.exists():
+            raise RuntimeError(
+                f"Local work folder not found: {local_folder} — "
+                f"ensure save_locally() ran before upload_work_folder_to_blob()."
+            )
+
         container_client = (
             BlobServiceClient(
                 account_url=self._config.BLOB_ACCOUNT_URL,
@@ -32,92 +128,91 @@ class AttachmentBlobSync:
             .get_container_client(self._config.BLOB_CONTAINER_NAME)
         )
 
-        blob_upload_error: Exception | None = None
+        all_files = sorted(f for f in local_folder.rglob("*") if f.is_file())
+        if not all_files:
+            logger.warning(f"No files found in {local_folder} to upload")
+            return 0
+
+        logger.info(
+            f"Uploading {len(all_files)} file(s) from {local_folder} to blob "
+            f"for PR: {purchase_req_no}"
+        )
+
+        success_count = 0
+        fail_count    = 0
+        for file_path in all_files:
+            # blob path mirrors the local path relative to work/
+            blob_path = file_path.relative_to(_WORK_DIR).as_posix()
+            data      = file_path.read_bytes()
+            if self._upload_blob(container_client, blob_path, data):
+                success_count += 1
+            else:
+                fail_count += 1
+
+        logger.info(
+            f"PR {purchase_req_no}: {success_count} uploaded, {fail_count} failed"
+        )
+
+        if fail_count > 0:
+            raise RuntimeError(
+                f"{fail_count} file(s) failed to upload for PR {purchase_req_no}"
+            )
+
+        return success_count
+
+    def run(self, purchase_req_no: str) -> None:
+        """
+        Standalone / CLI entry point — runs the full attachment pipeline:
+          1. Save all binary attachments locally (DB → work/)
+          2. Upload entire work folder to blob (work/ → Azure Blob)
+          3. Update ras_tracker.current_stage_fk = 'BLOB_UPLOAD'
+          4. Sync BI dashboard view
+
+        Pipeline stages call save_locally() and upload_work_folder_to_blob()
+        individually so they can manage their own tracker updates.
+        """
+        logger.info(f"=== attachment_blob_sync started for PR: {purchase_req_no} ===")
+
+        primary_conn = pyodbc.connect(self._config.get_azure_conn_str(), autocommit=False, timeout=0)
+        ras_conn     = pyodbc.connect(self._config.get_ras_conn_str(),     autocommit=False, timeout=0)
+
+        run_error: Exception | None = None
         try:
-            # ── Step 1: Blob upload ────────────────────────────────────────
             try:
-                attachments = self._fetch_attachments(primary_conn, purchase_req_no)
-                if not attachments:
-                    logger.warning(f"No attachments found for PR: {purchase_req_no}")
-                else:
-                    logger.info(f"Found {len(attachments)} attachment(s) for PR: {purchase_req_no}")
-
-                    attachment_ids = [att_id for att_id, _ in attachments]
-                    binary_docs = self._fetch_binary_docs(ras_conn, attachment_ids)
-
-                    if not binary_docs:
-                        logger.warning(
-                            f"No binary data found in ras_attachments for PR: {purchase_req_no} "
-                            f"(attachment_ids: {attachment_ids})"
-                        )
-                    else:
-                        success_count = 0
-                        fail_count    = 0
-
-                        for att_id, files_name in attachments:
-                            doc_bytes = binary_docs.get(att_id)
-                            if doc_bytes is None:
-                                logger.warning(
-                                    f"Skipping attachment_id={att_id} ({files_name}) — no binary doc found"
-                                )
-                                continue
-
-                            uploaded = self._upload(container_client, purchase_req_no, att_id, files_name, doc_bytes)
-                            if uploaded:
-                                success_count += 1
-                                self._save_local(purchase_req_no, att_id, files_name, doc_bytes)
-                            else:
-                                fail_count += 1
-
-                        logger.info(
-                            f"PR {purchase_req_no}: {success_count} uploaded, "
-                            f"{fail_count} failed, "
-                            f"{len(attachments) - success_count - fail_count} skipped (no doc)"
-                        )
-
-                        if fail_count == 0:
-                            self._upsert_tracker(primary_conn, purchase_req_no)
-                            primary_conn.commit()
-                            logger.info(
-                                f"Tracker updated: current_stage_fk = 'BLOB_UPLOAD' "
-                                f"for PR {purchase_req_no}"
-                            )
-                        else:
-                            logger.error(
-                                f"PR {purchase_req_no}: {fail_count} upload(s) failed — tracker NOT updated"
-                            )
+                saved = self.save_locally(purchase_req_no)
+                if saved > 0:
+                    self.upload_work_folder_to_blob(purchase_req_no)
+                    self._upsert_tracker(primary_conn, purchase_req_no)
+                    primary_conn.commit()
+                    logger.info(
+                        f"Tracker updated: current_stage_fk = 'BLOB_UPLOAD' "
+                        f"for PR {purchase_req_no}"
+                    )
             except Exception as exc:
-                blob_upload_error = exc
+                run_error = exc
                 logger.opt(exception=True).error(
-                    f"Blob upload step failed for PR {purchase_req_no}: {exc}"
+                    f"Attachment sync failed for PR {purchase_req_no}: {exc}"
                 )
 
-            # ── Step 2: BI dashboard sync ──────────────────────────────────
-            # Runs unconditionally — blob upload failure does not skip this step.
+            # BI dashboard sync always runs regardless of upload result
             try:
                 self._sync_bi_dashboard(ras_conn, primary_conn, purchase_req_no)
             except Exception as exc:
                 logger.error(f"BI dashboard sync failed for PR {purchase_req_no}: {exc}")
 
-            # Re-raise blob upload error after BI sync so the pipeline stage is
-            # still marked as FAILED in the orchestrator if Step 1 had an error.
-            if blob_upload_error is not None:
-                raise blob_upload_error
+            if run_error is not None:
+                raise run_error
 
         finally:
             primary_conn.close()
             ras_conn.close()
             logger.info(f"=== attachment_blob_sync finished for PR: {purchase_req_no} ===")
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
     # Internal helpers
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
 
     def _fetch_attachments(self, conn: pyodbc.Connection, purchase_req_no: str) -> list:
-        """
-        Returns list of (ATTACHMENT_ID, FILES_NAME) for the given PURCHASE_REQ_NO.
-        Joins purchase_req_mst → purchase_attachments.
-        """
         sql = """
             SELECT pa.[ATTACHMENT_ID], pa.[FILES_NAME]
             FROM [ras_procurement].[purchase_req_mst]  prm
@@ -134,14 +229,8 @@ class AttachmentBlobSync:
         return [(int(row[0]), str(row[1])) for row in rows]
 
     def _fetch_binary_docs(self, conn: pyodbc.Connection, attachment_ids: list) -> dict:
-        """
-        Returns dict {attachment_id: bytes} for the given list of IDs.
-        Queries ras_attachments on the RAS DB.
-        Only rows where doc IS NOT NULL are returned.
-        """
         if not attachment_ids:
             return {}
-
         placeholders = ", ".join("?" * len(attachment_ids))
         sql = f"""
             SELECT [attachment_id], [doc]
@@ -157,35 +246,19 @@ class AttachmentBlobSync:
 
     @staticmethod
     def _sanitize_pr_no(pr_no: str) -> str:
-        """
-        PURCHASE_REQ_NO values like 'R_3451/2026' contain '/' which would create
-        unintended sub-directories in the blob path. Replace with '_'.
-        """
+        """Replace '/' in PURCHASE_REQ_NO to avoid unintended blob sub-directories."""
         return pr_no.replace("/", "_")
 
-    def _upload(
-        self,
-        container_client,
-        pr_no: str,
-        att_id: int,
-        files_name: str,
-        data: bytes,
-    ) -> bool:
+    def _upload_blob(self, container_client, blob_path: str, data: bytes) -> bool:
         """
-        Uploads binary data to Azure Blob at:
-            procurement/{sanitized_pr_no}/{att_id}/{files_name}
-
-        Retries up to _MAX_RETRIES times on AzureError.
+        Uploads data to blob_path with up to _MAX_RETRIES attempts on AzureError.
         Returns True on success, False after all retries are exhausted.
         """
-        safe_pr = self._sanitize_pr_no(pr_no)
-        blob_path = f"procurement/{safe_pr}/{att_id}/{files_name}"
         blob_client = container_client.get_blob_client(blob_path)
-
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
                 blob_client.upload_blob(data, overwrite=True)
-                logger.info(f"Uploaded: {blob_path}")
+                logger.debug(f"Uploaded: {blob_path}")
                 return True
             except AzureError as exc:
                 if attempt < _MAX_RETRIES:
@@ -198,20 +271,12 @@ class AttachmentBlobSync:
                     )
         return False
 
-    def _save_local(
-        self,
-        pr_no: str,
-        att_id: int,
-        files_name: str,
-        data: bytes,
-    ) -> None:
+    def _save_local(self, pr_no: str, att_id: int, files_name: str, data: bytes) -> None:
         """
-        Mirrors the blob path under the local work/ directory:
+        Saves binary data to:
             work/procurement/{sanitized_pr_no}/{att_id}/{files_name}
-        Creates parent directories as needed.  Overwrites if the file
-        already exists (idempotent, same as blob overwrite=True).
         """
-        safe_pr   = self._sanitize_pr_no(pr_no)
+        safe_pr    = self._sanitize_pr_no(pr_no)
         local_path = _WORK_DIR / "procurement" / safe_pr / str(att_id) / files_name
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(data)
@@ -223,26 +288,15 @@ class AttachmentBlobSync:
         azure_conn: pyodbc.Connection,
         purchase_req_no: str,
     ) -> None:
-        """
-        Syncs BI dashboard data for the given PR from the on-prem view into the Azure table.
-        Steps:
-          1. SELECT all rows from on-prem [dbo].[vw_get_ras_data_for_bidashboard]
-             where PURCHASE_REQ_NO = ?
-          2. DELETE existing rows from Azure [ras_procurement].[vw_get_ras_data_for_bidashboard]
-             for this PR (prevents duplicates on re-runs)
-          3. INSERT fetched rows into Azure table
-        """
-        # Fetch from on-prem view
         src_cursor = onprem_conn.cursor()
         src_cursor.execute(
             "SELECT * FROM [dbo].[vw_get_ras_data_for_bidashboard] WHERE [PURCHASE_REQ_NO] = ?",
             purchase_req_no,
         )
-        rows = src_cursor.fetchall()
+        rows    = src_cursor.fetchall()
         columns = [col[0] for col in src_cursor.description]
         src_cursor.close()
 
-        # Delete + insert on Azure in a single transaction
         az_cursor = azure_conn.cursor()
         az_cursor.execute(
             "DELETE FROM [ras_procurement].[vw_get_ras_data_for_bidashboard] WHERE [PURCHASE_REQ_NO] = ?",
@@ -268,12 +322,6 @@ class AttachmentBlobSync:
         )
 
     def _upsert_tracker(self, conn: pyodbc.Connection, purchase_req_no: str) -> None:
-        """
-        UPSERT ras_tracker for the given PR.
-        - If row exists: update current_stage_fk = 'BLOB_UPLOAD'.
-        - If row is new: insert with data pulled directly from purchase_req_mst
-          (justification, currency, c_datetime, u_datetime, purchasefinalapprovalstatus).
-        """
         sql = """
             MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
             USING (
@@ -294,22 +342,12 @@ class AttachmentBlobSync:
                     [updated_at]       = GETUTCDATE()
             WHEN NOT MATCHED THEN
                 INSERT (
-                    [purchase_req_no_fk],
-                    [ras_justification],
-                    [currency],
-                    [ras_created_at],
-                    [ras_updated_at],
-                    [ras_status],
-                    [current_stage_fk]
+                    [purchase_req_no_fk], [ras_justification], [currency],
+                    [ras_created_at], [ras_updated_at], [ras_status], [current_stage_fk]
                 )
                 VALUES (
-                    src.[purchase_req_no_fk],
-                    src.[ras_justification],
-                    src.[currency],
-                    src.[ras_created_at],
-                    src.[ras_updated_at],
-                    src.[ras_status],
-                    'BLOB_UPLOAD'
+                    src.[purchase_req_no_fk], src.[ras_justification], src.[currency],
+                    src.[ras_created_at], src.[ras_updated_at], src.[ras_status], 'BLOB_UPLOAD'
                 );
         """
         cursor = conn.cursor()
