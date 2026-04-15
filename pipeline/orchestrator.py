@@ -103,8 +103,12 @@ class PipelineOrchestrator:
             f"{[f'{s.STAGE_ID}:{s.NAME}' for s in self._stages]}"
         )
 
+        # The last registered stage is the completion marker.
+        # PRs already at this stage are skipped; everything else is retried.
+        completed_stage = self._stages[-1].NAME
+
         try:
-            pending = self._repository.fetch_pending_prs()
+            pending = self._repository.fetch_pending_prs(completed_stage)
         except Exception as exc:
             self._log.critical(f"Cannot fetch pending PRs — aborting run: {exc}")
             return []
