@@ -41,6 +41,7 @@ from pipeline.stages.blob_upload import BlobUploadStage
 from pipeline.stages.classification import ClassificationStage
 from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
 from pipeline.stages.ingestion import IngestionStage
+from pipeline.tracker import PipelineTracker
 
 
 class PipelineOrchestrator:
@@ -76,6 +77,7 @@ class PipelineOrchestrator:
         self._config     = config
         self._log        = logger.bind(component="PipelineOrchestrator")
         self._repository = PipelineRepository(config.get_azure_conn_str(), limit=limit)
+        self._tracker    = PipelineTracker(config.get_azure_conn_str())
 
         # Load stage definitions from DB — single source of truth
         self._registry = StageRegistry(config.get_azure_conn_str())
@@ -159,17 +161,39 @@ class PipelineOrchestrator:
 
             if not result.succeeded:
                 pipeline_failed = True
+                # Move PR to EXCEPTION stage and write to exception table
+                self._handle_stage_failure(pr_no, result)
 
         pr_result = PRResult(purchase_req_no=pr_no, stage_results=stage_results)
         if pr_result.succeeded:
             self._log.success(f"PR={pr_no!r} completed all stages successfully")
         else:
             failed = pr_result.failed_stage
-            # log.opt(exception=...) writes the full stack trace to the log file
             self._log.opt(exception=failed.error).error(
                 f"PR={pr_no!r} failed at stage={failed.stage_name!r}: {failed.error}"
             )
         return pr_result
+
+    def _handle_stage_failure(self, pr_no: str, result: StageResult) -> None:
+        """
+        On stage failure:
+          1. Mark ras_tracker.current_stage_fk = 'EXCEPTION'
+          2. Insert a row into ras_pipeline_exceptions
+
+        If the DB write itself fails, log the error but do NOT re-raise —
+        the PR is already counted as failed in the run summary.
+        """
+        error_message = str(result.error) if result.error else "Unknown error"
+        try:
+            self._tracker.record_exception(
+                purchase_req_no=pr_no,
+                stage_name=result.stage_name,
+                error_message=error_message,
+            )
+        except Exception as exc:
+            self._log.opt(exception=True).error(
+                f"Could not write exception record for PR={pr_no!r}: {exc}"
+            )
 
     def _log_summary(self, results: List[PRResult]) -> None:
         """Logs a structured summary table at the end of the run."""
