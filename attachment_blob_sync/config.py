@@ -54,11 +54,11 @@ class BlobSyncConfig:
         self.AZURE_USER   = _require_env("AZURE_USER")
         self.AZURE_PASS   = _require_env("AZURE_PASS")
 
-        # RAS on-prem DB (separate server — holds ras_attachments with binary docs)
-        self.RAS_SERVER = _require_env("RAS_SERVER")
-        self.RAS_DB     = _require_env("RAS_DB")
-        self.RAS_USER   = _require_env("RAS_USER")
-        self.RAS_PASS   = _require_env("RAS_PASS")
+        # On-prem DB — same server as ONPREM_*, holds ras_attachments with binary docs
+        self.ONPREM_SERVER = _require_env("ONPREM_SERVER")
+        self.ONPREM_DB     = _require_env("ONPREM_DB")
+        self.ONPREM_USER   = _require_env("ONPREM_USER")
+        self.ONPREM_PASS   = _require_env("ONPREM_PASS")
 
         # Azure Blob Storage
         self.BLOB_ACCOUNT_URL    = _require_env("BLOB_ACCOUNT_URL")
@@ -78,11 +78,11 @@ class BlobSyncConfig:
         )
 
     def get_ras_conn_str(self) -> str:
-        """Connection string for the on-prem RAS DB (holds ras_attachments binary docs)."""
+        """Connection string for the on-prem DB (same as ONPREM_*, holds ras_attachments binary docs)."""
         return (
             f"DRIVER={{{self.ODBC_DRIVER}}};"
-            f"SERVER={self.RAS_SERVER};"
-            f"DATABASE={self.RAS_DB};"
-            f"UID={self.RAS_USER};PWD={self.RAS_PASS};"
+            f"SERVER={self.ONPREM_SERVER};"
+            f"DATABASE={self.ONPREM_DB};"
+            f"UID={self.ONPREM_USER};PWD={self.ONPREM_PASS};"
             f"TrustServerCertificate=yes;"
         )
