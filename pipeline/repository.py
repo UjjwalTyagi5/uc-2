@@ -24,8 +24,6 @@ from typing import List, Optional
 import pyodbc
 from loguru import logger
 
-from pipeline.models import PipelineStage
-
 
 class PipelineRepository:
     """
@@ -125,7 +123,7 @@ class PipelineRepository:
         finally:
             conn.close()
 
-    def fetch_prs_at_stage(self, completed_stage: PipelineStage) -> List[str]:
+    def fetch_prs_at_stage(self, completed_stage: str) -> List[str]:
         """
         Returns PURCHASE_REQ_NO values for PRs whose current_stage_fk equals
         `completed_stage`, ordered by updated_at ascending.

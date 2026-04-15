@@ -4,30 +4,26 @@ pipeline.orchestrator
 Central coordinator for the RAS attachment processing pipeline.
 
 Responsibilities:
-    1. Ask the repository for all unprocessed PRs.
-    2. Run each PR through every registered stage in order.
-    3. If a stage fails, skip remaining stages for that PR (fail-fast per PR)
+    1. Load the pipeline_stages table from DB via StageRegistry.
+    2. Validate all stage classes against the DB — fail fast if anything drifts.
+    3. Ask the repository for all unprocessed PRs.
+    4. Run each PR through every registered stage in order.
+    5. If a stage fails, skip remaining stages for that PR (fail-fast per PR)
        but continue to the next PR so one bad PR never blocks the whole batch.
-    4. Log a structured summary when the run is complete.
+    6. Log a structured summary when the run is complete.
 
 Extending the pipeline
 ----------------------
-To add a new processing stage (e.g. classification):
+To add a new processing stage (e.g. METADATA_EXTRACTION):
 
-    1. Create pipeline/stages/classification.py  →  ClassificationStage(BaseStage)
-    2. Import it here and append to STAGES:
+    1. Create pipeline/stages/metadata_extraction.py
+    2. Subclass BaseStage, set NAME = "METADATA_EXTRACTION", STAGE_ID = 5
+    3. In execute(): do the work, then call
+           self._tracker.advance_stage(purchase_req_no, self.NAME)
+    4. Append MetadataExtractionStage(config) to _build_default_stages() below
 
-        from pipeline.stages.classification import ClassificationStage
-        ...
-        STAGES = [
-            BlobUploadStage(config),
-            ClassificationStage(config),   # <-- new
-        ]
-
-    ClassificationStage.execute() should:
-        - Do its work for the given PURCHASE_REQ_NO
-        - Update ras_tracker.current_stage_fk to a new value on success
-        - Raise on failure (BaseStage.run() handles the rest)
+The stage NAME and STAGE_ID must match a row in the pipeline_stages DB table —
+StageRegistry validates this at startup and raises ValueError if they don't.
 """
 
 from __future__ import annotations
@@ -39,8 +35,12 @@ from loguru import logger
 from attachment_blob_sync.config import BlobSyncConfig
 from pipeline.models import PRResult, StageResult, StageStatus
 from pipeline.repository import PipelineRepository
+from pipeline.stage_registry import StageRegistry
 from pipeline.stages.base import BaseStage
 from pipeline.stages.blob_upload import BlobUploadStage
+from pipeline.stages.classification import ClassificationStage
+from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
+from pipeline.stages.ingestion import IngestionStage
 
 
 class PipelineOrchestrator:
@@ -52,10 +52,19 @@ class PipelineOrchestrator:
     config:
         Shared BlobSyncConfig used by all stages (holds DB and Blob creds).
     limit:
-        Optional cap on the number of PRs processed per run.  Useful for
-        gradually draining a large backlog.  None = process everything.
+        Optional cap on the number of PRs processed per run.
+        None = process everything.
     stages:
         Override the default stage list — primarily useful for testing.
+        If provided, these stages are still validated against the DB table.
+
+    Raises
+    ------
+    ValueError
+        At init time if any stage class has a NAME or STAGE_ID that does
+        not match the pipeline_stages table in the DB.
+    pyodbc.Error
+        At init time if the DB is unreachable or pipeline_stages is missing.
     """
 
     def __init__(
@@ -65,9 +74,15 @@ class PipelineOrchestrator:
         stages: Optional[List[BaseStage]] = None,
     ) -> None:
         self._config     = config
-        self._repository = PipelineRepository(config.get_azure_conn_str(), limit=limit)
-        self._stages     = stages if stages is not None else self._build_default_stages(config)
         self._log        = logger.bind(component="PipelineOrchestrator")
+        self._repository = PipelineRepository(config.get_azure_conn_str(), limit=limit)
+
+        # Load stage definitions from DB — single source of truth
+        self._registry = StageRegistry(config.get_azure_conn_str())
+
+        # Build stages, then validate every NAME/STAGE_ID against the DB table
+        self._stages = stages if stages is not None else self._build_default_stages(config)
+        self._registry.validate_stages(self._stages)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -84,7 +99,8 @@ class PipelineOrchestrator:
         """
         self._log.info("Pipeline run started")
         self._log.info(
-            f"Registered stages: {[s.name for s in self._stages]}"
+            f"Active stages: "
+            f"{[f'{s.STAGE_ID}:{s.NAME}' for s in self._stages]}"
         )
 
         try:
@@ -126,11 +142,11 @@ class PipelineOrchestrator:
         for stage in self._stages:
             if pipeline_failed:
                 self._log.warning(
-                    f"Skipping stage={stage.name!r} for PR={pr_no!r} "
+                    f"Skipping stage={stage.NAME!r} for PR={pr_no!r} "
                     f"(previous stage failed)"
                 )
                 stage_results.append(
-                    StageResult(stage_name=stage.name, status=StageStatus.SKIPPED)
+                    StageResult(stage_name=stage.NAME, status=StageStatus.SKIPPED)
                 )
                 continue
 
@@ -158,16 +174,17 @@ class PipelineOrchestrator:
 
         self._log.info("=" * 60)
         self._log.info("Pipeline run summary")
-        self._log.info(f"  Total PRs   : {total}")
-        self._log.info(f"  Succeeded   : {succeeded}")
-        self._log.info(f"  Failed      : {failed}")
+        self._log.info(f"  Total PRs : {total}")
+        self._log.info(f"  Succeeded : {succeeded}")
+        self._log.info(f"  Failed    : {failed}")
 
         if failed:
             self._log.info("  Failed PRs:")
             for r in results:
                 if not r.succeeded and r.failed_stage:
                     self._log.error(
-                        f"    {r.purchase_req_no!r} — stage={r.failed_stage.stage_name!r} "
+                        f"    {r.purchase_req_no!r} — "
+                        f"stage={r.failed_stage.stage_name!r} "
                         f"error={r.failed_stage.error!r}"
                     )
 
@@ -176,11 +193,24 @@ class PipelineOrchestrator:
     @staticmethod
     def _build_default_stages(config: BlobSyncConfig) -> List[BaseStage]:
         """
-        Returns the ordered list of stages for a standard pipeline run.
-        Edit this list to add / reorder / remove stages.
+        Ordered stage list for the ATTACHMENT domain pipeline.
+
+        Current state
+        -------------
+        Stage 1 — INGESTION           : records entry, creates ras_tracker row
+        Stage 2 — EMBED_DOC_EXTRACTION: stub (no work, marks stage)
+        Stage 3 — BLOB_UPLOAD         : uploads attachments to Azure Blob Storage
+        Stage 4 — CLASSIFICATION      : stub (no work, marks stage)
+
+        To add the next stage (e.g. METADATA_EXTRACTION):
+            1. Create pipeline/stages/metadata_extraction.py  (NAME="METADATA_EXTRACTION", STAGE_ID=5)
+            2. Append MetadataExtractionStage(config) to this list
+            3. Ensure STAGE_NAME=METADATA_EXTRACTION, STAGE_ID=5 exists in pipeline_stages table
         """
         return [
-            BlobUploadStage(config),
-            # ClassificationStage(config),   # uncomment when ready
-            # ExtractionStage(config),        # uncomment when ready
+            IngestionStage(config),            # stage 1  — real work
+            EmbedDocExtractionStage(config),   # stage 2  — stub
+            BlobUploadStage(config),           # stage 3  — real work
+            ClassificationStage(config),       # stage 4  — stub
+            # MetadataExtractionStage(config), # stage 5  — add when ready
         ]
