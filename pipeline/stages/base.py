@@ -80,7 +80,8 @@ class BaseStage(ABC):
 
         except Exception as exc:
             duration = time.perf_counter() - start
-            self._log.error(
+            # opt(exception=True) writes the full stack trace to the log file
+            self._log.opt(exception=True).error(
                 f"Stage={self.NAME!r} failed for PR={purchase_req_no!r} "
                 f"after {duration:.2f}s: {exc}"
             )

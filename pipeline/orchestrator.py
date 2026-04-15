@@ -165,7 +165,8 @@ class PipelineOrchestrator:
             self._log.success(f"PR={pr_no!r} completed all stages successfully")
         else:
             failed = pr_result.failed_stage
-            self._log.error(
+            # log.opt(exception=...) writes the full stack trace to the log file
+            self._log.opt(exception=failed.error).error(
                 f"PR={pr_no!r} failed at stage={failed.stage_name!r}: {failed.error}"
             )
         return pr_result
