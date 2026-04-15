@@ -30,6 +30,8 @@ from __future__ import annotations
 import pyodbc
 from loguru import logger
 
+from pipeline.db_utils import connect_with_retry
+
 
 class PipelineTracker:
     """
@@ -254,8 +256,4 @@ class PipelineTracker:
     # ------------------------------------------------------------------
 
     def _connect(self) -> pyodbc.Connection:
-        try:
-            return pyodbc.connect(self._conn_str, autocommit=False, timeout=0)
-        except pyodbc.Error as exc:
-            self._log.error(f"Cannot connect to Azure SQL DB: {exc}")
-            raise
+        return connect_with_retry(self._conn_str, autocommit=False)

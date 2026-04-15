@@ -33,6 +33,7 @@ from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import AzureError
 
 from attachment_blob_sync.config import BlobSyncConfig
+from pipeline.db_utils import connect_with_retry
 
 _MAX_RETRIES = 3
 _WORK_DIR    = Path("work")
@@ -57,8 +58,8 @@ class AttachmentBlobSync:
         Raises on any unrecoverable DB error.
         """
         logger.info(f"Saving attachments locally for PR: {purchase_req_no}")
-        primary_conn = pyodbc.connect(self._config.get_azure_conn_str(), autocommit=False, timeout=0)
-        ras_conn     = pyodbc.connect(self._config.get_ras_conn_str(),     autocommit=False, timeout=0)
+        primary_conn = connect_with_retry(self._config.get_azure_conn_str(), autocommit=False)
+        ras_conn     = connect_with_retry(self._config.get_ras_conn_str(),   autocommit=False)
         try:
             attachments = self._fetch_attachments(primary_conn, purchase_req_no)
             if not attachments:
@@ -173,8 +174,8 @@ class AttachmentBlobSync:
         """
         logger.info(f"=== attachment_blob_sync started for PR: {purchase_req_no} ===")
 
-        primary_conn = pyodbc.connect(self._config.get_azure_conn_str(), autocommit=False, timeout=0)
-        ras_conn     = pyodbc.connect(self._config.get_ras_conn_str(),     autocommit=False, timeout=0)
+        primary_conn = connect_with_retry(self._config.get_azure_conn_str(), autocommit=False)
+        ras_conn     = connect_with_retry(self._config.get_ras_conn_str(),   autocommit=False)
 
         run_error: Exception | None = None
         try:
