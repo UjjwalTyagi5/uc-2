@@ -38,7 +38,6 @@ class StageDefinition:
 class StageStatus(Enum):
     SUCCESS = "success"
     FAILED  = "failed"
-    SKIPPED = "skipped"   # earlier stage failed; this stage was never attempted
 
 
 @dataclass(frozen=True)
