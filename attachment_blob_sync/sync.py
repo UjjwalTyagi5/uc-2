@@ -29,63 +29,76 @@ class AttachmentBlobSync:
             .get_container_client(self._config.BLOB_CONTAINER_NAME)
         )
 
+        blob_upload_error: Exception | None = None
         try:
             # ── Step 1: Blob upload ────────────────────────────────────────
-            attachments = self._fetch_attachments(primary_conn, purchase_req_no)
-            if not attachments:
-                logger.warning(f"No attachments found for PR: {purchase_req_no}")
-            else:
-                logger.info(f"Found {len(attachments)} attachment(s) for PR: {purchase_req_no}")
-
-                attachment_ids = [att_id for att_id, _ in attachments]
-                binary_docs = self._fetch_binary_docs(ras_conn, attachment_ids)
-
-                if not binary_docs:
-                    logger.warning(
-                        f"No binary data found in ras_attachments for PR: {purchase_req_no} "
-                        f"(attachment_ids: {attachment_ids})"
-                    )
+            try:
+                attachments = self._fetch_attachments(primary_conn, purchase_req_no)
+                if not attachments:
+                    logger.warning(f"No attachments found for PR: {purchase_req_no}")
                 else:
-                    success_count = 0
-                    fail_count    = 0
+                    logger.info(f"Found {len(attachments)} attachment(s) for PR: {purchase_req_no}")
 
-                    for att_id, files_name in attachments:
-                        doc_bytes = binary_docs.get(att_id)
-                        if doc_bytes is None:
-                            logger.warning(
-                                f"Skipping attachment_id={att_id} ({files_name}) — no binary doc found"
-                            )
-                            continue
+                    attachment_ids = [att_id for att_id, _ in attachments]
+                    binary_docs = self._fetch_binary_docs(ras_conn, attachment_ids)
 
-                        uploaded = self._upload(container_client, purchase_req_no, att_id, files_name, doc_bytes)
-                        if uploaded:
-                            success_count += 1
-                        else:
-                            fail_count += 1
-
-                    logger.info(
-                        f"PR {purchase_req_no}: {success_count} uploaded, "
-                        f"{fail_count} failed, "
-                        f"{len(attachments) - success_count - fail_count} skipped (no doc)"
-                    )
-
-                    if fail_count == 0:
-                        self._upsert_tracker(primary_conn, purchase_req_no)
-                        primary_conn.commit()
-                        logger.info(
-                            f"Tracker updated: current_stage_fk = 'BLOB_UPLOAD' "
-                            f"for PR {purchase_req_no}"
+                    if not binary_docs:
+                        logger.warning(
+                            f"No binary data found in ras_attachments for PR: {purchase_req_no} "
+                            f"(attachment_ids: {attachment_ids})"
                         )
                     else:
-                        logger.error(
-                            f"PR {purchase_req_no}: {fail_count} upload(s) failed — tracker NOT updated"
+                        success_count = 0
+                        fail_count    = 0
+
+                        for att_id, files_name in attachments:
+                            doc_bytes = binary_docs.get(att_id)
+                            if doc_bytes is None:
+                                logger.warning(
+                                    f"Skipping attachment_id={att_id} ({files_name}) — no binary doc found"
+                                )
+                                continue
+
+                            uploaded = self._upload(container_client, purchase_req_no, att_id, files_name, doc_bytes)
+                            if uploaded:
+                                success_count += 1
+                            else:
+                                fail_count += 1
+
+                        logger.info(
+                            f"PR {purchase_req_no}: {success_count} uploaded, "
+                            f"{fail_count} failed, "
+                            f"{len(attachments) - success_count - fail_count} skipped (no doc)"
                         )
 
+                        if fail_count == 0:
+                            self._upsert_tracker(primary_conn, purchase_req_no)
+                            primary_conn.commit()
+                            logger.info(
+                                f"Tracker updated: current_stage_fk = 'BLOB_UPLOAD' "
+                                f"for PR {purchase_req_no}"
+                            )
+                        else:
+                            logger.error(
+                                f"PR {purchase_req_no}: {fail_count} upload(s) failed — tracker NOT updated"
+                            )
+            except Exception as exc:
+                blob_upload_error = exc
+                logger.opt(exception=True).error(
+                    f"Blob upload step failed for PR {purchase_req_no}: {exc}"
+                )
+
             # ── Step 2: BI dashboard sync ──────────────────────────────────
+            # Runs unconditionally — blob upload failure does not skip this step.
             try:
                 self._sync_bi_dashboard(ras_conn, primary_conn, purchase_req_no)
             except Exception as exc:
                 logger.error(f"BI dashboard sync failed for PR {purchase_req_no}: {exc}")
+
+            # Re-raise blob upload error after BI sync so the pipeline stage is
+            # still marked as FAILED in the orchestrator if Step 1 had an error.
+            if blob_upload_error is not None:
+                raise blob_upload_error
 
         finally:
             primary_conn.close()
