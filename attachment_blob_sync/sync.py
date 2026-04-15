@@ -19,7 +19,7 @@ class AttachmentBlobSync:
     def run(self, purchase_req_no: str) -> None:
         logger.info(f"=== attachment_blob_sync started for PR: {purchase_req_no} ===")
 
-        primary_conn = pyodbc.connect(self._config.get_onprem_conn_str(), autocommit=False, timeout=0)
+        primary_conn = pyodbc.connect(self._config.get_azure_conn_str(), autocommit=False, timeout=0)
         ras_conn     = pyodbc.connect(self._config.get_ras_conn_str(),     autocommit=False, timeout=0)
         container_client = (
             BlobServiceClient(
