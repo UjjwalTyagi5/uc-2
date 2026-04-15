@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pyodbc
 from loguru import logger
 from azure.storage.blob import BlobServiceClient
@@ -6,6 +8,7 @@ from azure.core.exceptions import AzureError
 from attachment_blob_sync.config import BlobSyncConfig
 
 _MAX_RETRIES = 3
+_WORK_DIR    = Path("work")   # local mirror root — relative to cwd
 
 
 class AttachmentBlobSync:
@@ -62,6 +65,7 @@ class AttachmentBlobSync:
                             uploaded = self._upload(container_client, purchase_req_no, att_id, files_name, doc_bytes)
                             if uploaded:
                                 success_count += 1
+                                self._save_local(purchase_req_no, att_id, files_name, doc_bytes)
                             else:
                                 fail_count += 1
 
@@ -193,6 +197,25 @@ class AttachmentBlobSync:
                         f"Upload failed after {_MAX_RETRIES} attempts for {blob_path}: {exc}"
                     )
         return False
+
+    def _save_local(
+        self,
+        pr_no: str,
+        att_id: int,
+        files_name: str,
+        data: bytes,
+    ) -> None:
+        """
+        Mirrors the blob path under the local work/ directory:
+            work/procurement/{sanitized_pr_no}/{att_id}/{files_name}
+        Creates parent directories as needed.  Overwrites if the file
+        already exists (idempotent, same as blob overwrite=True).
+        """
+        safe_pr   = self._sanitize_pr_no(pr_no)
+        local_path = _WORK_DIR / "procurement" / safe_pr / str(att_id) / files_name
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(data)
+        logger.debug(f"Saved locally: {local_path}")
 
     def _sync_bi_dashboard(
         self,
