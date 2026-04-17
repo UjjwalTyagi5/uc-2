@@ -161,6 +161,26 @@ class AttachmentBlobSync:
 
         return success_count
 
+    def sync_bi_dashboard_for_pr(self, purchase_req_no: str) -> None:
+        """
+        Syncs the BI dashboard row for a single PR.
+
+        Called by ClassificationStage (the final pipeline stage) after every
+        successful pipeline run — both first-time processing and re-processing
+        after source-data changes.
+
+        Opens its own connections and closes them in a finally block.
+        Raises on unrecoverable DB error.
+        """
+        logger.info(f"Syncing BI dashboard for PR: {purchase_req_no}")
+        ras_conn   = connect_with_retry(self._config.get_ras_conn_str(),   autocommit=False)
+        azure_conn = connect_with_retry(self._config.get_azure_conn_str(), autocommit=False)
+        try:
+            self._sync_bi_dashboard(ras_conn, azure_conn, purchase_req_no)
+        finally:
+            ras_conn.close()
+            azure_conn.close()
+
     def run(self, purchase_req_no: str) -> None:
         """
         Standalone / CLI entry point — runs the full attachment pipeline:

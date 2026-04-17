@@ -57,13 +57,17 @@ class PipelineRepository:
     #
     # ? placeholders: completed_stage, COMPLETED, DELIVERED, EXCEPTION
     # (pyodbc doesn't support IN (?) with a list, so we expand to 4 literals)
+    # Only process PRs that have been fully approved.
+    # Un-approved / in-progress PRs are skipped until their status advances.
     _PENDING_SQL = """
         SELECT prm.[PURCHASE_REQ_NO]
         FROM   [ras_procurement].[purchase_req_mst] prm
         LEFT JOIN [ras_procurement].[ras_tracker]   rt
           ON prm.[PURCHASE_REQ_NO] = rt.[purchase_req_no_fk]
-        WHERE rt.[purchase_req_no_fk] IS NULL
-           OR rt.[current_stage_fk] NOT IN (?, 'COMPLETED', 'DELIVERED', 'EXCEPTION')
+        WHERE (rt.[purchase_req_no_fk] IS NULL
+               OR rt.[current_stage_fk] NOT IN (?, 'COMPLETED', 'DELIVERED', 'EXCEPTION'))
+          AND UPPER(prm.[PURCHASEFINALAPPROVALSTATUS])
+                  IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
         ORDER BY prm.[C_DATETIME] ASC
     """
 
@@ -72,8 +76,10 @@ class PipelineRepository:
         FROM   [ras_procurement].[purchase_req_mst] prm
         LEFT JOIN [ras_procurement].[ras_tracker]   rt
           ON prm.[PURCHASE_REQ_NO] = rt.[purchase_req_no_fk]
-        WHERE rt.[purchase_req_no_fk] IS NULL
-           OR rt.[current_stage_fk] NOT IN (?, 'COMPLETED', 'DELIVERED', 'EXCEPTION')
+        WHERE (rt.[purchase_req_no_fk] IS NULL
+               OR rt.[current_stage_fk] NOT IN (?, 'COMPLETED', 'DELIVERED', 'EXCEPTION'))
+          AND UPPER(prm.[PURCHASEFINALAPPROVALSTATUS])
+                  IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
         ORDER BY prm.[C_DATETIME] ASC
     """
 

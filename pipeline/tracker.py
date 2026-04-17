@@ -104,6 +104,13 @@ class PipelineTracker:
             (NEWID(), ?, ?, ?, GETUTCDATE(), GETUTCDATE())
     """
 
+    _SET_LAST_PROCESSED_SQL = """
+        UPDATE [ras_procurement].[ras_tracker]
+        SET    [last_processed_at] = GETUTCDATE(),
+               [updated_at]        = GETUTCDATE()
+        WHERE  [purchase_req_no_fk] = ?
+    """
+
     def __init__(self, conn_str: str) -> None:
         self._conn_str = conn_str
         self._log      = logger.bind(component="PipelineTracker")
@@ -171,6 +178,33 @@ class PipelineTracker:
             conn.rollback()
             self._log.error(
                 f"advance_stage failed PR={purchase_req_no!r} stage={stage!r}: {exc}"
+            )
+            raise
+        finally:
+            conn.close()
+
+    def set_last_processed_at(self, purchase_req_no: str) -> None:
+        """
+        Stamps last_processed_at = GETUTCDATE() on the tracker row.
+        Called by the final pipeline stage (CLASSIFICATION) after it completes.
+        Used by SourceChangeDetector to compare against U_DATETIME and detect
+        source-data changes that require re-processing.
+
+        Raises:
+            pyodbc.Error: on any DB failure.
+        """
+        self._log.debug(f"set_last_processed_at PR={purchase_req_no!r}")
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(self._SET_LAST_PROCESSED_SQL, purchase_req_no)
+            conn.commit()
+            cursor.close()
+            self._log.info(f"last_processed_at set for PR={purchase_req_no!r}")
+        except pyodbc.Error as exc:
+            conn.rollback()
+            self._log.error(
+                f"set_last_processed_at failed PR={purchase_req_no!r}: {exc}"
             )
             raise
         finally:

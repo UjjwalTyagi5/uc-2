@@ -23,6 +23,7 @@ from pathlib import Path
 from loguru import logger
 
 from attachment_blob_sync.config import BlobSyncConfig
+from pipeline.change_detector import SourceChangeDetector
 from pipeline.orchestrator import PipelineOrchestrator
 
 # ── Log directory (created next to where the script is run from) ──────────
@@ -131,6 +132,18 @@ def main() -> None:
     except EnvironmentError as exc:
         logger.critical(f"Configuration error — cannot start pipeline: {exc}")
         sys.exit(1)
+
+    # Re-queue completed PRs whose source data changed since last processing.
+    # Runs before the main pipeline so the pipeline picks up re-queued PRs
+    # in the same run.
+    try:
+        requeued = SourceChangeDetector(config).detect_and_requeue()
+        if requeued:
+            logger.info(f"Re-queued {requeued} PR(s) whose source data changed")
+    except Exception as exc:
+        logger.opt(exception=True).warning(
+            f"Change detection failed (continuing with pipeline run): {exc}"
+        )
 
     try:
         results = PipelineOrchestrator(config, limit=args.limit).run()
