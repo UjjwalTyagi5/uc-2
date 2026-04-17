@@ -59,6 +59,9 @@ class PipelineRepository:
     # (pyodbc doesn't support IN (?) with a list, so we expand to 4 literals)
     # Only process PRs that have been fully approved.
     # Un-approved / in-progress PRs are skipped until their status advances.
+    # Allowlist approach: only fully-approved PRs enter the pipeline.
+    # PRs with REJECTED / REJECT status (or any other non-approved status)
+    # are naturally excluded and never picked up — no extra NOT IN needed.
     _PENDING_SQL = """
         SELECT prm.[PURCHASE_REQ_NO]
         FROM   [ras_procurement].[purchase_req_mst] prm
@@ -202,5 +205,5 @@ class PipelineRepository:
 
     def _connect(self) -> pyodbc.Connection:
         """Opens a read-only (autocommit) connection to the Azure SQL DB."""
-        from pipeline.db_utils import connect_with_retry
+        from db.connection import connect_with_retry
         return connect_with_retry(self._conn_str, autocommit=True)

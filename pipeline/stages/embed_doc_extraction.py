@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from attachment_blob_sync.config import BlobSyncConfig
+from utils.config import AppConfig
 from attachment_blob_sync.sync import AttachmentBlobSync
 from embed_doc_extraction.extractor import SUPPORTED_PARENTS, FileExtractor
 from pipeline.attachment_classification_repository import (
@@ -56,7 +56,7 @@ class EmbedDocExtractionStage(BaseStage):
     NAME     = "EMBED_DOC_EXTRACTION"
     STAGE_ID = 2
 
-    def __init__(self, config: BlobSyncConfig) -> None:
+    def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._config   = config
         self._tracker  = PipelineTracker(config.get_azure_conn_str())

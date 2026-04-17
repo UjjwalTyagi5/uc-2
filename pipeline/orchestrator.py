@@ -28,12 +28,15 @@ StageRegistry validates this at startup and raises ValueError if they don't.
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import List, Optional
 
 from loguru import logger
 
-from attachment_blob_sync.config import BlobSyncConfig
-from pipeline.models import PRResult, StageResult
+from utils.config import AppConfig
+from pipeline.attachment_classification_repository import AttachmentClassificationRepository
+from pipeline.models import PRResult, StageResult, StageStatus
 from pipeline.repository import PipelineRepository
 from pipeline.stage_registry import StageRegistry
 from pipeline.stages.base import BaseStage
@@ -43,6 +46,8 @@ from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
 from pipeline.stages.ingestion import IngestionStage
 from pipeline.tracker import PipelineTracker
 
+_WORK_DIR = Path("work")
+
 
 class PipelineOrchestrator:
     """
@@ -51,7 +56,7 @@ class PipelineOrchestrator:
     Parameters
     ----------
     config:
-        Shared BlobSyncConfig used by all stages (holds DB and Blob creds).
+        Shared AppConfig used by all stages (holds DB and Blob creds).
     limit:
         Optional cap on the number of PRs processed per run.
         None = process everything.
@@ -70,7 +75,7 @@ class PipelineOrchestrator:
 
     def __init__(
         self,
-        config: BlobSyncConfig,
+        config: AppConfig,
         limit: Optional[int] = None,
         stages: Optional[List[BaseStage]] = None,
     ) -> None:
@@ -78,6 +83,7 @@ class PipelineOrchestrator:
         self._log        = logger.bind(component="PipelineOrchestrator")
         self._repository = PipelineRepository(config.get_azure_conn_str(), limit=limit)
         self._tracker    = PipelineTracker(config.get_azure_conn_str())
+        self._att_repo   = AttachmentClassificationRepository(config.get_azure_conn_str())
 
         # Load stage definitions from DB — single source of truth
         self._registry = StageRegistry(config.get_azure_conn_str())
@@ -139,12 +145,46 @@ class PipelineOrchestrator:
         """
         Runs stages in order for a single PR.
 
+        Before stages begin, clears all prior pipeline output for this PR so
+        every run starts from a clean slate — handles both first-time PRs
+        (no-op) and retries (removes stale rows and local files).
+
         On stage failure:
           - Writes to ras_pipeline_exceptions + marks ras_tracker = EXCEPTION
           - Immediately stops all further stages for this PR  (break)
           - Returns so the caller loop can continue to the next PR
         """
         stage_results: List[StageResult] = []
+
+        # ── Pre-run cleanup ───────────────────────────────────────────────
+        # Delete all pipeline output rows for this PR from the DB (via SP),
+        # then wipe the local work folder so we download fresh from source.
+        # Safe for new PRs — the SP and rmtree are both no-ops when nothing exists.
+        try:
+            self._att_repo.cleanup_for_pr(pr_no)
+        except Exception as exc:
+            self._log.opt(exception=True).error(
+                f"Pre-run DB cleanup failed for PR={pr_no!r} — aborting PR: {exc}"
+            )
+            self._handle_stage_failure(pr_no, StageResult(
+                stage_name="PRE_RUN_CLEANUP",
+                status=StageStatus.FAILED,
+                error=exc,
+            ))
+            return PRResult(
+                purchase_req_no=pr_no,
+                stage_results=[StageResult(
+                    stage_name="PRE_RUN_CLEANUP",
+                    status=StageStatus.FAILED,
+                    error=exc,
+                )],
+            )
+
+        safe_pr    = pr_no.replace("/", "_")
+        work_folder = _WORK_DIR / "procurement" / safe_pr
+        if work_folder.exists():
+            shutil.rmtree(work_folder)
+            self._log.debug(f"Removed local work folder: {work_folder}")
 
         for stage in self._stages:
             result = stage.run(pr_no)
@@ -171,14 +211,24 @@ class PipelineOrchestrator:
           1. Mark ras_tracker.current_stage_fk = 'EXCEPTION'
           2. Insert a row into ras_pipeline_exceptions
 
+        If stage_id == 0 (PRE_RUN_CLEANUP has no DB stage row), skip the
+        ras_pipeline_exceptions insert — just mark the tracker as EXCEPTION.
+
         If the DB write itself fails, log the error but do NOT re-raise —
         the PR is already counted as failed in the run summary.
         """
         error_message = str(result.error) if result.error else "Unknown error"
+        if result.stage_id == 0:
+            # Not a real pipeline stage — can't FK to pipeline_stages; just log.
+            self._log.warning(
+                f"Stage failure recorded (no DB exception row) for PR={pr_no!r} "
+                f"stage={result.stage_name!r}: {error_message}"
+            )
+            return
         try:
             self._tracker.record_exception(
                 purchase_req_no=pr_no,
-                stage_name=result.stage_name,
+                stage_id=result.stage_id,
                 error_message=error_message,
             )
         except Exception as exc:
@@ -211,7 +261,7 @@ class PipelineOrchestrator:
         self._log.info("=" * 60)
 
     @staticmethod
-    def _build_default_stages(config: BlobSyncConfig) -> List[BaseStage]:
+    def _build_default_stages(config: AppConfig) -> List[BaseStage]:
         """
         Ordered stage list for the ATTACHMENT domain pipeline.
 

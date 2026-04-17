@@ -1,10 +1,12 @@
-import pyodbc
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+import pyodbc
 from loguru import logger
 
+from db.connection import get_connection
 from .db_manager import BaseSyncManager, _quote_table
 from .config import SYNC_CONTROL_TABLE, SYNC_STATUS_TABLE, BATCH_SIZE, AZURE_BATCH_SIZE, PARALLEL_WORKERS
 
@@ -171,8 +173,7 @@ class PurchaseSyncManager(BaseSyncManager):
                 # guarantees no stale/idle connection can time out
                 src = BaseSyncManager(self.source_manager.conn_str)
                 src.connect()
-                az_conn = pyodbc.connect(self.conn_str, autocommit=False)
-                az_conn.timeout = 0
+                az_conn = get_connection(self.conn_str, autocommit=False)
                 az_cur = az_conn.cursor()
 
                 try:
@@ -213,10 +214,9 @@ class PurchaseSyncManager(BaseSyncManager):
                                         az_conn.close()
                                     except Exception:
                                         pass
-                                    az_conn = pyodbc.connect(
+                                    az_conn = get_connection(
                                         self.conn_str, autocommit=False
                                     )
-                                    az_conn.timeout = 0
                                     az_cur = az_conn.cursor()
                                 else:
                                     raise

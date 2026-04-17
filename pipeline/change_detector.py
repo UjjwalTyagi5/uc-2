@@ -40,8 +40,8 @@ from typing import List
 import pyodbc
 from loguru import logger
 
-from attachment_blob_sync.config import BlobSyncConfig
-from pipeline.db_utils import connect_with_retry
+from utils.config import AppConfig
+from db.connection import connect_with_retry
 
 # PRs with these approval statuses are eligible for processing.
 # Case-insensitive comparison is done in SQL with UPPER().
@@ -56,9 +56,12 @@ class SourceChangeDetector:
     Parameters
     ----------
     config:
-        Shared BlobSyncConfig — only the Azure SQL connection string is used.
+        Shared AppConfig — only the Azure SQL connection string is used.
     """
 
+    # PRs with REJECTED / REJECT status are intentionally excluded by the
+    # IN ('APPROVED BY ALL', ...) allowlist — they are never re-queued even
+    # if their U_DATETIME changes (e.g. someone edits a rejected PR).
     _CHANGED_PRS_SQL = """
         SELECT prm.[PURCHASE_REQ_NO]
         FROM   [ras_procurement].[purchase_req_mst] prm
@@ -74,11 +77,12 @@ class SourceChangeDetector:
     _REQUEUE_SQL = """
         UPDATE [ras_procurement].[ras_tracker]
         SET    [current_stage_fk] = 'INGESTION',
+               [retry_count]      = [retry_count] + 1,
                [updated_at]       = GETUTCDATE()
         WHERE  [purchase_req_no_fk] = ?
     """
 
-    def __init__(self, config: BlobSyncConfig) -> None:
+    def __init__(self, config: AppConfig) -> None:
         self._conn_str = config.get_azure_conn_str()
         self._log      = logger.bind(component="SourceChangeDetector")
 

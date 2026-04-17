@@ -29,7 +29,7 @@ On success, advances ras_tracker.current_stage_fk to 'BLOB_UPLOAD'.
 
 from __future__ import annotations
 
-from attachment_blob_sync.config import BlobSyncConfig
+from utils.config import AppConfig
 from attachment_blob_sync.sync import AttachmentBlobSync
 from pipeline.stages.base import BaseStage
 from pipeline.tracker import PipelineTracker
@@ -48,7 +48,7 @@ class BlobUploadStage(BaseStage):
     NAME     = "BLOB_UPLOAD"
     STAGE_ID = 3
 
-    def __init__(self, config: BlobSyncConfig) -> None:
+    def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._config  = config
         self._tracker = PipelineTracker(config.get_azure_conn_str())

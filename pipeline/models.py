@@ -46,6 +46,7 @@ class StageResult:
 
     stage_name:    str
     status:        StageStatus
+    stage_id:      int                 = 0     # matches pipeline_stages.stage_id; 0 = no DB stage
     duration_secs: float               = 0.0
     error:         Optional[Exception] = field(default=None, compare=False)
 

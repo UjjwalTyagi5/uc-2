@@ -1,124 +1,182 @@
 """
 attachment_blob_sync.sync
 ~~~~~~~~~~~~~~~~~~~~~~~~~
-Core logic for downloading attachments and uploading them to Azure Blob.
+Downloads attachments from the on-prem DB, saves locally, uploads to
+Azure Blob, and keeps the BI dashboard row current.
 
-Public API (used by pipeline stages)
---------------------------------------
+Public API
+----------
 save_locally(pr_no)
-    Downloads all binary attachments for the PR from the on-prem DB and
-    saves them to work/procurement/{safe_pr}/{att_id}/{filename}.
-    Does NOT upload to blob, does NOT touch ras_tracker.
-    Called by BlobUploadStage.
+    Downloads binary attachments from DB → work/procurement/{safe_pr}/{att_id}/{filename}.
+    Does NOT upload to blob. Called by EmbedDocExtractionStage.
 
 upload_work_folder_to_blob(pr_no)
-    Walks work/procurement/{safe_pr}/ recursively and uploads every file
-    to Azure Blob at the same relative path (blob path mirrors local path
-    under work/).  Includes parent files AND any extracted sub-files added
-    by EmbedDocExtractionStage.
-    Does NOT touch ras_tracker.
-    Called by EmbedDocExtractionStage after extraction is complete.
+    Uploads the entire work/procurement/{safe_pr}/ folder to Azure Blob,
+    preserving directory structure. Called by BlobUploadStage.
 
-run(pr_no)                           [CLI / standalone use]
-    Convenience method that calls save_locally() + upload_work_folder_to_blob()
-    + updates ras_tracker + syncs BI dashboard.
-    Used by `python -m attachment_blob_sync --pr-no <PR>`.
+sync_bi_dashboard_for_pr(pr_no)
+    Refreshes the BI dashboard row for this PR (DELETE + re-INSERT).
+    Called by ClassificationStage after every successful pipeline run.
+
+run(pr_no)
+    Convenience for CLI / standalone use: save_locally + upload + tracker update.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
-import pyodbc
-from loguru import logger
-from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import AzureError
+from azure.storage.blob import BlobServiceClient
 
-from attachment_blob_sync.config import BlobSyncConfig
-from pipeline.db_utils import connect_with_retry
-
-_MAX_RETRIES = 3
-_WORK_DIR    = Path("work")
+from db.crud import BaseRepository
+from db.tables import AzureTables, OnPremTables
+from utils.config import ALLOWED_ATTACHMENT_EXTENSIONS, AppConfig
 
 
-class AttachmentBlobSync:
-    def __init__(self, config: BlobSyncConfig):
-        self._config = config
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Public API
-    # ──────────────────────────────────────────────────────────────────────
+# ── SQL (module-level, like reference pattern) ─────────────────────────────
+
+_FETCH_ATTACHMENTS_SQL = f"""
+    SELECT pa.[ATTACHMENT_ID], pa.[FILES_NAME]
+    FROM   {AzureTables.PURCHASE_REQ_MST}  prm
+    JOIN   {AzureTables.PURCHASE_ATTACHMENTS} pa
+      ON   prm.[PURCHASE_REQ_ID] = pa.[PURCHASE_ID]
+    WHERE  prm.[PURCHASE_REQ_NO] = ?
+      AND  pa.[ATTACHMENT_ID]    IS NOT NULL
+      AND  pa.[FILES_NAME]       IS NOT NULL
+"""
+
+_FETCH_BINARY_DOCS_SQL = f"""
+    SELECT [attachment_id], [doc]
+    FROM   {OnPremTables.RAS_ATTACHMENTS}
+    WHERE  [attachment_id] IN ({{placeholders}})
+      AND  [doc] IS NOT NULL
+"""
+
+_FETCH_BI_DASHBOARD_SQL = f"""
+    SELECT * FROM {OnPremTables.BI_DASHBOARD}
+    WHERE  [PURCHASE_REQ_NO] = ?
+"""
+
+_DELETE_BI_DASHBOARD_SQL = f"""
+    DELETE FROM {AzureTables.BI_DASHBOARD}
+    WHERE  [PURCHASE_REQ_NO] = ?
+"""
+
+_UPSERT_TRACKER_SQL = f"""
+    MERGE {AzureTables.RAS_TRACKER} WITH (HOLDLOCK) AS target
+    USING (
+        SELECT
+            [PURCHASE_REQ_NO]             AS purchase_req_no_fk,
+            [JUSTIFICATION]               AS ras_justification,
+            [CURRENCY]                    AS currency,
+            [C_DATETIME]                  AS ras_created_at,
+            [U_DATETIME]                  AS ras_updated_at,
+            [PURCHASEFINALAPPROVALSTATUS]  AS ras_status
+        FROM {AzureTables.PURCHASE_REQ_MST}
+        WHERE [PURCHASE_REQ_NO] = ?
+    ) AS src
+      ON target.[purchase_req_no_fk] = src.[purchase_req_no_fk]
+    WHEN MATCHED THEN
+        UPDATE SET
+            [current_stage_fk] = 'BLOB_UPLOAD',
+            [updated_at]       = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+        INSERT (
+            [purchase_req_no_fk], [ras_justification], [currency],
+            [ras_created_at], [ras_updated_at], [ras_status], [current_stage_fk]
+        )
+        VALUES (
+            src.[purchase_req_no_fk], src.[ras_justification], src.[currency],
+            src.[ras_created_at], src.[ras_updated_at], src.[ras_status], 'BLOB_UPLOAD'
+        );
+"""
+
+
+# ── Repository class ───────────────────────────────────────────────────────
+
+class AttachmentBlobSync(BaseRepository):
+    """
+    Manages the full lifecycle of PR attachments:
+      DB download → local save → Azure Blob upload → BI dashboard sync.
+
+    Inherits BaseRepository (Azure SQL as primary).
+    Uses _ras_conn_str for on-prem SQL Server reads.
+    """
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__(config.get_azure_conn_str())
+        self._ras_conn_str     = config.get_ras_conn_str()
+        self._config           = config
+        self._work_dir         = Path(config.WORK_DIR)
+        self._max_blob_retries = config.BLOB_MAX_RETRIES
+
+    # ── Public API ─────────────────────────────────────────────────────────
 
     def save_locally(self, purchase_req_no: str) -> int:
         """
         Downloads all attachments for the PR from the DB and saves them to:
-            work/procurement/{safe_pr}/{att_id}/{filename}
+            work/procurement/{sanitized_pr}/{att_id}/{filename}
 
         Returns the number of files saved.
         Does NOT upload to blob and does NOT update ras_tracker.
-
-        Raises on any unrecoverable DB error.
         """
-        logger.info(f"Saving attachments locally for PR: {purchase_req_no}")
-        primary_conn = connect_with_retry(self._config.get_azure_conn_str(), autocommit=False)
-        ras_conn     = connect_with_retry(self._config.get_ras_conn_str(),   autocommit=False)
-        try:
-            attachments = self._fetch_attachments(primary_conn, purchase_req_no)
-            if not attachments:
-                logger.warning(f"No attachments found for PR: {purchase_req_no}")
-                return 0
+        self._log.info(f"Saving attachments locally for PR: {purchase_req_no}")
 
-            logger.info(f"Found {len(attachments)} attachment(s) for PR: {purchase_req_no}")
-            attachment_ids = [att_id for att_id, _ in attachments]
-            binary_docs    = self._fetch_binary_docs(ras_conn, attachment_ids)
+        attachments = self._get_attachments(purchase_req_no)
+        if not attachments:
+            self._log.warning(f"No attachments found for PR: {purchase_req_no}")
+            return 0
 
-            if not binary_docs:
-                logger.warning(
-                    f"No binary data found in ras_attachments for PR: {purchase_req_no} "
-                    f"(attachment_ids: {attachment_ids})"
+        self._log.info(f"Found {len(attachments)} attachment(s) for PR: {purchase_req_no}")
+
+        attachment_ids = [att_id for att_id, _ in attachments]
+        binary_docs    = self._get_binary_docs(attachment_ids)
+
+        if not binary_docs:
+            self._log.warning(
+                f"No binary data found for PR: {purchase_req_no} "
+                f"(attachment_ids: {attachment_ids})"
+            )
+            return 0
+
+        saved = 0
+        for att_id, files_name in attachments:
+            ext = Path(files_name).suffix.lower()
+            if ext not in ALLOWED_ATTACHMENT_EXTENSIONS:
+                self._log.warning(
+                    f"Skipping att_id={att_id} ({files_name}) — "
+                    f"extension {ext!r} not in allowed list"
                 )
-                return 0
+                continue
 
-            saved = 0
-            for att_id, files_name in attachments:
-                doc_bytes = binary_docs.get(att_id)
-                if doc_bytes is None:
-                    logger.warning(
-                        f"Skipping attachment_id={att_id} ({files_name}) — no binary doc found"
-                    )
-                    continue
-                self._save_local(purchase_req_no, att_id, files_name, doc_bytes)
-                saved += 1
+            doc_bytes = binary_docs.get(att_id)
+            if doc_bytes is None:
+                self._log.warning(f"Skipping att_id={att_id} ({files_name}) — no binary doc")
+                continue
 
-            logger.info(f"Saved {saved} file(s) locally for PR: {purchase_req_no}")
-            return saved
+            self._save_local(purchase_req_no, att_id, files_name, doc_bytes)
+            saved += 1
 
-        finally:
-            primary_conn.close()
-            ras_conn.close()
+        self._log.info(f"Saved {saved} file(s) locally for PR: {purchase_req_no}")
+        return saved
 
     def upload_work_folder_to_blob(self, purchase_req_no: str) -> int:
         """
         Uploads the entire work/procurement/{safe_pr}/ folder to Azure Blob,
-        preserving directory structure.
-
-        Blob path = file path relative to work/:
-            local:  work/procurement/R_134984_2020/452205/invoice.pdf
-            blob:   procurement/R_134984_2020/452205/invoice.pdf
-
-            local:  work/procurement/R_134984_2020/452205/extracted/doc__embed.pdf
-            blob:   procurement/R_134984_2020/452205/extracted/doc__embed.pdf
+        preserving directory structure under work/.
 
         Returns the number of files uploaded.
         Does NOT update ras_tracker.
-
-        Raises RuntimeError if the local folder doesn't exist or any upload fails.
         """
-        safe_pr      = self._sanitize_pr_no(purchase_req_no)
-        local_folder = _WORK_DIR / "procurement" / safe_pr
+        safe_pr      = _sanitize_pr_no(purchase_req_no)
+        local_folder = self._work_dir / "procurement" / safe_pr
 
         if not local_folder.exists():
             raise RuntimeError(
                 f"Local work folder not found: {local_folder} — "
-                f"ensure save_locally() ran before upload_work_folder_to_blob()."
+                f"run save_locally() before upload_work_folder_to_blob()."
             )
 
         container_client = (
@@ -131,26 +189,24 @@ class AttachmentBlobSync:
 
         all_files = sorted(f for f in local_folder.rglob("*") if f.is_file())
         if not all_files:
-            logger.warning(f"No files found in {local_folder} to upload")
+            self._log.warning(f"No files found in {local_folder} to upload")
             return 0
 
-        logger.info(
-            f"Uploading {len(all_files)} file(s) from {local_folder} to blob "
+        self._log.info(
+            f"Uploading {len(all_files)} file(s) from {local_folder} "
             f"for PR: {purchase_req_no}"
         )
 
         success_count = 0
         fail_count    = 0
         for file_path in all_files:
-            # blob path mirrors the local path relative to work/
-            blob_path = file_path.relative_to(_WORK_DIR).as_posix()
-            data      = file_path.read_bytes()
-            if self._upload_blob(container_client, blob_path, data):
+            blob_path = file_path.relative_to(self._work_dir).as_posix()
+            if self._upload_blob(container_client, blob_path, file_path.read_bytes()):
                 success_count += 1
             else:
                 fail_count += 1
 
-        logger.info(
+        self._log.info(
             f"PR {purchase_req_no}: {success_count} uploaded, {fail_count} failed"
         )
 
@@ -163,214 +219,138 @@ class AttachmentBlobSync:
 
     def sync_bi_dashboard_for_pr(self, purchase_req_no: str) -> None:
         """
-        Syncs the BI dashboard row for a single PR.
+        Refreshes the BI dashboard row for a PR: reads from on-prem view,
+        deletes the old Azure row, inserts fresh data.
 
-        Called by ClassificationStage (the final pipeline stage) after every
-        successful pipeline run — both first-time processing and re-processing
-        after source-data changes.
-
-        Opens its own connections and closes them in a finally block.
-        Raises on unrecoverable DB error.
+        Called by ClassificationStage on every pipeline run (first-time
+        and re-process).
         """
-        logger.info(f"Syncing BI dashboard for PR: {purchase_req_no}")
-        ras_conn   = connect_with_retry(self._config.get_ras_conn_str(),   autocommit=False)
-        azure_conn = connect_with_retry(self._config.get_azure_conn_str(), autocommit=False)
+        self._log.info(f"Syncing BI dashboard for PR: {purchase_req_no}")
+
+        # Read source from on-prem (get column names too for dynamic INSERT)
+        rows, columns = self._fetch_from_with_columns(
+            self._ras_conn_str, _FETCH_BI_DASHBOARD_SQL, purchase_req_no
+        )
+
+        # Delete old + insert fresh in one Azure transaction
+        conn = self._connect_write()
         try:
-            self._sync_bi_dashboard(ras_conn, azure_conn, purchase_req_no)
+            cursor = conn.cursor()
+
+            cursor.execute(_DELETE_BI_DASHBOARD_SQL, purchase_req_no)
+            deleted = cursor.rowcount
+
+            if rows:
+                col_list     = ", ".join(f"[{c}]" for c in columns)
+                placeholders = ", ".join("?" * len(columns))
+                insert_sql   = (
+                    f"INSERT INTO {AzureTables.BI_DASHBOARD} "
+                    f"({col_list}) VALUES ({placeholders})"
+                )
+                cursor.fast_executemany = True
+                cursor.executemany(insert_sql, [list(row) for row in rows])
+
+            conn.commit()
+            self._log.info(
+                f"BI dashboard sync for PR {purchase_req_no}: "
+                f"deleted {deleted} row(s), inserted {len(rows)} row(s)"
+            )
+        except Exception:
+            conn.rollback()
+            raise
         finally:
-            ras_conn.close()
-            azure_conn.close()
+            conn.close()
 
     def run(self, purchase_req_no: str) -> None:
         """
         Standalone / CLI entry point — runs the full attachment pipeline:
           1. Save all binary attachments locally (DB → work/)
-          2. Upload entire work folder to blob (work/ → Azure Blob)
+          2. Upload entire work folder to blob  (work/ → Azure Blob)
           3. Update ras_tracker.current_stage_fk = 'BLOB_UPLOAD'
-          4. Sync BI dashboard view
+          4. Sync BI dashboard row
 
         Pipeline stages call save_locally() and upload_work_folder_to_blob()
         individually so they can manage their own tracker updates.
         """
-        logger.info(f"=== attachment_blob_sync started for PR: {purchase_req_no} ===")
-
-        primary_conn = connect_with_retry(self._config.get_azure_conn_str(), autocommit=False)
-        ras_conn     = connect_with_retry(self._config.get_ras_conn_str(),   autocommit=False)
+        self._log.info(f"=== attachment_blob_sync started for PR: {purchase_req_no} ===")
 
         run_error: Exception | None = None
         try:
-            try:
-                saved = self.save_locally(purchase_req_no)
-                if saved > 0:
-                    self.upload_work_folder_to_blob(purchase_req_no)
-                    self._upsert_tracker(primary_conn, purchase_req_no)
-                    primary_conn.commit()
-                    logger.info(
-                        f"Tracker updated: current_stage_fk = 'BLOB_UPLOAD' "
-                        f"for PR {purchase_req_no}"
-                    )
-            except Exception as exc:
-                run_error = exc
-                logger.opt(exception=True).error(
-                    f"Attachment sync failed for PR {purchase_req_no}: {exc}"
+            saved = self.save_locally(purchase_req_no)
+            if saved > 0:
+                self.upload_work_folder_to_blob(purchase_req_no)
+                self._execute(_UPSERT_TRACKER_SQL, purchase_req_no)
+                self._log.info(
+                    f"Tracker updated: current_stage_fk = 'BLOB_UPLOAD' "
+                    f"for PR {purchase_req_no}"
                 )
+        except Exception as exc:
+            run_error = exc
+            self._log.opt(exception=True).error(
+                f"Attachment sync failed for PR {purchase_req_no}: {exc}"
+            )
 
-            # BI dashboard sync always runs regardless of upload result
-            try:
-                self._sync_bi_dashboard(ras_conn, primary_conn, purchase_req_no)
-            except Exception as exc:
-                logger.error(f"BI dashboard sync failed for PR {purchase_req_no}: {exc}")
+        # BI dashboard sync always runs regardless of upload result
+        try:
+            self.sync_bi_dashboard_for_pr(purchase_req_no)
+        except Exception as exc:
+            self._log.error(f"BI dashboard sync failed for PR {purchase_req_no}: {exc}")
 
-            if run_error is not None:
-                raise run_error
+        self._log.info(f"=== attachment_blob_sync finished for PR: {purchase_req_no} ===")
 
-        finally:
-            primary_conn.close()
-            ras_conn.close()
-            logger.info(f"=== attachment_blob_sync finished for PR: {purchase_req_no} ===")
+        if run_error is not None:
+            raise run_error
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Internal helpers
-    # ──────────────────────────────────────────────────────────────────────
+    # ── Internal helpers ───────────────────────────────────────────────────
 
-    def _fetch_attachments(self, conn: pyodbc.Connection, purchase_req_no: str) -> list:
-        sql = """
-            SELECT pa.[ATTACHMENT_ID], pa.[FILES_NAME]
-            FROM [ras_procurement].[purchase_req_mst]  prm
-            JOIN [ras_procurement].[purchase_attachments] pa
-              ON prm.[PURCHASE_REQ_ID] = pa.[PURCHASE_ID]
-            WHERE prm.[PURCHASE_REQ_NO] = ?
-              AND pa.[ATTACHMENT_ID] IS NOT NULL
-              AND pa.[FILES_NAME]    IS NOT NULL
-        """
-        cursor = conn.cursor()
-        cursor.execute(sql, purchase_req_no)
-        rows = cursor.fetchall()
-        cursor.close()
+    def _get_attachments(self, purchase_req_no: str) -> list[tuple[int, str]]:
+        """Returns [(attachment_id, files_name), ...] from Azure SQL."""
+        rows = self._fetch(_FETCH_ATTACHMENTS_SQL, purchase_req_no)
         return [(int(row[0]), str(row[1])) for row in rows]
 
-    def _fetch_binary_docs(self, conn: pyodbc.Connection, attachment_ids: list) -> dict:
+    def _get_binary_docs(self, attachment_ids: list[int]) -> dict[int, bytes]:
+        """Returns {attachment_id: doc_bytes} from the on-prem RAS database."""
         if not attachment_ids:
             return {}
         placeholders = ", ".join("?" * len(attachment_ids))
-        sql = f"""
-            SELECT [attachment_id], [doc]
-            FROM [ras_attachments]
-            WHERE [attachment_id] IN ({placeholders})
-              AND [doc] IS NOT NULL
-        """
-        cursor = conn.cursor()
-        cursor.execute(sql, attachment_ids)
-        rows = cursor.fetchall()
-        cursor.close()
+        sql  = _FETCH_BINARY_DOCS_SQL.format(placeholders=placeholders)
+        rows = self._fetch_from(self._ras_conn_str, sql, *attachment_ids)
         return {int(row[0]): bytes(row[1]) for row in rows}
 
-    @staticmethod
-    def _sanitize_pr_no(pr_no: str) -> str:
-        """Replace '/' in PURCHASE_REQ_NO to avoid unintended blob sub-directories."""
-        return pr_no.replace("/", "_")
-
     def _upload_blob(self, container_client, blob_path: str, data: bytes) -> bool:
-        """
-        Uploads data to blob_path with up to _MAX_RETRIES attempts on AzureError.
-        Returns True on success, False after all retries are exhausted.
-        """
+        """Upload `data` to `blob_path` with up to self._max_blob_retries attempts."""
         blob_client = container_client.get_blob_client(blob_path)
-        for attempt in range(1, _MAX_RETRIES + 1):
+        for attempt in range(1, self._max_blob_retries + 1):
             try:
                 blob_client.upload_blob(data, overwrite=True)
-                logger.debug(f"Uploaded: {blob_path}")
+                self._log.debug(f"Uploaded: {blob_path}")
                 return True
             except AzureError as exc:
-                if attempt < _MAX_RETRIES:
-                    logger.warning(
-                        f"Upload attempt {attempt}/{_MAX_RETRIES} failed for {blob_path}: {exc}"
+                if attempt < self._max_blob_retries:
+                    self._log.warning(
+                        f"Upload attempt {attempt}/{self._max_blob_retries} failed "
+                        f"for {blob_path}: {exc}"
                     )
                 else:
-                    logger.error(
-                        f"Upload failed after {_MAX_RETRIES} attempts for {blob_path}: {exc}"
+                    self._log.error(
+                        f"Upload failed after {self._max_blob_retries} attempts "
+                        f"for {blob_path}: {exc}"
                     )
         return False
 
-    def _save_local(self, pr_no: str, att_id: int, files_name: str, data: bytes) -> None:
-        """
-        Saves binary data to:
-            work/procurement/{sanitized_pr_no}/{att_id}/{files_name}
-        """
-        safe_pr    = self._sanitize_pr_no(pr_no)
-        local_path = _WORK_DIR / "procurement" / safe_pr / str(att_id) / files_name
+    def _save_local(
+        self, pr_no: str, att_id: int, files_name: str, data: bytes
+    ) -> None:
+        """Saves binary data to work/procurement/{safe_pr}/{att_id}/{files_name}."""
+        safe_pr    = _sanitize_pr_no(pr_no)
+        local_path = self._work_dir / "procurement" / safe_pr / str(att_id) / files_name
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(data)
-        logger.debug(f"Saved locally: {local_path}")
+        self._log.debug(f"Saved locally: {local_path}")
 
-    def _sync_bi_dashboard(
-        self,
-        onprem_conn: pyodbc.Connection,
-        azure_conn: pyodbc.Connection,
-        purchase_req_no: str,
-    ) -> None:
-        src_cursor = onprem_conn.cursor()
-        src_cursor.execute(
-            "SELECT * FROM [dbo].[vw_get_ras_data_for_bidashboard] WHERE [PURCHASE_REQ_NO] = ?",
-            purchase_req_no,
-        )
-        rows    = src_cursor.fetchall()
-        columns = [col[0] for col in src_cursor.description]
-        src_cursor.close()
 
-        az_cursor = azure_conn.cursor()
-        az_cursor.execute(
-            "DELETE FROM [ras_procurement].[vw_get_ras_data_for_bidashboard] WHERE [PURCHASE_REQ_NO] = ?",
-            purchase_req_no,
-        )
-        deleted = az_cursor.rowcount
+# ── Module-level utility ───────────────────────────────────────────────────
 
-        if rows:
-            col_list     = ", ".join(f"[{c}]" for c in columns)
-            placeholders = ", ".join("?" * len(columns))
-            insert_sql   = (
-                f"INSERT INTO [ras_procurement].[vw_get_ras_data_for_bidashboard] "
-                f"({col_list}) VALUES ({placeholders})"
-            )
-            az_cursor.fast_executemany = True
-            az_cursor.executemany(insert_sql, [list(row) for row in rows])
-
-        azure_conn.commit()
-        az_cursor.close()
-        logger.info(
-            f"BI dashboard sync for PR {purchase_req_no}: "
-            f"deleted {deleted} old row(s), inserted {len(rows)} row(s)"
-        )
-
-    def _upsert_tracker(self, conn: pyodbc.Connection, purchase_req_no: str) -> None:
-        sql = """
-            MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
-            USING (
-                SELECT
-                    [PURCHASE_REQ_NO]            AS purchase_req_no_fk,
-                    [JUSTIFICATION]              AS ras_justification,
-                    [CURRENCY]                   AS currency,
-                    [C_DATETIME]                 AS ras_created_at,
-                    [U_DATETIME]                 AS ras_updated_at,
-                    [PURCHASEFINALAPPROVALSTATUS] AS ras_status
-                FROM [ras_procurement].[purchase_req_mst]
-                WHERE [PURCHASE_REQ_NO] = ?
-            ) AS src
-              ON target.[purchase_req_no_fk] = src.[purchase_req_no_fk]
-            WHEN MATCHED THEN
-                UPDATE SET
-                    [current_stage_fk] = 'BLOB_UPLOAD',
-                    [updated_at]       = GETUTCDATE()
-            WHEN NOT MATCHED THEN
-                INSERT (
-                    [purchase_req_no_fk], [ras_justification], [currency],
-                    [ras_created_at], [ras_updated_at], [ras_status], [current_stage_fk]
-                )
-                VALUES (
-                    src.[purchase_req_no_fk], src.[ras_justification], src.[currency],
-                    src.[ras_created_at], src.[ras_updated_at], src.[ras_status], 'BLOB_UPLOAD'
-                );
-        """
-        cursor = conn.cursor()
-        cursor.execute(sql, purchase_req_no)
-        cursor.close()
+def _sanitize_pr_no(pr_no: str) -> str:
+    """Replace '/' in PURCHASE_REQ_NO to avoid unintended blob sub-directories."""
+    return pr_no.replace("/", "_")

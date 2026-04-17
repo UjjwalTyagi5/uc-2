@@ -3,7 +3,7 @@ import sys
 
 from loguru import logger
 
-from attachment_blob_sync.config import BlobSyncConfig
+from utils.config import AppConfig
 from attachment_blob_sync.sync import AttachmentBlobSync
 
 
@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        config = BlobSyncConfig()
+        config = AppConfig()
         AttachmentBlobSync(config).run(args.pr_no)
     except Exception as exc:
         logger.error(f"attachment_blob_sync failed: {exc}")

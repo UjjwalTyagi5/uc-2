@@ -23,7 +23,7 @@ All subsequent stages depend on this row existing in ras_tracker.
 
 from __future__ import annotations
 
-from attachment_blob_sync.config import BlobSyncConfig
+from utils.config import AppConfig
 from pipeline.stages.base import BaseStage
 from pipeline.tracker import PipelineTracker
 
@@ -40,7 +40,7 @@ class IngestionStage(BaseStage):
     NAME     = "INGESTION"
     STAGE_ID = 1
 
-    def __init__(self, config: BlobSyncConfig) -> None:
+    def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._tracker = PipelineTracker(config.get_azure_conn_str())
 

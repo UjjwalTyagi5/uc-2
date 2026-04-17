@@ -74,6 +74,7 @@ class BaseStage(ABC):
             )
             return StageResult(
                 stage_name=self.NAME,
+                stage_id=self.STAGE_ID,
                 status=StageStatus.SUCCESS,
                 duration_secs=duration,
             )
@@ -87,6 +88,7 @@ class BaseStage(ABC):
             )
             return StageResult(
                 stage_name=self.NAME,
+                stage_id=self.STAGE_ID,
                 status=StageStatus.FAILED,
                 duration_secs=duration,
                 error=exc,

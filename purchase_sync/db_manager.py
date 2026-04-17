@@ -1,6 +1,9 @@
-import pyodbc
 from abc import ABC
+
+import pyodbc
 from loguru import logger
+
+from db.connection import connect_with_retry
 
 
 def _quote_table(table_name: str) -> str:
@@ -22,8 +25,7 @@ class BaseSyncManager(ABC):
 
     def connect(self):
         try:
-            self.conn = pyodbc.connect(self.conn_str, autocommit=False)
-            self.conn.timeout = 0  # no query execution timeout
+            self.conn = connect_with_retry(self.conn_str, autocommit=False)
             self.cursor = self.conn.cursor()
             logger.info("Connected to DB")
         except Exception as e:

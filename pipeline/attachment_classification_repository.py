@@ -18,6 +18,25 @@ Write path (called from EmbedDocExtractionStage)
        MERGE on (attachment_classify_uuid_pk, file_path).
 
 Both methods open a fresh connection per call and commit in a finally block.
+
+Cleanup path (called from PipelineOrchestrator before each PR run)
+------------------------------------------------------------------
+3. cleanup_for_pr(purchase_req_no)
+       Calls the stored procedure usp_cleanup_pr_data which deletes all
+       PR-specific rows across every pipeline output table — in FK-safe order,
+       inside a single DB transaction — before stages run.
+
+       Tables cleaned (in order):
+         EmbeddedAttachmentClassification  (FK child of AttachmentClassification)
+         AttachmentClassification
+         vw_get_ras_data_for_bidashboard   (BI dashboard)
+
+       ras_tracker and ras_pipeline_exceptions are intentionally NOT cleaned —
+       ras_tracker tracks pipeline state; ras_pipeline_exceptions is kept as
+       audit history across all runs.
+
+       Required DB migration (run once):
+           See migration SQL in db/migrations/usp_cleanup_pr_data.sql
 """
 
 from __future__ import annotations
@@ -100,6 +119,10 @@ class AttachmentClassificationRepository:
         WHERE  [purchase_req_no_fk] = ?
     """
 
+    # Calls the stored procedure that wipes all pipeline output rows for a PR
+    # before we (re-)process it, so we always start from a clean slate.
+    _CLEANUP_SP_SQL = "EXEC [ras_procurement].[usp_cleanup_pr_data] ?"
+
     def __init__(self, conn_str: str) -> None:
         self._conn_str = conn_str
         self._log      = logger.bind(component="AttachmentClassificationRepository")
@@ -122,6 +145,43 @@ class AttachmentClassificationRepository:
             self._log.error(
                 f"get_tracker_uuid failed for PR={purchase_req_no!r}: {exc}"
             )
+            raise
+        finally:
+            conn.close()
+
+    def cleanup_for_pr(self, purchase_req_no: str) -> None:
+        """
+        Deletes all pipeline output rows for this PR before (re-)processing.
+
+        Delegates entirely to the stored procedure usp_cleanup_pr_data so that
+        FK ordering and transaction management live in one place in the DB.
+
+        Tables cleared by the SP (in order):
+          1. EmbeddedAttachmentClassification  (FK child — must go first)
+          2. AttachmentClassification
+          3. vw_get_ras_data_for_bidashboard
+
+        ras_tracker and ras_pipeline_exceptions are intentionally NOT touched.
+
+        Safe to call for brand-new PRs — the SP is a no-op when no rows exist.
+
+        Raises
+        ------
+        pyodbc.Error
+            If the SP call fails (logged + re-raised so the orchestrator can
+            record the exception and skip this PR).
+        """
+        self._log.debug(f"cleanup_for_pr PR={purchase_req_no!r}")
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(self._CLEANUP_SP_SQL, purchase_req_no)
+            conn.commit()
+            cursor.close()
+            self._log.info(f"Pre-run cleanup done for PR={purchase_req_no!r}")
+        except pyodbc.Error as exc:
+            conn.rollback()
+            self._log.error(f"cleanup_for_pr failed for PR={purchase_req_no!r}: {exc}")
             raise
         finally:
             conn.close()
@@ -253,5 +313,5 @@ class AttachmentClassificationRepository:
     # ── Private helpers ────────────────────────────────────────────────────
 
     def _connect(self) -> pyodbc.Connection:
-        from pipeline.db_utils import connect_with_retry
+        from db.connection import connect_with_retry
         return connect_with_retry(self._conn_str, autocommit=False)

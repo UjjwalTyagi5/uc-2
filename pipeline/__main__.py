@@ -22,7 +22,8 @@ from pathlib import Path
 
 from loguru import logger
 
-from attachment_blob_sync.config import BlobSyncConfig
+from utils.config import AppConfig
+from db.connection import connect_with_retry
 from pipeline.change_detector import SourceChangeDetector
 from pipeline.orchestrator import PipelineOrchestrator
 
@@ -100,6 +101,37 @@ def _configure_logging() -> None:
     logger.info(f"Logs writing to: {_LOG_DIR.resolve()}")
 
 
+def _verify_connections(config: AppConfig) -> None:
+    """
+    Smoke-tests both DB connections before the pipeline does any real work.
+
+    Runs SELECT 1 against:
+      - Azure SQL  (ras_procurement schema — pipeline writes)
+      - On-prem SQL Server (ras_attachments — binary blob reads)
+
+    Exits with code 1 if either connection fails so the problem is caught
+    immediately with a clear error rather than partway through processing.
+    """
+    checks = [
+        ("Azure SQL",  config.get_azure_conn_str()),
+        ("On-prem SQL", config.get_ras_conn_str()),
+    ]
+    failed = False
+    for label, conn_str in checks:
+        try:
+            conn = connect_with_retry(conn_str, autocommit=True)
+            conn.cursor().execute("SELECT 1")
+            conn.close()
+            logger.info(f"DB connection OK: {label}")
+        except Exception as exc:
+            logger.critical(f"DB connection FAILED: {label} — {exc}")
+            failed = True
+
+    if failed:
+        logger.critical("One or more DB connections failed — aborting pipeline")
+        sys.exit(1)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m pipeline",
@@ -128,10 +160,12 @@ def main() -> None:
     args = _build_parser().parse_args()
 
     try:
-        config = BlobSyncConfig()
+        config = AppConfig()
     except EnvironmentError as exc:
         logger.critical(f"Configuration error — cannot start pipeline: {exc}")
         sys.exit(1)
+
+    _verify_connections(config)
 
     # Re-queue completed PRs whose source data changed since last processing.
     # Runs before the main pipeline so the pipeline picks up re-queued PRs

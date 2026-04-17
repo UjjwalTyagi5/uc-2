@@ -180,5 +180,5 @@ class StageRegistry:
             conn.close()
 
     def _connect(self) -> pyodbc.Connection:
-        from pipeline.db_utils import connect_with_retry
+        from db.connection import connect_with_retry
         return connect_with_retry(self._conn_str, autocommit=True)
