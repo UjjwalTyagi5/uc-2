@@ -29,6 +29,8 @@ StageRegistry validates this at startup and raises ValueError if they don't.
 from __future__ import annotations
 
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 
@@ -128,11 +130,15 @@ class PipelineOrchestrator:
             self._log.info("Nothing to process — pipeline run finished")
             return []
 
-        results: List[PRResult] = []
-        for idx, pr_no in enumerate(pending, 1):
-            self._log.info(f"--- [{idx}/{total}] PR: {pr_no!r} ---")
-            result = self._process_pr(pr_no)
-            results.append(result)
+        workers = self._config.PIPELINE_WORKERS
+        if workers > 1:
+            self._log.info(f"Processing {total} PRs with {workers} parallel workers")
+            results = self._run_parallel(pending, workers)
+        else:
+            results = []
+            for idx, pr_no in enumerate(pending, 1):
+                self._log.info(f"--- [{idx}/{total}] PR: {pr_no!r} ---")
+                results.append(self._process_pr(pr_no))
 
         self._log_summary(results)
         return results
@@ -140,6 +146,53 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _run_parallel(self, pr_nos: List[str], workers: int) -> List[PRResult]:
+        """
+        Process pr_nos concurrently using a thread pool.
+
+        Uses ThreadPoolExecutor — appropriate because all pipeline work is
+        I/O-bound (DB queries, blob uploads, file I/O).  Each thread opens
+        its own pyodbc connections and writes to its own work subfolder so
+        there is no shared mutable state between workers.
+
+        Results are returned in completion order (not submission order) for
+        live progress logging; the summary at the end is unaffected.
+        """
+        total     = len(pr_nos)
+        results: List[PRResult] = []
+        counter_lock = threading.Lock()
+        completed    = 0
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_pr = {
+                executor.submit(self._process_pr, pr_no): pr_no
+                for pr_no in pr_nos
+            }
+            for future in as_completed(future_to_pr):
+                pr_no = future_to_pr[future]
+                with counter_lock:
+                    completed += 1
+                    idx = completed
+                try:
+                    result = future.result()
+                    results.append(result)
+                    status = "OK" if result.succeeded else "FAILED"
+                    self._log.info(f"[{idx}/{total}] PR={pr_no!r} {status}")
+                except Exception as exc:
+                    self._log.opt(exception=True).error(
+                        f"[{idx}/{total}] PR={pr_no!r} raised unexpectedly: {exc}"
+                    )
+                    results.append(PRResult(
+                        purchase_req_no=pr_no,
+                        stage_results=[StageResult(
+                            stage_name="UNKNOWN",
+                            status=StageStatus.FAILED,
+                            error=exc,
+                        )],
+                    ))
+
+        return results
 
     def _process_pr(self, pr_no: str) -> PRResult:
         """

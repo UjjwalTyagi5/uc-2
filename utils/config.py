@@ -49,6 +49,12 @@ Optional — ETL batch / concurrency settings:
     BATCH_SIZE          rows fetched from on-prem per query      (default: 100000)
     AZURE_BATCH_SIZE    rows per Azure INSERT commit             (default: 2000)
     PARALLEL_WORKERS    parallel threads per table sync          (default: 4)
+
+Optional — Pipeline concurrency:
+    PIPELINE_WORKERS    parallel workers for PR processing       (default: 1)
+                        Set to 2–8 to process multiple PRs at the same time.
+                        Each worker opens its own DB connections and work folder.
+                        Keep at 1 if the DB connection limit is tight.
 """
 
 from __future__ import annotations
@@ -194,6 +200,11 @@ class AppConfig:
         self.BATCH_SIZE        = int(_optional("BATCH_SIZE",        "100000"))
         self.AZURE_BATCH_SIZE  = int(_optional("AZURE_BATCH_SIZE",  "2000"))
         self.PARALLEL_WORKERS  = int(_optional("PARALLEL_WORKERS",  "4"))
+
+        # ── Pipeline concurrency ───────────────────────────────────────────
+        # Number of PRs to process in parallel (ThreadPoolExecutor workers).
+        # 1 = sequential (safe default); raise to 2-8 to speed up large batches.
+        self.PIPELINE_WORKERS  = int(_optional("PIPELINE_WORKERS",  "1"))
 
         # ── Blob upload settings ───────────────────────────────────────────
         # BLOB_MAX_RETRIES : how many times to retry a single file upload
