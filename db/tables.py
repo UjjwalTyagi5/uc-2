@@ -36,8 +36,9 @@ class AzureTables:
     PIPELINE_STAGES          = "[ras_procurement].[pipeline_stages]"
 
     # ── Attachment classification ──────────────────────────────────────────
-    ATTACHMENT_CLASSIFICATION          = "[ras_procurement].[AttachmentClassification]"
-    EMBEDDED_ATTACHMENT_CLASSIFICATION = "[ras_procurement].[EmbeddedAttachmentClassification]"
+    ATTACHMENT_CLASSIFICATION          = "[ras_procurement].[attachment_classification]"
+    EMBEDDED_ATTACHMENT_CLASSIFICATION = "[ras_procurement].[embedded_attachment_classification]"
+    QUOTATION_EXTRACTED_ITEMS          = "[ras_procurement].[quotation_extracted_items]"
 
     # ── BI dashboard ───────────────────────────────────────────────────────
     BI_DASHBOARD = "[ras_procurement].[vw_get_ras_data_for_bidashboard]"

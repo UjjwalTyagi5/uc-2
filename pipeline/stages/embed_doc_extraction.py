@@ -76,7 +76,7 @@ class EmbedDocExtractionStage(BaseStage):
             self._log.warning(
                 f"No local files for PR={purchase_req_no!r} — skipping embed extraction"
             )
-            self._tracker.advance_stage(purchase_req_no, self.NAME)
+            self._tracker.advance_stage(purchase_req_no, self.STAGE_ID)
             return
 
         # ── Step 2: Extract embedded files + record in DB ─────────────────
@@ -158,4 +158,4 @@ class EmbedDocExtractionStage(BaseStage):
             f"Embed extraction complete: {total_extracted} embedded file(s) "
             f"for PR={purchase_req_no!r}"
         )
-        self._tracker.advance_stage(purchase_req_no, self.NAME)
+        self._tracker.advance_stage(purchase_req_no, self.STAGE_ID)

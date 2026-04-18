@@ -68,28 +68,22 @@ _UPSERT_TRACKER_SQL = f"""
     MERGE {AzureTables.RAS_TRACKER} WITH (HOLDLOCK) AS target
     USING (
         SELECT
-            [PURCHASE_REQ_NO]             AS purchase_req_no_fk,
-            [JUSTIFICATION]               AS ras_justification,
-            [CURRENCY]                    AS currency,
-            [C_DATETIME]                  AS ras_created_at,
-            [U_DATETIME]                  AS ras_updated_at,
-            [PURCHASEFINALAPPROVALSTATUS]  AS ras_status
+            [PURCHASE_REQ_NO]            AS purchase_req_no,
+            [PURCHASEFINALAPPROVALSTATUS] AS ras_status
         FROM {AzureTables.PURCHASE_REQ_MST}
         WHERE [PURCHASE_REQ_NO] = ?
     ) AS src
-      ON target.[purchase_req_no_fk] = src.[purchase_req_no_fk]
+      ON target.[purchase_req_no] = src.[purchase_req_no]
     WHEN MATCHED THEN
         UPDATE SET
-            [current_stage_fk] = 'BLOB_UPLOAD',
+            [current_stage_fk] = 3,
             [updated_at]       = SYSUTCDATETIME()
     WHEN NOT MATCHED THEN
         INSERT (
-            [purchase_req_no_fk], [ras_justification], [currency],
-            [ras_created_at], [ras_updated_at], [ras_status], [current_stage_fk]
+            [purchase_req_no], [ras_status], [current_stage_fk]
         )
         VALUES (
-            src.[purchase_req_no_fk], src.[ras_justification], src.[currency],
-            src.[ras_created_at], src.[ras_updated_at], src.[ras_status], 'BLOB_UPLOAD'
+            src.[purchase_req_no], src.[ras_status], 3
         );
 """
 

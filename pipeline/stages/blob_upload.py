@@ -60,4 +60,4 @@ class BlobUploadStage(BaseStage):
         self._log.info(
             f"Uploaded {uploaded} file(s) to blob for PR={purchase_req_no!r}"
         )
-        self._tracker.advance_stage(purchase_req_no, self.NAME)
+        self._tracker.advance_stage(purchase_req_no, self.STAGE_ID)

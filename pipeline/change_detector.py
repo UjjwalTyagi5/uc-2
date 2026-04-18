@@ -66,8 +66,8 @@ class SourceChangeDetector:
         SELECT prm.[PURCHASE_REQ_NO]
         FROM   [ras_procurement].[purchase_req_mst] prm
         JOIN   [ras_procurement].[ras_tracker]      rt
-          ON   rt.[purchase_req_no_fk] = prm.[PURCHASE_REQ_NO]
-        WHERE  rt.[current_stage_fk]  = 'CLASSIFICATION'
+          ON   rt.[purchase_req_no] = prm.[PURCHASE_REQ_NO]
+        WHERE  rt.[current_stage_fk]  = 4
           AND  rt.[last_processed_at] IS NOT NULL
           AND  prm.[U_DATETIME]       > rt.[last_processed_at]
           AND  UPPER(prm.[PURCHASEFINALAPPROVALSTATUS])
@@ -76,10 +76,10 @@ class SourceChangeDetector:
 
     _REQUEUE_SQL = """
         UPDATE [ras_procurement].[ras_tracker]
-        SET    [current_stage_fk] = 'INGESTION',
+        SET    [current_stage_fk] = 1,
                [retry_count]      = [retry_count] + 1,
-               [updated_at]       = GETUTCDATE()
-        WHERE  [purchase_req_no_fk] = ?
+               [updated_at]       = SYSUTCDATETIME()
+        WHERE  [purchase_req_no] = ?
     """
 
     def __init__(self, config: AppConfig) -> None:

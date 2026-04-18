@@ -1,42 +1,37 @@
 """
 pipeline.attachment_classification_repository
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-CRUD service for the two attachment-classification tables.
+CRUD service for the attachment classification tables.
 
 Tables
 ------
-AttachmentClassification          — one row per parent attachment file
-EmbeddedAttachmentClassification  — one row per file extracted from a parent
+attachment_classification          — one row per parent attachment file
+                                     linked to ras_tracker via ras_uuid_pk
+embedded_attachment_classification — one row per file extracted from a parent
+                                     linked via attachment_classification_id
 
 Write path (called from EmbedDocExtractionStage)
 -------------------------------------------------
 1. upsert_parent(...)
-       MERGE on (purchase_req_no_fk, attachment_id).
+       MERGE on attachment_id (UNIQUE constraint).
        Returns the attachment_classify_uuid_pk so embedded rows can FK to it.
 
-2. upsert_embedded(attachment_classify_uuid_pk, parent_attachment_id, file_path)
-       MERGE on (attachment_classify_uuid_pk, file_path).
-
-Both methods open a fresh connection per call and commit in a finally block.
+2. upsert_embedded(attachment_classification_id, parent_attachment_id, file_path)
+       MERGE on (attachment_classification_id, file_path).
 
 Cleanup path (called from PipelineOrchestrator before each PR run)
 ------------------------------------------------------------------
 3. cleanup_for_pr(purchase_req_no)
-       Calls the stored procedure usp_cleanup_pr_data which deletes all
-       PR-specific rows across every pipeline output table — in FK-safe order,
-       inside a single DB transaction — before stages run.
+       Calls stored procedure usp_cleanup_pr_data which deletes all
+       PR-specific rows in FK-safe order inside a single DB transaction.
 
        Tables cleaned (in order):
-         EmbeddedAttachmentClassification  (FK child of AttachmentClassification)
-         AttachmentClassification
-         vw_get_ras_data_for_bidashboard   (BI dashboard)
+         quotation_extracted_items          (FK child of both classification tables)
+         embedded_attachment_classification (FK child of attachment_classification)
+         attachment_classification
+         vw_get_ras_data_for_bidashboard    (BI dashboard)
 
-       ras_tracker and ras_pipeline_exceptions are intentionally NOT cleaned —
-       ras_tracker tracks pipeline state; ras_pipeline_exceptions is kept as
-       audit history across all runs.
-
-       Required DB migration (run once):
-           See migration SQL in db/migrations/usp_cleanup_pr_data.sql
+       ras_tracker and ras_pipeline_exceptions are intentionally NOT cleaned.
 """
 
 from __future__ import annotations
@@ -44,83 +39,80 @@ from __future__ import annotations
 import pyodbc
 from loguru import logger
 
+from db.tables import AzureTables
+
 
 class AttachmentClassificationRepository:
     """
-    Data-access layer for AttachmentClassification and
-    EmbeddedAttachmentClassification tables.
+    Data-access layer for attachment_classification and
+    embedded_attachment_classification tables.
 
     Parameters
     ----------
     conn_str:
-        pyodbc connection string for the Azure SQL DB
-        (the same one used by PipelineTracker).
+        pyodbc connection string for the Azure SQL DB.
     """
 
     # ── SQL ────────────────────────────────────────────────────────────────
 
-    _MERGE_PARENT_SQL = """
-        MERGE [ras_procurement].[AttachmentClassification] WITH (HOLDLOCK) AS target
+    # MERGE on attachment_id (has UNIQUE constraint — single key is sufficient)
+    _MERGE_PARENT_SQL = f"""
+        MERGE {AzureTables.ATTACHMENT_CLASSIFICATION} WITH (HOLDLOCK) AS target
         USING (
-            SELECT ? AS purchase_req_no_fk,
+            SELECT ? AS ras_uuid_pk,
                    ? AS attachment_id
         ) AS src
-          ON  target.[purchase_req_no_fk] = src.[purchase_req_no_fk]
-          AND target.[attachment_id]      = src.[attachment_id]
+          ON  target.[attachment_id] = src.[attachment_id]
         WHEN MATCHED THEN
             UPDATE SET
                 [file_path]           = ?,
                 [embedded_file_flag]  = ?,
                 [embedded_file_count] = ?,
-                [updated_at]          = GETUTCDATE()
+                [updated_at]          = SYSUTCDATETIME()
         WHEN NOT MATCHED THEN
             INSERT (
-                [purchase_req_no_fk],
                 [ras_uuid_pk],
                 [attachment_id],
                 [file_path],
                 [embedded_file_flag],
                 [embedded_file_count]
             )
-            VALUES (?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?);
     """
 
-    _SELECT_PARENT_PK_SQL = """
+    _SELECT_PARENT_PK_SQL = f"""
         SELECT [attachment_classify_uuid_pk]
-        FROM   [ras_procurement].[AttachmentClassification]
-        WHERE  [purchase_req_no_fk] = ?
-          AND  [attachment_id]      = ?
+        FROM   {AzureTables.ATTACHMENT_CLASSIFICATION}
+        WHERE  [attachment_id] = ?
     """
 
-    _MERGE_EMBEDDED_SQL = """
-        MERGE [ras_procurement].[EmbeddedAttachmentClassification] WITH (HOLDLOCK) AS target
+    _MERGE_EMBEDDED_SQL = f"""
+        MERGE {AzureTables.EMBEDDED_ATTACHMENT_CLASSIFICATION} WITH (HOLDLOCK) AS target
         USING (
-            SELECT ? AS attachment_classify_uuid_pk,
+            SELECT ? AS attachment_classification_id,
                    ? AS file_path
         ) AS src
-          ON  target.[attachment_classify_uuid_pk] = src.[attachment_classify_uuid_pk]
-          AND target.[file_path]                   = src.[file_path]
+          ON  target.[attachment_classification_id] = src.[attachment_classification_id]
+          AND target.[file_path]                    = src.[file_path]
         WHEN MATCHED THEN
             UPDATE SET
                 [parent_attachment_id] = ?,
-                [updated_at]           = GETUTCDATE()
+                [updated_at]           = SYSUTCDATETIME()
         WHEN NOT MATCHED THEN
             INSERT (
-                [attachment_classify_uuid_pk],
+                [attachment_classification_id],
                 [parent_attachment_id],
                 [file_path]
             )
             VALUES (?, ?, ?);
     """
 
-    _GET_TRACKER_UUID_SQL = """
+    _GET_TRACKER_UUID_SQL = f"""
         SELECT [ras_uuid_pk]
-        FROM   [ras_procurement].[ras_tracker]
-        WHERE  [purchase_req_no_fk] = ?
+        FROM   {AzureTables.RAS_TRACKER}
+        WHERE  [purchase_req_no] = ?
     """
 
-    # Calls the stored procedure that wipes all pipeline output rows for a PR
-    # before we (re-)process it, so we always start from a clean slate.
     _CLEANUP_SP_SQL = "EXEC [ras_procurement].[usp_cleanup_pr_data] ?"
 
     def __init__(self, conn_str: str) -> None:
@@ -130,16 +122,12 @@ class AttachmentClassificationRepository:
     # ── Public interface ───────────────────────────────────────────────────
 
     def get_tracker_uuid(self, purchase_req_no: str) -> str | None:
-        """
-        Returns the ras_uuid_pk from ras_tracker for the given PR,
-        or None if the row doesn't exist yet.
-        """
+        """Returns the ras_uuid_pk from ras_tracker for the given PR, or None."""
         conn = self._connect()
         try:
             cursor = conn.cursor()
             cursor.execute(self._GET_TRACKER_UUID_SQL, purchase_req_no)
             row = cursor.fetchone()
-            cursor.close()
             return str(row[0]) if row else None
         except pyodbc.Error as exc:
             self._log.error(
@@ -153,23 +141,11 @@ class AttachmentClassificationRepository:
         """
         Deletes all pipeline output rows for this PR before (re-)processing.
 
-        Delegates entirely to the stored procedure usp_cleanup_pr_data so that
-        FK ordering and transaction management live in one place in the DB.
-
-        Tables cleared by the SP (in order):
-          1. EmbeddedAttachmentClassification  (FK child — must go first)
-          2. AttachmentClassification
-          3. vw_get_ras_data_for_bidashboard
-
-        ras_tracker and ras_pipeline_exceptions are intentionally NOT touched.
-
-        Safe to call for brand-new PRs — the SP is a no-op when no rows exist.
-
-        Raises
-        ------
-        pyodbc.Error
-            If the SP call fails (logged + re-raised so the orchestrator can
-            record the exception and skip this PR).
+        Delegates to usp_cleanup_pr_data which runs in a single transaction:
+          1. quotation_extracted_items
+          2. embedded_attachment_classification
+          3. attachment_classification
+          4. vw_get_ras_data_for_bidashboard
         """
         self._log.debug(f"cleanup_for_pr PR={purchase_req_no!r}")
         conn = self._connect()
@@ -177,7 +153,6 @@ class AttachmentClassificationRepository:
             cursor = conn.cursor()
             cursor.execute(self._CLEANUP_SP_SQL, purchase_req_no)
             conn.commit()
-            cursor.close()
             self._log.info(f"Pre-run cleanup done for PR={purchase_req_no!r}")
         except pyodbc.Error as exc:
             conn.rollback()
@@ -196,21 +171,13 @@ class AttachmentClassificationRepository:
         embedded_file_count: int,
     ) -> str:
         """
-        INSERT or UPDATE a row in AttachmentClassification.
+        INSERT or UPDATE a row in attachment_classification.
 
-        Matched on (purchase_req_no_fk, attachment_id).
-        On INSERT: populates ras_uuid_pk FK to ras_tracker.
+        Matched on attachment_id (UNIQUE constraint).
+        On INSERT: sets ras_uuid_pk FK to ras_tracker.
         On UPDATE: refreshes file_path, embedded_file_flag, embedded_file_count.
 
-        Returns
-        -------
-        str
-            The attachment_classify_uuid_pk of the upserted row.
-
-        Raises
-        ------
-        pyodbc.Error  : on any DB failure.
-        RuntimeError  : if the row cannot be found after the MERGE.
+        Returns the attachment_classify_uuid_pk of the upserted row.
         """
         self._log.debug(
             f"upsert_parent PR={purchase_req_no!r} att_id={attachment_id!r} "
@@ -220,42 +187,37 @@ class AttachmentClassificationRepository:
         try:
             cursor = conn.cursor()
 
-            # MERGE — INSERT or UPDATE
             cursor.execute(
                 self._MERGE_PARENT_SQL,
                 # USING source
-                purchase_req_no, attachment_id,
+                ras_uuid_pk, attachment_id,
                 # WHEN MATCHED UPDATE
                 file_path, embedded_file_flag, embedded_file_count,
                 # WHEN NOT MATCHED INSERT
-                purchase_req_no, ras_uuid_pk, attachment_id,
-                file_path, embedded_file_flag, embedded_file_count,
+                ras_uuid_pk, attachment_id, file_path,
+                embedded_file_flag, embedded_file_count,
             )
 
-            # SELECT the PK (auto-generated NEWSEQUENTIALID on first insert)
-            cursor.execute(self._SELECT_PARENT_PK_SQL, purchase_req_no, attachment_id)
+            cursor.execute(self._SELECT_PARENT_PK_SQL, attachment_id)
             row = cursor.fetchone()
             if row is None:
                 raise RuntimeError(
-                    f"upsert_parent: cannot find AttachmentClassification row after MERGE "
+                    f"upsert_parent: cannot find attachment_classification row after MERGE "
                     f"for PR={purchase_req_no!r} att_id={attachment_id!r}"
                 )
             pk = str(row[0])
 
             conn.commit()
-            cursor.close()
             self._log.info(
-                f"AttachmentClassification upserted: PR={purchase_req_no!r} "
-                f"att_id={attachment_id!r} pk={pk} "
-                f"embedded_count={embedded_file_count}"
+                f"attachment_classification upserted: PR={purchase_req_no!r} "
+                f"att_id={attachment_id!r} pk={pk} embedded_count={embedded_file_count}"
             )
             return pk
 
         except pyodbc.Error as exc:
             conn.rollback()
             self._log.error(
-                f"upsert_parent failed PR={purchase_req_no!r} "
-                f"att_id={attachment_id!r}: {exc}"
+                f"upsert_parent failed PR={purchase_req_no!r} att_id={attachment_id!r}: {exc}"
             )
             raise
         finally:
@@ -268,15 +230,9 @@ class AttachmentClassificationRepository:
         file_path: str,
     ) -> None:
         """
-        INSERT or UPDATE a row in EmbeddedAttachmentClassification.
+        INSERT or UPDATE a row in embedded_attachment_classification.
 
-        Matched on (attachment_classify_uuid_pk, file_path).
-        On INSERT: creates the embedded file record linked to its parent.
-        On UPDATE: refreshes parent_attachment_id.
-
-        Raises
-        ------
-        pyodbc.Error  : on any DB failure.
+        Matched on (attachment_classification_id, file_path).
         """
         self._log.debug(
             f"upsert_embedded parent_pk={attachment_classify_uuid_pk!r} "
@@ -295,9 +251,8 @@ class AttachmentClassificationRepository:
                 attachment_classify_uuid_pk, parent_attachment_id, file_path,
             )
             conn.commit()
-            cursor.close()
             self._log.debug(
-                f"EmbeddedAttachmentClassification upserted: "
+                f"embedded_attachment_classification upserted: "
                 f"parent_pk={attachment_classify_uuid_pk!r} file={file_path!r}"
             )
 

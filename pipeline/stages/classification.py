@@ -55,7 +55,7 @@ class ClassificationStage(BaseStage):
             f"CLASSIFICATION not yet implemented — "
             f"passing through for PR={purchase_req_no!r}"
         )
-        self._tracker.advance_stage(purchase_req_no, self.NAME)
+        self._tracker.advance_stage(purchase_req_no, self.STAGE_ID)
 
         # Stamp last_processed_at so SourceChangeDetector can detect future changes
         self._tracker.set_last_processed_at(purchase_req_no)

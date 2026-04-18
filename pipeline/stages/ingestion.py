@@ -50,4 +50,4 @@ class IngestionStage(BaseStage):
         Uses MERGE so re-running is safe (idempotent).
         """
         self._log.info(f"Recording ingestion for PR={purchase_req_no!r}")
-        self._tracker.upsert_stage(purchase_req_no, self.NAME)
+        self._tracker.upsert_stage(purchase_req_no, self.STAGE_ID)
