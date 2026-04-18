@@ -113,6 +113,21 @@ class AttachmentClassificationRepository:
         WHERE  [purchase_req_no] = ?
     """
 
+    _UPDATE_PARENT_CLASSIFICATION_SQL = f"""
+        UPDATE {AzureTables.ATTACHMENT_CLASSIFICATION}
+        SET    [doc_type]            = ?,
+               [classification_conf] = ?
+        WHERE  [attachment_id]       = ?
+    """
+
+    _UPDATE_EMBEDDED_CLASSIFICATION_SQL = f"""
+        UPDATE {AzureTables.EMBEDDED_ATTACHMENT_CLASSIFICATION}
+        SET    [doc_type]            = ?,
+               [classification_conf] = ?
+        WHERE  [attachment_classification_id] = ?
+          AND  [file_path]                    = ?
+    """
+
     _CLEANUP_SP_SQL = "EXEC [ras_procurement].[usp_cleanup_pr_data] ?"
 
     def __init__(self, conn_str: str) -> None:
@@ -268,6 +283,102 @@ class AttachmentClassificationRepository:
             conn.rollback()
             self._log.error(
                 f"upsert_embedded failed for file={file_path!r}: {exc}"
+            )
+            raise
+        finally:
+            conn.close()
+
+    def get_parent_pk(
+        self,
+        attachment_id: str,
+    ) -> str | None:
+        """
+        Returns the attachment_classify_uuid_pk for a given attachment_id,
+        or None if the row doesn't exist.
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(self._SELECT_PARENT_PK_SQL, attachment_id)
+            row = cursor.fetchone()
+            return str(row[0]) if row else None
+        except pyodbc.Error as exc:
+            self._log.error(
+                f"get_parent_pk failed for att_id={attachment_id!r}: {exc}"
+            )
+            raise
+        finally:
+            conn.close()
+
+    def update_parent_classification(
+        self,
+        attachment_id: str,
+        doc_type: str,
+        classification_conf: float,
+    ) -> None:
+        """
+        Updates doc_type and classification_conf on an existing
+        attachment_classification row.
+        """
+        self._log.debug(
+            f"update_parent_classification att_id={attachment_id!r} "
+            f"doc_type={doc_type!r} conf={classification_conf}"
+        )
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                self._UPDATE_PARENT_CLASSIFICATION_SQL,
+                doc_type, classification_conf, attachment_id,
+            )
+            conn.commit()
+            self._log.info(
+                f"attachment_classification updated: att_id={attachment_id!r} "
+                f"doc_type={doc_type!r} conf={classification_conf}"
+            )
+        except pyodbc.Error as exc:
+            conn.rollback()
+            self._log.error(
+                f"update_parent_classification failed att_id={attachment_id!r}: {exc}"
+            )
+            raise
+        finally:
+            conn.close()
+
+    def update_embedded_classification(
+        self,
+        attachment_classification_id: str,
+        file_path: str,
+        doc_type: str,
+        classification_conf: float,
+    ) -> None:
+        """
+        Updates doc_type and classification_conf on an existing
+        embedded_attachment_classification row.
+        """
+        self._log.debug(
+            f"update_embedded_classification parent_pk={attachment_classification_id!r} "
+            f"file={file_path!r} doc_type={doc_type!r} conf={classification_conf}"
+        )
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                self._UPDATE_EMBEDDED_CLASSIFICATION_SQL,
+                doc_type, classification_conf,
+                attachment_classification_id, file_path,
+            )
+            conn.commit()
+            self._log.debug(
+                f"embedded_attachment_classification updated: "
+                f"parent_pk={attachment_classification_id!r} "
+                f"file={file_path!r} doc_type={doc_type!r}"
+            )
+        except pyodbc.Error as exc:
+            conn.rollback()
+            self._log.error(
+                f"update_embedded_classification failed for "
+                f"file={file_path!r}: {exc}"
             )
             raise
         finally:

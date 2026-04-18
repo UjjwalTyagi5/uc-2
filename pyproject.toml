@@ -14,5 +14,20 @@ dependencies = [
     "rarfile>=4.0",
     "PyMuPDF>=1.23",
     "extract-msg>=0.28",
+    # file_classifier dependencies
+    "openai>=1.58.0",
+    "pandas>=2.2.0",
+    "openpyxl>=3.1.0",
+    "xlrd>=2.0.0",
+    "pdfplumber>=0.11.0",
+    "python-docx>=1.1.0",
+    "python-pptx>=1.0.0",
+    "Pillow>=11.0.0",
+    "chardet>=5.2.0",
+    "beautifulsoup4>=4.12.0",
+    "tiktoken>=0.8.0",
+    "pydantic-settings>=2.7.0",
+    "structlog>=24.0.0",
+    "tabulate>=0.9.0",
 ]
 
