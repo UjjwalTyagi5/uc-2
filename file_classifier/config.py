@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     max_file_size_mb: int = Field(default=50)
     batch_concurrency: int = Field(default=5, description="Max parallel LLM calls for batch endpoint")
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 settings = Settings()
