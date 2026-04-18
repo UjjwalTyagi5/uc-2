@@ -13,5 +13,6 @@ dependencies = [
     "py7zr>=0.20",
     "rarfile>=4.0",
     "PyMuPDF>=1.23",
+    "extract-msg>=0.28",
 ]
 
