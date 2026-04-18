@@ -2,7 +2,7 @@
 name = "purchase-sync"
 version = "0.1.0"
 description = "ETL sync module: on-prem SQL Server → Azure SQL (purchase requisition tables)"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 dependencies = [
     "pyodbc>=4.0.39",
     "loguru>=0.7.0",
