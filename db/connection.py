@@ -75,9 +75,12 @@ def _is_transient(exc: pyodbc.Error) -> bool:
     sql_state = str(exc.args[0]) if exc.args else ""
     if sql_state in _RETRY_STATES:
         return True
-    # Numeric codes appear in the string representation of the exception
     message = str(exc)
     return any(str(code) in message for code in _RETRY_CODES)
+
+
+# Public alias — used by BaseRepository to check query-execution errors
+is_transient_error = _is_transient
 
 
 # ── Main public function ──────────────────────────────────────────────────
