@@ -57,6 +57,8 @@ import random
 import time
 from typing import Any, Callable, List, Optional, Sequence, TypeVar
 
+import os
+
 import pyodbc
 from loguru import logger
 
@@ -64,8 +66,10 @@ from db.connection import connect_with_retry, is_transient_error
 
 _T = TypeVar("_T")
 
-_MAX_RETRIES = 3       # extra attempts after first failure (4 total)
-_BASE_DELAY  = 2.0     # starting back-off in seconds; doubles each retry
+# Read from the same env vars as AppConfig so a single .env entry controls
+# retry behaviour across both connection attempts and query execution.
+_MAX_RETRIES = int(os.getenv("DB_MAX_RETRIES", "3"))
+_BASE_DELAY  = float(os.getenv("DB_BASE_DELAY", "2.0"))
 
 
 class BaseRepository:

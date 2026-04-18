@@ -30,6 +30,7 @@ How it works
 
 from __future__ import annotations
 
+import os
 import random
 import time
 
@@ -85,11 +86,15 @@ is_transient_error = _is_transient
 
 # ── Main public function ──────────────────────────────────────────────────
 
+_MAX_RETRIES = int(os.getenv("DB_MAX_RETRIES", "4"))
+_BASE_DELAY  = float(os.getenv("DB_BASE_DELAY", "2.0"))
+
+
 def get_connection(
     conn_str: str,
     autocommit: bool = False,
-    max_retries: int = 4,
-    base_delay: float = 2.0,
+    max_retries: int = _MAX_RETRIES,
+    base_delay: float = _BASE_DELAY,
 ) -> pyodbc.Connection:
     """
     Return a pooled database connection, retrying on transient errors.
