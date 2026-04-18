@@ -1,15 +1,16 @@
 """
 embed_doc_extraction.extractor
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Extracts embedded files from Office documents and PDFs.
+Extracts embedded files from Office documents, PDFs, and MSG emails.
 
 Supported parent formats
 ------------------------
   OOXML  : .xlsx, .docx, .pptx  (ZIP-based Office Open XML)
   OLE    : .xls,  .doc,  .ppt   (legacy compound-document format)
   PDF    : .pdf                  (embedded files + FileAttachment annotations)
+  MSG    : .msg                  (Outlook email — extracts all attachments)
 
-Archives found inside parent files are also expanded one level:
+Archives found inside parent files are expanded one level then deleted:
   .zip, .7z, .rar, .tar, .tar.gz, .tgz, .tar.bz2
 
 Usage
@@ -26,23 +27,23 @@ import shutil
 import tarfile
 import tempfile
 import zipfile
-from pathlib import Path
 
+import extract_msg
+import fitz  # PyMuPDF
 import olefile
 import py7zr
 import rarfile
-import fitz  # PyMuPDF
 from loguru import logger
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-SUPPORTED_PARENTS = (".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt", ".pdf")
+SUPPORTED_PARENTS = (".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt", ".pdf", ".msg")
 
 EXTRACT_EXTENSIONS = (
     ".pdf", ".xls", ".xlsx", ".doc", ".docx", ".ppt", ".pptx",
     ".jpg", ".jpeg", ".png", ".tif", ".tiff",
     ".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.bz2",
-    ".txt",
+    ".txt", ".msg",
 )
 
 SKIP_EXTENSIONS = (".emf", ".bin")
@@ -188,10 +189,12 @@ class FileExtractor:
                     fn = os.path.basename(m.name)
                     if fn:
                         t = self.unique_path(out, self.with_parent_prefix(fn))
-                        with tar.extractfile(m) as s, open(t, "wb") as d:
-                            shutil.copyfileobj(s, d)
-                        self.extracted_count += 1
-                        logger.debug(f"  -> {os.path.basename(t)}")
+                        src = tar.extractfile(m)
+                        if src is not None:
+                            with src as s, open(t, "wb") as d:
+                                shutil.copyfileobj(s, d)
+                            self.extracted_count += 1
+                            logger.debug(f"  -> {os.path.basename(t)}")
         except Exception as exc:
             logger.error(f"TAR extraction error: {exc}")
 
@@ -199,10 +202,17 @@ class FileExtractor:
         if not os.path.exists(path):
             return
         fl = path.lower()
-        if   fl.endswith(".zip"):                               self._extract_zip(path, out)
-        elif fl.endswith(".7z"):                                self._extract_7z(path, out)
-        elif fl.endswith(".rar"):                               self._extract_rar(path, out)
+        if   fl.endswith(".zip"):                                   self._extract_zip(path, out)
+        elif fl.endswith(".7z"):                                    self._extract_7z(path, out)
+        elif fl.endswith(".rar"):                                   self._extract_rar(path, out)
         elif fl.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2")): self._extract_tar(path, out)
+
+        # Delete archive after extraction — contents are now in out/
+        try:
+            os.remove(path)
+            logger.debug(f"Deleted archive: {os.path.basename(path)}")
+        except Exception as exc:
+            logger.warning(f"Could not delete archive {os.path.basename(path)}: {exc}")
 
     # ── Save extracted file + handle if archive ────────────────────────────
 
@@ -368,7 +378,6 @@ class FileExtractor:
             logger.debug(f"Reading PDF: {os.path.basename(file_path)}")
             doc = fitz.open(file_path)
 
-            # Embedded file attachments
             if doc.embfile_count() > 0:
                 logger.debug(f"  {doc.embfile_count()} embedded file(s)")
                 for i in range(doc.embfile_count()):
@@ -378,7 +387,6 @@ class FileExtractor:
                     if data:
                         self._save_file(data, name, out)
 
-            # FileAttachment annotations
             for pn, page in enumerate(doc, 1):
                 annots = page.annots()
                 if not annots:
@@ -400,6 +408,64 @@ class FileExtractor:
             logger.error(f"PDF error ({os.path.basename(file_path)}): {exc}")
             return False
 
+    # ── MSG (Outlook email) ──────────────────────────────────────────────────
+
+    def extract_from_msg(self, file_path: str, out: str) -> bool:
+        try:
+            logger.debug(f"Reading MSG: {os.path.basename(file_path)}")
+            msg = extract_msg.Message(file_path)
+
+            if not msg.attachments:
+                logger.debug(f"  No attachments in {os.path.basename(file_path)}")
+                msg.close()
+                return True
+
+            logger.debug(f"  {len(msg.attachments)} attachment(s)")
+            for att in msg.attachments:
+                name = "attachment"
+                try:
+                    name = (
+                        getattr(att, "longFilename", None)
+                        or getattr(att, "shortFilename", None)
+                        or getattr(att, "filename", None)
+                        or "attachment"
+                    )
+                    name = self.sanitize(name)
+
+                    # Nested .msg attachments
+                    if getattr(att, "type", None) == "msg" and not name.lower().endswith(".msg"):
+                        name += ".msg"
+
+                    data = getattr(att, "data", None) or b""
+
+                    # Fall back to saving to a temp dir if data isn't directly available
+                    if not data:
+                        with tempfile.TemporaryDirectory() as tmp:
+                            att.save(customPath=tmp)
+                            for fn in os.listdir(tmp):
+                                src = os.path.join(tmp, fn)
+                                if os.path.isfile(src):
+                                    with open(src, "rb") as f:
+                                        data = f.read()
+                                    if name == "attachment":
+                                        name = fn
+                                    break
+
+                    if not data:
+                        logger.warning(f"  Empty attachment skipped: {name}")
+                        continue
+
+                    self._save_file(data, name, out)
+
+                except Exception as exc:
+                    logger.warning(f"  Failed attachment '{name}': {exc}")
+
+            msg.close()
+            return True
+        except Exception as exc:
+            logger.error(f"MSG error ({os.path.basename(file_path)}): {exc}")
+            return False
+
     # ── Detect + dispatch ────────────────────────────────────────────────────
 
     def detect_type(self, path: str) -> str | None:
@@ -407,14 +473,15 @@ class FileExtractor:
         if lower.endswith((".xlsx", ".docx", ".pptx")): return "ooxml"
         if lower.endswith((".xls",  ".doc",  ".ppt")):  return "ole"
         if lower.endswith(".pdf"):                       return "pdf"
+        if lower.endswith(".msg"):                       return "msg"
 
         # Fallback: read file header
         try:
             with open(path, "rb") as f:
                 h = f.read(8)
-            if h.startswith(b"PK\x03\x04"):                    return "ooxml"
+            if h.startswith(b"PK\x03\x04"):                        return "ooxml"
             if h.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"): return "ole"
-            if h.startswith(b"%PDF"):                           return "pdf"
+            if h.startswith(b"%PDF"):                               return "pdf"
         except Exception:
             pass
         return None
@@ -441,4 +508,5 @@ class FileExtractor:
         if ft == "ooxml": return self.extract_from_ooxml(file_path, out)
         if ft == "ole":   return self.extract_from_ole(file_path, out)
         if ft == "pdf":   return self.extract_from_pdf(file_path, out)
+        if ft == "msg":   return self.extract_from_msg(file_path, out)
         return False
