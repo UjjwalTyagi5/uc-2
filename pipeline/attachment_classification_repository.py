@@ -141,12 +141,20 @@ class AttachmentClassificationRepository:
         """
         Deletes all pipeline output rows for this PR before (re-)processing.
 
-        Delegates to usp_cleanup_pr_data which runs in a single transaction:
+        Skipped entirely for brand-new PRs (no ras_tracker row) — nothing to clean.
+
+        For existing PRs delegates to usp_cleanup_pr_data (single transaction):
           1. quotation_extracted_items
           2. embedded_attachment_classification
           3. attachment_classification
           4. vw_get_ras_data_for_bidashboard
         """
+        if self.get_tracker_uuid(purchase_req_no) is None:
+            self._log.debug(
+                f"cleanup_for_pr skipped — no ras_tracker row for PR={purchase_req_no!r}"
+            )
+            return
+
         self._log.debug(f"cleanup_for_pr PR={purchase_req_no!r}")
         conn = self._connect()
         try:
