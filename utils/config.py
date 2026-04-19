@@ -52,6 +52,19 @@ Optional — ETL batch / concurrency settings:
 
 Optional — Pipeline concurrency:
     PIPELINE_WORKERS    parallel workers for PR processing       (default: 1)
+
+Optional — Azure OpenAI (required only by LLM-based stages: CLASSIFICATION, METADATA_EXTRACTION):
+    AZURE_OPENAI_ENDPOINT       e.g. https://myaccount.openai.azure.com/
+    AZURE_OPENAI_API_KEY
+    AZURE_OPENAI_DEPLOYMENT     model deployment name  (default: gpt-4o)
+    AZURE_OPENAI_API_VERSION    API version string     (default: 2025-04-01-preview)
+
+Optional — Quotation extraction tuning:
+    EXTRACTION_MAX_PAGES        max PDF pages to render per file  (default: 20)
+    EXTRACTION_LLM_TEMPERATURE  LLM temperature                   (default: 0)
+    EXTRACTION_LLM_MAX_TOKENS   max tokens in LLM response        (default: 16000)
+    LLM_MAX_RETRIES             extra LLM attempts after failure  (default: 3)
+    LLM_RETRY_BASE_DELAY        starting back-off in seconds      (default: 5.0)
                         Set to 2–8 to process multiple PRs at the same time.
                         Each worker opens its own DB connections and work folder.
                         Keep at 1 if the DB connection limit is tight.
@@ -172,10 +185,12 @@ class AppConfig:
         self.AZURE_PASS   = _require("AZURE_PASS")
 
         # ── On-prem SQL Server ─────────────────────────────────────────────
-        self.ONPREM_SERVER = _require("ONPREM_SERVER")
-        self.ONPREM_DB     = _require("ONPREM_DB")
-        self.ONPREM_USER   = _require("ONPREM_USER")
-        self.ONPREM_PASS   = _require("ONPREM_PASS")
+        # Optional at startup — only needed by ETL sync and pipeline stages
+        # that read binary attachments.  Validated lazily in get_onprem_conn_str().
+        self.ONPREM_SERVER = _optional("ONPREM_SERVER", "")
+        self.ONPREM_DB     = _optional("ONPREM_DB",     "")
+        self.ONPREM_USER   = _optional("ONPREM_USER",   "")
+        self.ONPREM_PASS   = _optional("ONPREM_PASS",   "")
 
         # ── Azure Blob Storage ─────────────────────────────────────────────
         self.BLOB_ACCOUNT_URL    = _require("BLOB_ACCOUNT_URL")
@@ -213,12 +228,24 @@ class AppConfig:
         self.CLASSIFICATION_WORKERS = int(_optional("CLASSIFICATION_WORKERS", "4"))
 
         # ── Blob upload settings ───────────────────────────────────────────
-        # BLOB_MAX_RETRIES : how many times to retry a single file upload
-        #                    before giving up  (default 3)
-        # WORK_DIR         : local folder where attachments are downloaded
-        #                    before uploading to blob  (default "work")
         self.BLOB_MAX_RETRIES = int(_optional("BLOB_MAX_RETRIES", "3"))
         self.WORK_DIR         = _optional("WORK_DIR", "work")
+
+        # ── Azure OpenAI ───────────────────────────────────────────────────
+        # Optional at startup — required only by LLM-based stages.
+        # Validated lazily: stages that use LLM will fail with a clear message
+        # if these are missing.
+        self.AOAI_ENDPOINT    = _optional("AZURE_OPENAI_ENDPOINT",   "")
+        self.AOAI_API_KEY     = _optional("AZURE_OPENAI_API_KEY",    "")
+        self.AOAI_DEPLOYMENT  = _optional("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        self.AOAI_API_VERSION = _optional("AZURE_OPENAI_API_VERSION","2025-04-01-preview")
+
+        # ── Quotation extraction tuning ────────────────────────────────────
+        self.MAX_PAGES            = int(_optional("EXTRACTION_MAX_PAGES",           "20"))
+        self.LLM_TEMPERATURE      = float(_optional("EXTRACTION_LLM_TEMPERATURE",  "0"))
+        self.LLM_MAX_TOKENS       = int(_optional("EXTRACTION_LLM_MAX_TOKENS",     "16000"))
+        self.LLM_MAX_RETRIES      = int(_optional("LLM_MAX_RETRIES",               "3"))
+        self.LLM_RETRY_BASE_DELAY = float(_optional("LLM_RETRY_BASE_DELAY",        "5.0"))
 
     # ── Connection string builders ─────────────────────────────────────────
 
@@ -236,6 +263,13 @@ class AppConfig:
 
     def get_onprem_conn_str(self) -> str:
         """Connection string for the on-prem SQL Server database."""
+        missing = [v for v in ("ONPREM_SERVER", "ONPREM_DB", "ONPREM_USER", "ONPREM_PASS")
+                   if not getattr(self, v)]
+        if missing:
+            raise EnvironmentError(
+                f"On-prem SQL Server connection requires env vars that are not set: "
+                f"{', '.join(missing)}"
+            )
         return (
             f"DRIVER={{{self.ODBC_DRIVER}}};"
             f"SERVER={self.ONPREM_SERVER};"

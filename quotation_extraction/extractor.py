@@ -10,13 +10,13 @@ Flow per quotation file:
 from __future__ import annotations
 
 import json
+import pathlib
 import re
-import uuid
-from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Optional
 
 from loguru import logger
+from pydantic import ValidationError
 
 from .config import ExtractionConfig
 from .document_loader import load_document
@@ -29,46 +29,62 @@ from .models import (
     RASContext,
 )
 
+_PROMPTS_DIR = pathlib.Path(__file__).parent / "prompts"
+
 _PROMPTS_CACHE: dict[str, str] = {}
 
 
-def _read_prompt(name: str, config: ExtractionConfig) -> str:
+def _read_prompt(name: str) -> str:
     if name not in _PROMPTS_CACHE:
-        path = config.prompts_dir() / name
-        _PROMPTS_CACHE[name] = path.read_text(encoding="utf-8")
+        _PROMPTS_CACHE[name] = (_PROMPTS_DIR / name).read_text(encoding="utf-8")
     return _PROMPTS_CACHE[name]
 
 
 # ── Prompt building ──
 
 
+def _na(val: object) -> str:
+    """Return the value as string, or 'N/A' if None/empty."""
+    if val is None or str(val).strip() == "":
+        return "N/A"
+    return str(val)
+
+
 def _build_line_items_table(items: list[LineItemContext]) -> str:
-    rows = [
-        "| DTL_ID | Item No | Description | Qty | Type | UOM "
-        "| Unit Price | Total (REQ_VALUE) | Discount | Currency "
-        "| Supplier | Delivery Date | Payment | Comments |"
-    ]
-    rows.append(
-        "|--------|---------|-------------|-----|------|-----"
-        "|------------|-------------------|----------|----------"
-        "|----------|---------------|---------|----------|"
+    header = (
+        "| DTL_ID | Item No | Item Code | Description | Qty | UOM | Type "
+        "| Unit Price | Original Value | Initial Offer | Negotiated "
+        "| Req Value | Discount | Currency | Supplier "
+        "| Delivery Date | Prepayment | Payment Terms | Comments |"
     )
+    sep = (
+        "|--------|---------|-----------|-------------|-----|-----|------"
+        "|------------|----------------|---------------|----------"
+        "|-----------|----------|----------|----------"
+        "|---------------|------------|---------------|----------|"
+    )
+    rows = [header, sep]
     for li in items:
         rows.append(
-            f"| {li.purchase_dtl_id} "
-            f"| {li.item_no} "
-            f"| {li.item_description or 'N/A'} "
-            f"| {li.quantity or 'N/A'} "
-            f"| {li.item_type or 'N/A'} "
-            f"| {li.uom or 'N/A'} "
-            f"| {li.unit_price or 'N/A'} "
-            f"| {li.req_value or 'N/A'} "
-            f"| {li.discount or 'N/A'} "
-            f"| {li.currency or 'N/A'} "
-            f"| {li.supplier_name or 'N/A'} "
-            f"| {li.delivery_date or 'N/A'} "
-            f"| {li.payment_details or 'N/A'} "
-            f"| {li.comments or 'N/A'} |"
+            f"| {_na(li.purchase_dtl_id)} "
+            f"| {_na(li.item_no)} "
+            f"| {_na(li.item_code)} "
+            f"| {_na(li.item_description)} "
+            f"| {_na(li.quantity)} "
+            f"| {_na(li.uom)} "
+            f"| {_na(li.item_type)} "
+            f"| {_na(li.unit_price)} "
+            f"| {_na(li.original_value)} "
+            f"| {_na(li.initial_offer)} "
+            f"| {_na(li.negotiation)} "
+            f"| {_na(li.req_value)} "
+            f"| {_na(li.discount)} "
+            f"| {_na(li.currency)} "
+            f"| {_na(li.supplier_name)} "
+            f"| {_na(li.delivery_date)} "
+            f"| {_na(li.prepayment)} "
+            f"| {_na(li.payment_details)} "
+            f"| {_na(li.comments)} |"
         )
     return "\n".join(rows)
 
@@ -78,8 +94,8 @@ def _build_user_prompt(
     ctx: RASContext,
     doc: DocumentContent,
 ) -> str:
-    tpl = _read_prompt("extraction.txt", config)
-    taxonomy = _read_prompt("item_taxonomy.txt", config)
+    tpl = _read_prompt("extraction.txt")
+    taxonomy = _read_prompt("item_taxonomy.txt")
 
     doc_content_str: str
     if doc.is_image_based:
@@ -89,33 +105,40 @@ def _build_user_prompt(
     else:
         doc_content_str = doc.text or "[No content extracted]"
 
+    def _f(val: object) -> str:
+        return str(val) if val is not None else "N/A"
+
     return tpl.format(
         purchase_req_no=ctx.purchase_req_no,
         purchase_req_id=ctx.purchase_req_id,
-        justification=ctx.justification or "N/A",
-        supplier_name=ctx.supplier_name or "N/A",
-        currency=ctx.currency or "N/A",
-        enquiry_no=ctx.enquiry_no or "N/A",
-        classification=ctx.classification or "N/A",
-        department=ctx.department or "N/A",
-        negotiated_by=ctx.negotiated_by or "N/A",
-        address=ctx.address or "N/A",
-        contract_no=ctx.contract_no or "N/A",
-        order_no=ctx.order_no or "N/A",
-        purchase_value=ctx.purchase_value or "N/A",
-        category=ctx.category or "N/A",
-        sub_category=ctx.sub_category or "N/A",
-        site_region=ctx.site_region or "N/A",
-        site_country=ctx.site_country or "N/A",
-        site=ctx.site or "N/A",
-        division=ctx.division or "N/A",
-        requisition_type=ctx.requisition_type or "N/A",
-        parent_supplier=ctx.parent_supplier or "N/A",
-        supplier_type=ctx.supplier_type or "N/A",
-        supplier_country=ctx.supplier_country or "N/A",
-        payment_days=ctx.payment_days or "N/A",
-        po_date=ctx.po_date or "N/A",
-        category_buyer=ctx.category_buyer or "N/A",
+        justification=_f(ctx.justification),
+        supplier_name=_f(ctx.supplier_name),
+        currency=_f(ctx.currency),
+        enquiry_no=_f(ctx.enquiry_no),
+        classification=_f(ctx.classification),
+        department=_f(ctx.department),
+        negotiated_by=_f(ctx.negotiated_by),
+        address=_f(ctx.address),
+        contract_no=_f(ctx.contract_no),
+        order_no=_f(ctx.order_no),
+        purchase_value=_f(ctx.purchase_value),
+        category=_f(ctx.category),
+        sub_category=_f(ctx.sub_category),
+        l3=_f(ctx.l3),
+        l4=_f(ctx.l4),
+        purchase_category=_f(ctx.purchase_category),
+        ras_title=_f(ctx.ras_title),
+        site_region=_f(ctx.site_region),
+        site_country=_f(ctx.site_country),
+        site=_f(ctx.site),
+        division=_f(ctx.division),
+        requisition_type=_f(ctx.requisition_type),
+        parent_supplier=_f(ctx.parent_supplier),
+        supplier_type=_f(ctx.supplier_type),
+        supplier_country=_f(ctx.supplier_country),
+        payment_days=_f(ctx.payment_days),
+        po_date=_f(ctx.po_date),
+        category_buyer=_f(ctx.category_buyer),
         line_items_table=_build_line_items_table(ctx.line_items),
         item_taxonomy=taxonomy,
         document_content=doc_content_str,
@@ -123,33 +146,6 @@ def _build_user_prompt(
 
 
 # ── JSON parsing helpers ──
-
-
-def _safe_date(val: object) -> Optional[date]:
-    if val is None or val == "":
-        return None
-    try:
-        return date.fromisoformat(str(val))
-    except (ValueError, TypeError):
-        return None
-
-
-def _safe_decimal(val: object) -> Optional[Decimal]:
-    if val is None or val == "":
-        return None
-    try:
-        return Decimal(str(val))
-    except (InvalidOperation, TypeError):
-        return None
-
-
-def _safe_int(val: object) -> Optional[int]:
-    if val is None or val == "":
-        return None
-    try:
-        return int(val)  # type: ignore[arg-type]
-    except (ValueError, TypeError):
-        return None
 
 
 def _strip_json_fences(raw: str) -> str:
@@ -166,8 +162,13 @@ def _parse_llm_response(
     source: QuotationSource,
     ras_supplier: Optional[str],
 ) -> list[ExtractedItem]:
-    """Parse the raw JSON string into a list of :class:`ExtractedItem`."""
+    """Parse the raw JSON string into a list of :class:`ExtractedItem`.
 
+    Pydantic handles all type coercions (str→Decimal, str→date, str→int)
+    and normalises empty strings to None via the model's pre-validator.
+    Invalid individual items are skipped with a warning rather than
+    failing the whole file.
+    """
     raw = _strip_json_fences(raw)
 
     try:
@@ -176,25 +177,15 @@ def _parse_llm_response(
         logger.error("LLM returned invalid JSON: {}", exc)
         return []
 
-    header = data if isinstance(data, dict) else {}
+    header: dict = data if isinstance(data, dict) else {}
     items_raw: list[dict] = header.get("items", [])
 
     if not items_raw:
         logger.warning("LLM returned zero items for {}", source.blob_path)
         return []
 
-    # shared header fields
-    h_supplier = header.get("supplier_name")
-    h_address = header.get("supplier_address")
-    h_country = header.get("supplier_country")
-    h_ref = header.get("quotation_ref_no")
-    h_date = _safe_date(header.get("quotation_date"))
-    h_currency = header.get("currency")
-    h_validity_date = _safe_date(header.get("validity_date"))
-    h_validity_days = _safe_int(header.get("validity_days"))
-    h_payment = header.get("payment_terms")
-
-    # is_selected_quote: supplier name in quotation matches the RAS primary supplier
+    # Determine if the quotation supplier matches the RAS primary supplier
+    h_supplier: Optional[str] = header.get("supplier_name") or None
     is_selected = False
     if ras_supplier and h_supplier:
         is_selected = (
@@ -202,54 +193,43 @@ def _parse_llm_response(
             or h_supplier.strip().lower() in ras_supplier.strip().lower()
         )
 
+    # Header fields shared across every item row in this quotation
+    header_fields = {
+        "supplier_name":    h_supplier,
+        "supplier_address": header.get("supplier_address") or None,
+        "supplier_country": header.get("supplier_country") or None,
+        "quotation_ref_no": header.get("quotation_ref_no") or None,
+        "quotation_date":   header.get("quotation_date"),
+        "currency":         header.get("currency") or None,
+        "validity_date":    header.get("validity_date"),
+        "validity_days":    header.get("validity_days"),
+        "payment_terms":    header.get("payment_terms") or None,
+    }
+
     results: list[ExtractedItem] = []
-    for item in items_raw:
-        results.append(
-            ExtractedItem(
-                attachment_classify_fk=source.attachment_classify_fk,
-                embedded_classify_fk=source.embedded_classify_fk,
-                purchase_dtl_id=_safe_int(item.get("purchase_dtl_id")),
-                is_selected_quote=is_selected,
-                supplier_match_conf=_safe_decimal(
-                    item.get("supplier_match_conf")
-                ),
-                quote_rank=None,  # computed later across all quotations
-                supplier_name=h_supplier,
-                supplier_address=h_address,
-                supplier_country=h_country,
-                quotation_ref_no=h_ref,
-                quotation_date=h_date,
-                currency=h_currency,
-                validity_date=h_validity_date,
-                validity_days=h_validity_days,
-                payment_terms=h_payment,
-                item_name=item.get("item_name"),
-                item_description=item.get("item_description"),
-                quantity=_safe_decimal(item.get("quantity")),
-                unit=item.get("unit"),
-                unit_price=_safe_decimal(item.get("unit_price")),
-                total_price=_safe_decimal(item.get("total_price")),
-                discount=_safe_decimal(item.get("discount")),
-                taxation_details=item.get("taxation_details"),
-                delivery_date=_safe_date(item.get("delivery_date")),
-                delivery_time_days=_safe_int(item.get("delivery_time_days")),
-                item_level_1=item.get("item_level_1") or None,
-                item_level_2=item.get("item_level_2") or None,
-                item_level_3=item.get("item_level_3") or None,
-                item_level_4=item.get("item_level_4") or None,
-                item_level_5=item.get("item_level_5") or None,
-                item_level_6=item.get("item_level_6") or None,
-                item_level_7=item.get("item_level_7") or None,
-                item_level_8=item.get("item_level_8") or None,
-                commodity_tag=item.get("commodity_tag"),
-                item_summary=item.get("item_summary"),
+    for raw_item in items_raw:
+        try:
+            item = ExtractedItem.model_validate({
+                # source linkage — set programmatically, never from LLM
+                "attachment_classify_fk": source.attachment_classify_fk,
+                "embedded_classify_fk":   source.embedded_classify_fk,
+                "is_selected_quote":      is_selected,
+                "quote_rank":             None,
+                # header fields (shared across all items in this quotation)
+                **header_fields,
+                # item-level fields from LLM — Pydantic coerces types
+                **raw_item,
+            })
+            results.append(item)
+        except ValidationError as exc:
+            logger.warning(
+                "Skipping invalid item from LLM response for {}: {}",
+                source.blob_path, exc,
             )
-        )
 
     logger.info(
-        "Parsed {} items from LLM response (supplier={})",
-        len(results),
-        h_supplier,
+        "Parsed {} item(s) from LLM response (supplier={})",
+        len(results), h_supplier,
     )
     return results
 
@@ -364,10 +344,12 @@ class QuotationExtractor:
         Returns a list of :class:`ExtractedItem` (one per extracted line).
         """
         doc: DocumentContent = load_document(
-            file_path, max_pages=self._config.MAX_PAGES
+            file_path,
+            max_pages=self._config.MAX_PAGES,
+            work_dir=pathlib.Path(file_path).parent,
         )
 
-        system_prompt = _read_prompt("system.txt", self._config)
+        system_prompt = _read_prompt("system.txt")
         user_prompt = _build_user_prompt(self._config, ras_context, doc)
 
         raw_response = self._llm.extract(system_prompt, user_prompt, doc)

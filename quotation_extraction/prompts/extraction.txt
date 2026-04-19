@@ -1,32 +1,51 @@
 ## Purchase Requisition Context
 
-**RAS Number:** {purchase_req_no}
-**Requisition ID:** {purchase_req_id}
-**Requisition Type:** {requisition_type}
-**Justification:** {justification}
-**Primary Supplier:** {supplier_name}
-**Supplier Address:** {address}
-**Parent Supplier:** {parent_supplier}
-**Supplier Type:** {supplier_type}
-**Supplier Country:** {supplier_country}
-**Currency (RAS):** {currency}
-**Purchase Value:** {purchase_value}
-**Enquiry No:** {enquiry_no}
-**Contract No:** {contract_no}
-**Order No:** {order_no}
-**Classification:** {classification}
-**Department:** {department}
-**Negotiated By:** {negotiated_by}
-**Category Buyer:** {category_buyer}
-**Category:** {category}
-**Sub-category:** {sub_category}
-**Site:** {site}
-**Region / Country:** {site_region} / {site_country}
-**Division:** {division}
-**Payment Days:** {payment_days}
-**PO Date:** {po_date}
+The following data was recorded at the time the purchase requisition was raised.
+Fields marked "N/A" were not captured in the source system — treat them as unknown.
+
+### Header Information
+
+| Field | Value |
+|---|---|
+| RAS Number | {purchase_req_no} |
+| Requisition ID | {purchase_req_id} |
+| RAS Title | {ras_title} |
+| Requisition Type | {requisition_type} |
+| Classification | {classification} |
+| Justification | {justification} |
+| Primary Supplier | {supplier_name} |
+| Supplier Address | {address} |
+| Parent Supplier | {parent_supplier} |
+| Supplier Type | {supplier_type} |
+| Supplier Country | {supplier_country} |
+| Currency (RAS) | {currency} |
+| Purchase Value | {purchase_value} |
+| Enquiry No | {enquiry_no} |
+| Contract No | {contract_no} |
+| Order No | {order_no} |
+| Department | {department} |
+| Negotiated By | {negotiated_by} |
+| Category Buyer | {category_buyer} |
+| Purchase Category | {purchase_category} |
+| Category L1 | {category} |
+| Category L2 | {sub_category} |
+| Category L3 | {l3} |
+| Category L4 | {l4} |
+| Site | {site} |
+| Region / Country | {site_region} / {site_country} |
+| Division | {division} |
+| Payment Days | {payment_days} |
+| PO Date | {po_date} |
 
 ### Line Items from the Requisition
+
+The table below lists the items the buyer expects to find in the quotation.
+Column legend:
+- **DTL_ID** — unique line-item identifier; use this value for `purchase_dtl_id` when you match a quotation item
+- **Item Code** — internal material/part code (may be N/A)
+- **Unit Price / Original Value / Initial Offer / Negotiated** — price history; use for cross-validation only
+- **Req Value** — total requisition value for the line (Qty × Unit Price)
+- **Prepayment / Payment Terms** — buyer-side payment conditions
 
 {line_items_table}
 
@@ -46,55 +65,63 @@
 
 ## Required Output
 
-Extract **every item** found in the quotation document above.  For each item, attempt to match it to the closest line item from the requisition table (use the Description, Quantity, and Type columns to judge similarity).
+Analyse the quotation document above against the requisition context.
+Extract **every item** found in the document.
+For each item try to match it to the closest line item in the requisition table
+(use Description, Item Code, Quantity, and UOM as primary matching signals).
 
-Return a **single JSON object** (no markdown fences, no extra text) with this schema:
+> **Important:** A purchase requisition can cover any type of procurement —
+> goods (equipment, components, materials, consumables), services (maintenance,
+> consulting, hiring, IT), or mixed orders.  Adapt your extraction accordingly.
+
+Return a **single JSON object** — no markdown fences, no extra text:
 
 {{
-  "supplier_name": "string",
+  "supplier_name": "string or null",
   "supplier_address": "string or null",
   "supplier_country": "string or null",
   "quotation_ref_no": "string or null",
   "quotation_date": "YYYY-MM-DD or null",
-  "currency": "ISO-4217 code or null",
+  "currency": "ISO-4217 three-letter code or null",
   "validity_date": "YYYY-MM-DD or null",
-  "validity_days": integer or null,
+  "validity_days": "integer or null",
   "payment_terms": "string or null",
   "items": [
     {{
-      "purchase_dtl_id": integer_from_DTL_ID_column_or_null,
-      "supplier_match_conf": 0.0_to_1.0,
+      "purchase_dtl_id": "integer from DTL_ID column if matched, else null",
+      "supplier_match_conf": "0.0 to 1.0 — your confidence this item matches the requisition line",
       "item_name": "canonical item name in English",
-      "item_description": "full description with specs in English",
-      "quantity": number_or_null,
+      "item_description": "full description with all specs in English",
+      "quantity": "number or null",
       "unit": "unit of measurement or null",
-      "unit_price": number_or_null,
-      "total_price": number_or_null,
-      "discount": number_or_null,
-      "taxation_details": "tax info string or null",
+      "unit_price": "number or null",
+      "total_price": "number or null",
+      "discount": "discount amount or percentage as number, or null",
+      "taxation_details": "tax/GST/VAT info as string or null",
       "delivery_date": "YYYY-MM-DD or null",
-      "delivery_time_days": integer_or_null,
-      "item_level_1": "broadest category",
-      "item_level_2": "sub-category",
-      "item_level_3": "product/service type",
-      "item_level_4": "brand/manufacturer",
-      "item_level_5": "model/series",
-      "item_level_6": "config/variant or empty",
-      "item_level_7": "spec detail or empty",
-      "item_level_8": "additional detail or empty",
-      "commodity_tag": "slug-style-commodity-tag",
-      "item_summary": "1–2 sentence summary of the item"
+      "delivery_time_days": "integer number of days or null",
+      "item_level_1": "broadest category (e.g. Industrial Equipment, IT Hardware, Services)",
+      "item_level_2": "sub-category (e.g. Pumps & Valves, Laptops, Facility Management)",
+      "item_level_3": "product or service type",
+      "item_level_4": "brand or manufacturer if known, else null",
+      "item_level_5": "model or series if known, else null",
+      "item_level_6": "configuration or variant if known, else null",
+      "item_level_7": "key technical specification if known, else null",
+      "item_level_8": "any additional distinguishing detail, else null",
+      "commodity_tag": "lowercase-slug-tag (e.g. industrial-pump, it-laptop, vehicle-hiring)",
+      "item_summary": "1–2 sentence plain-English summary of the item and its intended use"
     }}
   ]
 }}
 
 ### Rules
-- All text MUST be in English.  Translate if the document is in another language.
-- Dates in ISO 8601 (YYYY-MM-DD).
-- Prices as plain numbers — no currency symbols, no thousand separators.
-- If a field cannot be determined, set it to null (or "" for item_level fields).
-- Extract ALL items found in the quotation, even those that do not match any requisition line item.
-- For items that match a requisition line, set purchase_dtl_id to the DTL_ID value from the table above.
-- For unmatched items, set purchase_dtl_id to null.
-- supplier_match_conf reflects your confidence that the extracted item matches the requisition line item (0.0 = no match, 1.0 = certain match).
-- commodity_tag should be a lowercase slug (e.g. "industrial-temperature-control", "vehicle-hiring", "it-laptop").
+- All text fields MUST be in English — translate from any source language.
+- Dates must be ISO 8601 (YYYY-MM-DD).  Convert formats like "15-Apr-2026" or "15/04/26" accordingly.
+- Prices as plain numbers — strip currency symbols, commas, and thousand separators.
+- Distinguish unit price from total price.  If only one price is shown assume it is the unit price unless quantity = 1.
+- If a field genuinely cannot be determined from the document, return null (not an empty string, not "N/A").
+- item_level fields should be null when truly unknown — do not guess.
+- Extract ALL items found in the document, even those not present in the requisition table (set purchase_dtl_id = null for those).
+- For matched items set purchase_dtl_id to the integer DTL_ID from the table.
+- supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
+- commodity_tag should be a lowercase hyphenated slug that uniquely identifies the commodity family.

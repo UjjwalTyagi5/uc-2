@@ -1,20 +1,22 @@
-"""Persist extracted items to [ras_procurement].[quotation_extracted_items]."""
+"""Persist extracted items to quotation_extracted_items.
+
+All DB access goes through BaseRepository so writes get automatic retry
+on transient Azure SQL errors, consistent connection management, and
+bulk-insert via fast_executemany for better performance.
+"""
 
 from __future__ import annotations
 
-import pyodbc
 from loguru import logger
 
-from pipeline.db_utils import connect_with_retry
+from db.crud import BaseRepository
+from db.tables import AzureTables
 
 from .config import ExtractionConfig
 from .models import ExtractedItem
 
-_SCHEMA = "ras_procurement"
-_TABLE = "quotation_extracted_items"
-
 _INSERT_SQL = f"""
-INSERT INTO [{_SCHEMA}].[{_TABLE}] (
+INSERT INTO {AzureTables.QUOTATION_EXTRACTED_ITEMS} (
     [attachment_classify_fk],
     [embedded_classify_fk],
     [purchase_dtl_id],
@@ -59,18 +61,19 @@ INSERT INTO [{_SCHEMA}].[{_TABLE}] (
 """
 
 _DELETE_BY_ATTACHMENT_SQL = f"""
-DELETE FROM [{_SCHEMA}].[{_TABLE}]
+DELETE FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS}
  WHERE [attachment_classify_fk] = ?
+   AND [embedded_classify_fk] IS NULL
 """
 
 _DELETE_BY_EMBEDDED_SQL = f"""
-DELETE FROM [{_SCHEMA}].[{_TABLE}]
+DELETE FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS}
  WHERE [embedded_classify_fk] = ?
 """
 
 
-def _to_param(val: object) -> object:
-    """Convert Python types to pyodbc-friendly values."""
+def _p(val: object) -> object:
+    """Convert Python types to pyodbc-safe values."""
     if val is None:
         return None
     if isinstance(val, bool):
@@ -78,11 +81,52 @@ def _to_param(val: object) -> object:
     return val
 
 
-class ExtractionWriter:
+def _item_to_row(item: ExtractedItem) -> list:
+    """Convert one ExtractedItem to the ordered INSERT parameter list."""
+    return [
+        _p(str(item.attachment_classify_fk) if item.attachment_classify_fk else None),
+        _p(str(item.embedded_classify_fk)   if item.embedded_classify_fk   else None),
+        _p(item.purchase_dtl_id),
+        _p(item.is_selected_quote),
+        _p(item.supplier_match_conf),
+        _p(item.quote_rank),
+        _p(item.supplier_name),
+        _p(item.supplier_address),
+        _p(item.supplier_country),
+        _p(item.quotation_ref_no),
+        _p(item.quotation_date),
+        _p(item.currency),
+        _p(item.validity_date),
+        _p(item.validity_days),
+        _p(item.payment_terms),
+        _p(item.item_name),
+        _p(item.item_description),
+        _p(item.quantity),
+        _p(item.unit),
+        _p(item.unit_price),
+        _p(item.total_price),
+        _p(item.discount),
+        _p(item.taxation_details),
+        _p(item.delivery_date),
+        _p(item.delivery_time_days),
+        _p(item.item_level_1),
+        _p(item.item_level_2),
+        _p(item.item_level_3),
+        _p(item.item_level_4),
+        _p(item.item_level_5),
+        _p(item.item_level_6),
+        _p(item.item_level_7),
+        _p(item.item_level_8),
+        _p(item.commodity_tag),
+        _p(item.item_summary),
+    ]
+
+
+class ExtractionWriter(BaseRepository):
     """Writes :class:`ExtractedItem` rows to the silver table."""
 
     def __init__(self, config: ExtractionConfig) -> None:
-        self._conn_str = config.get_azure_conn_str()
+        super().__init__(config.get_azure_conn_str())
 
     def write(self, items: list[ExtractedItem], *, replace: bool = True) -> int:
         """Insert items into the silver table.
@@ -95,84 +139,36 @@ class ExtractionWriter:
         if not items:
             return 0
 
-        conn: pyodbc.Connection = connect_with_retry(
-            self._conn_str, autocommit=False
+        if replace:
+            self._delete_existing(items)
+
+        rows = [_item_to_row(item) for item in items]
+        self._execute_many(_INSERT_SQL, rows)
+
+        logger.info(
+            "Wrote {} row(s) to {}",
+            len(rows), AzureTables.QUOTATION_EXTRACTED_ITEMS,
         )
-        try:
-            cursor = conn.cursor()
+        return len(rows)
 
-            if replace:
-                self._delete_existing(cursor, items)
+    def _delete_existing(self, items: list[ExtractedItem]) -> None:
+        """Delete pre-existing rows for the same source FK(s).
 
-            written = 0
-            for item in items:
-                params = (
-                    _to_param(str(item.attachment_classify_fk) if item.attachment_classify_fk else None),
-                    _to_param(str(item.embedded_classify_fk) if item.embedded_classify_fk else None),
-                    _to_param(item.purchase_dtl_id),
-                    _to_param(item.is_selected_quote),
-                    _to_param(item.supplier_match_conf),
-                    _to_param(item.quote_rank),
-                    _to_param(item.supplier_name),
-                    _to_param(item.supplier_address),
-                    _to_param(item.supplier_country),
-                    _to_param(item.quotation_ref_no),
-                    _to_param(item.quotation_date),
-                    _to_param(item.currency),
-                    _to_param(item.validity_date),
-                    _to_param(item.validity_days),
-                    _to_param(item.payment_terms),
-                    _to_param(item.item_name),
-                    _to_param(item.item_description),
-                    _to_param(item.quantity),
-                    _to_param(item.unit),
-                    _to_param(item.unit_price),
-                    _to_param(item.total_price),
-                    _to_param(item.discount),
-                    _to_param(item.taxation_details),
-                    _to_param(item.delivery_date),
-                    _to_param(item.delivery_time_days),
-                    _to_param(item.item_level_1),
-                    _to_param(item.item_level_2),
-                    _to_param(item.item_level_3),
-                    _to_param(item.item_level_4),
-                    _to_param(item.item_level_5),
-                    _to_param(item.item_level_6),
-                    _to_param(item.item_level_7),
-                    _to_param(item.item_level_8),
-                    _to_param(item.commodity_tag),
-                    _to_param(item.item_summary),
-                )
-                cursor.execute(_INSERT_SQL, params)
-                written += 1
-
-            conn.commit()
-            logger.info("Wrote {} rows to {}.{}", written, _SCHEMA, _TABLE)
-            return written
-
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _delete_existing(
-        cursor: pyodbc.Cursor,
-        items: list[ExtractedItem],
-    ) -> None:
-        """Delete pre-existing rows for the same source FK(s)."""
-        deleted_att: set[str] = set()
+        Embedded items carry both FKs — delete by the more-specific key
+        (embedded FK) so rows from sibling embedded files are untouched.
+        Parent-only items are deleted by their attachment FK.
+        """
         deleted_emb: set[str] = set()
+        deleted_att: set[str] = set()
 
         for item in items:
-            if item.attachment_classify_fk:
-                key = str(item.attachment_classify_fk)
-                if key not in deleted_att:
-                    cursor.execute(_DELETE_BY_ATTACHMENT_SQL, key)
-                    deleted_att.add(key)
-            elif item.embedded_classify_fk:
+            if item.embedded_classify_fk:
                 key = str(item.embedded_classify_fk)
                 if key not in deleted_emb:
-                    cursor.execute(_DELETE_BY_EMBEDDED_SQL, key)
+                    self._execute(_DELETE_BY_EMBEDDED_SQL, key)
                     deleted_emb.add(key)
+            elif item.attachment_classify_fk:
+                key = str(item.attachment_classify_fk)
+                if key not in deleted_att:
+                    self._execute(_DELETE_BY_ATTACHMENT_SQL, key)
+                    deleted_att.add(key)

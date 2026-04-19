@@ -17,6 +17,8 @@ from typing import Optional
 
 from loguru import logger
 
+from pipeline.tracker import PipelineTracker
+
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
 from .extractor import QuotationExtractor, compute_quote_ranks
@@ -24,8 +26,7 @@ from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
 
-_DEFAULT_WORK_DIR = pathlib.Path(__file__).resolve().parents[1] / "work"
-
+_METADATA_EXTRACTION_STAGE_ID = 5
 
 def run_extraction(
     purchase_req_no: str,
@@ -47,7 +48,7 @@ def run_extraction(
         When True, processes ALL attachments regardless of doc_type
         classification.  Useful for testing.
     work_dir:
-        Root of the local work directory.  Defaults to ``uc-2/work/``.
+        Root of the local work directory.  Overrides config.WORK_DIR.
         Files are expected at ``{work_dir}/{blob_path}``
         (e.g. ``work/procurement/R_260647_2026/1000831/file.pdf``).
     write_to_db:
@@ -61,7 +62,9 @@ def run_extraction(
     if config is None:
         config = ExtractionConfig()
 
-    work_root = pathlib.Path(work_dir) if work_dir else _DEFAULT_WORK_DIR
+    # Use the same WORK_DIR as the blob-sync and pipeline stages so all
+    # modules resolve files from the same root (configurable via WORK_DIR env).
+    work_root = pathlib.Path(work_dir) if work_dir else pathlib.Path(config.WORK_DIR)
 
     # 1. Build RAS context (line items + metadata)
     ras_ctx: RASContext = build_ras_context(config, purchase_req_no)
@@ -77,7 +80,21 @@ def run_extraction(
         config, purchase_req_no, include_all=include_all_attachments
     )
     if not sources:
-        logger.warning("No quotation sources found for {}", purchase_req_no)
+        msg = (
+            f"No quotation documents found for PR={purchase_req_no!r}. "
+            f"None of the attachments are classified as 'Quotation' — "
+            f"this RAS cannot proceed to benchmarking."
+        )
+        logger.warning(msg)
+        try:
+            PipelineTracker(config.get_azure_conn_str()).record_exception(
+                purchase_req_no, _METADATA_EXTRACTION_STAGE_ID, msg
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record no-quotation exception for PR={!r}",
+                purchase_req_no,
+            )
         return []
 
     # 3. Extract from each quotation file (read from local work/ folder)

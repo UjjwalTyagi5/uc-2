@@ -42,8 +42,6 @@ from pipeline.attachment_classification_repository import (
 from pipeline.stages.base import BaseStage
 from pipeline.tracker import PipelineTracker
 
-_WORK_DIR = Path("work")
-
 # Map classifier output values → DB-expected values
 _CLASSIFICATION_MAP = {
     "E-Auction": "E-Auction Results",
@@ -77,13 +75,14 @@ class ClassificationStage(BaseStage):
 
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
-        self._config   = config
-        self._tracker  = PipelineTracker(config.get_azure_conn_str())
-        self._att_repo = AttachmentClassificationRepository(config.get_azure_conn_str())
+        self._config    = config
+        self._work_dir  = Path(config.WORK_DIR)
+        self._tracker   = PipelineTracker(config.get_azure_conn_str())
+        self._att_repo  = AttachmentClassificationRepository(config.get_azure_conn_str())
 
     def execute(self, purchase_req_no: str) -> None:
         safe_pr     = purchase_req_no.replace("/", "_")
-        pr_work_dir = _WORK_DIR / "procurement" / safe_pr
+        pr_work_dir = self._work_dir / "procurement" / safe_pr
 
         if not pr_work_dir.exists():
             self._log.warning(

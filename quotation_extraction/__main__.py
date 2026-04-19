@@ -24,7 +24,6 @@ import json
 import pathlib
 import sys
 import uuid
-from dataclasses import asdict
 from datetime import date
 from decimal import Decimal
 
@@ -109,7 +108,7 @@ def _print_summary(items: list[ExtractedItem]) -> None:
     matched = sum(1 for i in items if i.purchase_dtl_id is not None)
     logger.info("Matched to RAS line items: {}/{}", matched, len(items))
 
-    as_dicts = [asdict(i) for i in items]
+    as_dicts = [i.model_dump() for i in items]
     print(json.dumps(as_dicts, indent=2, default=_json_serializer))
 
 

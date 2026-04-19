@@ -26,7 +26,10 @@ dependencies = [
     "chardet>=5.2.0",
     "beautifulsoup4>=4.12.0",
     "tiktoken>=0.8.0",
+    "pydantic>=2.7.0",
     "pydantic-settings>=2.7.0",
+    "langchain-openai>=0.1.0",
+    "langchain-core>=0.1.0",
     "structlog>=24.0.0",
     "tabulate>=0.9.0",
 ]
