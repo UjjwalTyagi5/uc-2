@@ -35,7 +35,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from utils.config import AppConfig
-from attachment_blob_sync.sync import AttachmentBlobSync
 from pipeline.attachment_classification_repository import (
     AttachmentClassificationRepository,
 )
@@ -183,22 +182,10 @@ class ClassificationStage(BaseStage):
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _finish(self, purchase_req_no: str) -> None:
-        """Advance tracker, stamp last_processed_at, and sync BI dashboard."""
+        """Advance tracker and stamp last_processed_at."""
         self._tracker.advance_stage(purchase_req_no, self.STAGE_ID)
-
         # Stamp last_processed_at so SourceChangeDetector can detect future changes
         self._tracker.set_last_processed_at(purchase_req_no)
-
-        # Sync BI dashboard row for this PR now that processing is complete.
-        # Runs on both first-time processing and re-processing after source changes.
-        try:
-            AttachmentBlobSync(self._config).sync_bi_dashboard_for_pr(purchase_req_no)
-        except Exception as exc:
-            # BI dashboard sync failure is non-fatal — log it but do not fail the stage.
-            self._log.error(
-                f"BI dashboard sync failed for PR={purchase_req_no!r} "
-                f"(non-fatal, continuing): {exc}"
-            )
 
     def _process_file_task(self, task: dict, classify_file_fn) -> None:
         """

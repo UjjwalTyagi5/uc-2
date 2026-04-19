@@ -64,11 +64,23 @@ class EmbedDocExtractionStage(BaseStage):
         safe_pr     = purchase_req_no.replace("/", "_")
         pr_work_dir = self._work_dir / "procurement" / safe_pr
 
-        # ── Step 1: Download attachments to local work/ ────────────────────
-        saved = AttachmentBlobSync(self._config).save_locally(purchase_req_no)
+        # ── Step 1: Download attachments + sync BI dashboard ─────────────────
+        # Both reads happen here because we're already connected to on-prem.
+        # BI dashboard data must be in Azure before METADATA_EXTRACTION reads it.
+        blob_sync = AttachmentBlobSync(self._config)
+        saved = blob_sync.save_locally(purchase_req_no)
         self._log.info(
             f"Saved {saved} attachment(s) to work/ for PR={purchase_req_no!r}"
         )
+
+        try:
+            blob_sync.sync_bi_dashboard_for_pr(purchase_req_no)
+        except Exception as exc:
+            # Non-fatal — log and continue; context_builder handles missing data gracefully
+            self._log.error(
+                f"BI dashboard sync failed for PR={purchase_req_no!r} "
+                f"(non-fatal, continuing): {exc}"
+            )
 
         if not pr_work_dir.exists() or saved == 0:
             self._log.warning(
