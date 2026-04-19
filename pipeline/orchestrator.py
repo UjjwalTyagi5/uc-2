@@ -142,6 +142,25 @@ class PipelineOrchestrator:
         self._log_summary(results)
         return results
 
+    def run_single(self, purchase_req_no: str) -> PRResult:
+        """
+        Force a full reprocess of one specific PR from scratch.
+
+        Steps:
+          1. Wipe all pipeline state (ras_tracker, ras_pipeline_exceptions)
+             so the PR looks brand new to the pipeline.
+          2. Run _process_pr() which cleans child tables, wipes the local
+             work folder, and executes every registered stage in order.
+
+        Use this when you need to reprocess a specific PR regardless of its
+        current pipeline state (including EXCEPTION or COMPLETED).
+        """
+        self._log.info(f"Forced single-PR reprocess: PR={purchase_req_no!r}")
+        self._tracker.reset_for_reprocess(purchase_req_no)
+        result = self._process_pr(purchase_req_no)
+        self._log_summary([result])
+        return result
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
