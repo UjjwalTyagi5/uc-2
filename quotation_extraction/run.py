@@ -19,7 +19,7 @@ from loguru import logger
 
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
-from .extractor import QuotationExtractor, compute_quote_ranks
+from .extractor import QuotationExtractor, compute_quote_ranks, resolve_selected_quote
 from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
@@ -116,7 +116,10 @@ def run_extraction(
         logger.warning("No items extracted for {}", purchase_req_no)
         return []
 
-    # 4. Compute quote_rank across all quotation sources
+    # 4. Winner-takes-all: pick the single best-matching quotation source
+    resolve_selected_quote(all_items)
+
+    # 5. Compute quote_rank across all quotation sources
     compute_quote_ranks(all_items)
 
     logger.info(
@@ -126,7 +129,7 @@ def run_extraction(
         len(sources),
     )
 
-    # 5. Write to DB
+    # 6. Write to DB
     if write_to_db:
         writer = ExtractionWriter(config)
         writer.write(all_items)

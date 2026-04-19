@@ -397,6 +397,57 @@ def _align_to_ras_line_items(
     return matched
 
 
+# ── Winner-takes-all selection ──
+
+
+def resolve_selected_quote(all_items: list[ExtractedItem]) -> None:
+    """Ensure exactly one quotation source is marked is_selected_quote = True.
+
+    Each quotation source is identified by (attachment_classify_fk,
+    embedded_classify_fk).  Among all sources with supplier_match_conf ≥
+    _SELECTED_THRESHOLD, only the one with the highest confidence wins.
+    All others are set to False.  If no source meets the threshold every
+    item gets False.
+
+    Mutates items in-place.
+    """
+    from collections import defaultdict
+
+    # Group by source key → collect (conf, items) per source
+    groups: dict[tuple, list[ExtractedItem]] = defaultdict(list)
+    for item in all_items:
+        key = (item.attachment_classify_fk, item.embedded_classify_fk)
+        groups[key].append(item)
+
+    # Find the best-confidence source that exceeds the selection threshold
+    best_key = None
+    best_conf = Decimal("0")
+
+    for key, group in groups.items():
+        # Representative conf: all items in a source share the same value
+        conf = group[0].supplier_match_conf or Decimal("0")
+        if conf >= _SELECTED_THRESHOLD and conf > best_conf:
+            best_conf = conf
+            best_key  = key
+
+    # Apply winner-takes-all: only best_key items get True
+    for key, group in groups.items():
+        selected = key == best_key
+        for item in group:
+            item.is_selected_quote = selected
+
+    if best_key is not None:
+        logger.info(
+            "Winner-takes-all: source key={} selected (conf={}); {} other source(s) deselected",
+            best_key, best_conf, len(groups) - 1,
+        )
+    else:
+        logger.info(
+            "Winner-takes-all: no source met threshold={} — all is_selected_quote=False",
+            _SELECTED_THRESHOLD,
+        )
+
+
 # ── Quote ranking ──
 
 
