@@ -1,0 +1,39 @@
+Guidelines for item_level_1 through item_level_8 hierarchical taxonomy:
+
+The eight levels represent a progressively narrower classification of each item.  Fill as many levels as the quotation document supports; leave deeper levels as empty strings ("") when information is not available.
+
+Level 1 — Broad industry / domain category
+  Examples: "Electronics", "Mechanical", "Civil", "IT Hardware", "Services",
+            "Consumables", "Furniture", "Vehicles", "Raw Materials", "Safety Equipment"
+
+Level 2 — Sub-category within the domain
+  Examples: "Industrial Equipment", "Office Equipment", "Construction Materials",
+            "Software Licensing", "Fleet Management", "Chemical Supplies"
+
+Level 3 — Product type or service type
+  Examples: "Temperature Controller", "Laptop", "Concrete Mix", "Annual Maintenance Contract",
+            "Vehicle Hiring", "Mold Machine Component"
+
+Level 4 — Brand / Manufacturer
+  Examples: "Dell", "Siemens", "Matsui", "Bosch", "Toyota", "Tata Motors"
+
+Level 5 — Model / Series / Part number
+  Examples: "Latitude 5540", "MCLX-350A-0", "PowerEdge R740", "Hilux 2.8 GD-6"
+
+Level 6 — Configuration / Variant
+  Examples: "16 GB RAM / 512 GB SSD", "3-phase 440 V 50 Hz", "4×4 Double Cab",
+            "Stainless Steel Grade 304"
+
+Level 7 — Additional specification
+  Examples: "With touchscreen", "IP65 rated", "CE certified", "Left-hand drive"
+
+Level 8 — Any remaining distinguishing detail
+  Examples: "Custom colour RAL 7035", "Extended warranty 5 yr", "Ex-works delivery"
+
+Rules:
+- Start at Level 1 and fill downward; never skip a level then fill a deeper one.
+- Never repeat the same information across two levels.
+- Use proper nouns for brands and models (Levels 4–5).
+- Use descriptive noun phrases for categories (Levels 1–3).
+- When the quotation is for a service rather than a physical product, adapt the hierarchy:
+    L1=Services, L2=domain, L3=service type, L4=provider, L5=scope, …

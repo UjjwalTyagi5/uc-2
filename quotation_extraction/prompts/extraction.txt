@@ -1,0 +1,100 @@
+## Purchase Requisition Context
+
+**RAS Number:** {purchase_req_no}
+**Requisition ID:** {purchase_req_id}
+**Requisition Type:** {requisition_type}
+**Justification:** {justification}
+**Primary Supplier:** {supplier_name}
+**Supplier Address:** {address}
+**Parent Supplier:** {parent_supplier}
+**Supplier Type:** {supplier_type}
+**Supplier Country:** {supplier_country}
+**Currency (RAS):** {currency}
+**Purchase Value:** {purchase_value}
+**Enquiry No:** {enquiry_no}
+**Contract No:** {contract_no}
+**Order No:** {order_no}
+**Classification:** {classification}
+**Department:** {department}
+**Negotiated By:** {negotiated_by}
+**Category Buyer:** {category_buyer}
+**Category:** {category}
+**Sub-category:** {sub_category}
+**Site:** {site}
+**Region / Country:** {site_region} / {site_country}
+**Division:** {division}
+**Payment Days:** {payment_days}
+**PO Date:** {po_date}
+
+### Line Items from the Requisition
+
+{line_items_table}
+
+---
+
+## Item Taxonomy Guidelines
+
+{item_taxonomy}
+
+---
+
+## Quotation Document
+
+{document_content}
+
+---
+
+## Required Output
+
+Extract **every item** found in the quotation document above.  For each item, attempt to match it to the closest line item from the requisition table (use the Description, Quantity, and Type columns to judge similarity).
+
+Return a **single JSON object** (no markdown fences, no extra text) with this schema:
+
+{{
+  "supplier_name": "string",
+  "supplier_address": "string or null",
+  "supplier_country": "string or null",
+  "quotation_ref_no": "string or null",
+  "quotation_date": "YYYY-MM-DD or null",
+  "currency": "ISO-4217 code or null",
+  "validity_date": "YYYY-MM-DD or null",
+  "validity_days": integer or null,
+  "payment_terms": "string or null",
+  "items": [
+    {{
+      "purchase_dtl_id": integer_from_DTL_ID_column_or_null,
+      "supplier_match_conf": 0.0_to_1.0,
+      "item_name": "canonical item name in English",
+      "item_description": "full description with specs in English",
+      "quantity": number_or_null,
+      "unit": "unit of measurement or null",
+      "unit_price": number_or_null,
+      "total_price": number_or_null,
+      "discount": number_or_null,
+      "taxation_details": "tax info string or null",
+      "delivery_date": "YYYY-MM-DD or null",
+      "delivery_time_days": integer_or_null,
+      "item_level_1": "broadest category",
+      "item_level_2": "sub-category",
+      "item_level_3": "product/service type",
+      "item_level_4": "brand/manufacturer",
+      "item_level_5": "model/series",
+      "item_level_6": "config/variant or empty",
+      "item_level_7": "spec detail or empty",
+      "item_level_8": "additional detail or empty",
+      "commodity_tag": "slug-style-commodity-tag",
+      "item_summary": "1–2 sentence summary of the item"
+    }}
+  ]
+}}
+
+### Rules
+- All text MUST be in English.  Translate if the document is in another language.
+- Dates in ISO 8601 (YYYY-MM-DD).
+- Prices as plain numbers — no currency symbols, no thousand separators.
+- If a field cannot be determined, set it to null (or "" for item_level fields).
+- Extract ALL items found in the quotation, even those that do not match any requisition line item.
+- For items that match a requisition line, set purchase_dtl_id to the DTL_ID value from the table above.
+- For unmatched items, set purchase_dtl_id to null.
+- supplier_match_conf reflects your confidence that the extracted item matches the requisition line item (0.0 = no match, 1.0 = certain match).
+- commodity_tag should be a lowercase slug (e.g. "industrial-temperature-control", "vehicle-hiring", "it-laptop").
