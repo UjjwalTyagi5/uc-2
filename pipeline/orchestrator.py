@@ -146,17 +146,28 @@ class PipelineOrchestrator:
         """
         Force a full reprocess of one specific PR from scratch.
 
-        Steps:
-          1. Wipe all pipeline state (ras_tracker, ras_pipeline_exceptions)
-             so the PR looks brand new to the pipeline.
-          2. Run _process_pr() which cleans child tables, wipes the local
-             work folder, and executes every registered stage in order.
+        Steps (order matters — child tables must be cleaned while tracker exists):
+          1. cleanup_for_pr  — SP deletes quotation_extracted_items,
+                               embedded_attachment_classification,
+                               attachment_classification, BI dashboard rows
+                               (uses ras_tracker FK lookup, so must run first)
+          2. reset_for_reprocess — deletes ras_pipeline_exceptions then the
+                               ras_tracker row so the PR looks brand new
+          3. _process_pr     — wipes local work folder, runs all stages
 
         Use this when you need to reprocess a specific PR regardless of its
         current pipeline state (including EXCEPTION or COMPLETED).
         """
         self._log.info(f"Forced single-PR reprocess: PR={purchase_req_no!r}")
+
+        # Step 1 — clean child tables (SP needs tracker row for FK lookup)
+        self._att_repo.cleanup_for_pr(purchase_req_no)
+
+        # Step 2 — delete exceptions + tracker row (PR now looks brand new)
         self._tracker.reset_for_reprocess(purchase_req_no)
+
+        # Step 3 — _process_pr calls cleanup_for_pr again but it's a no-op
+        #           (tracker gone), then wipes work folder and runs all stages
         result = self._process_pr(purchase_req_no)
         self._log_summary([result])
         return result
