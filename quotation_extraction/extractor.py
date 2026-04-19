@@ -13,6 +13,7 @@ import json
 import pathlib
 import re
 from decimal import Decimal
+from difflib import SequenceMatcher
 from typing import Optional
 
 from loguru import logger
@@ -145,6 +146,103 @@ def _build_user_prompt(
     )
 
 
+# ── Supplier matching ──
+
+_SELECTED_THRESHOLD = Decimal("0.70")   # min confidence to mark as selected quote
+_PRICE_TOLERANCE    = Decimal("0.05")   # 5 % — prices within this band count as matching
+_PRICE_MAX_BOOST    = Decimal("0.10")   # max confidence boost from price alignment
+
+
+def _compute_supplier_match(
+    extracted_supplier: Optional[str],
+    ras_context: RASContext,
+) -> tuple[bool, Decimal]:
+    """Fuzzy-match extracted supplier name against all RAS supplier sources.
+
+    Sources checked (in priority order):
+      1. purchase_req_mst.SUPPLIER_NAME      → ras_context.supplier_name
+      2. purchase_req_detail.SUPPLIER_NAME   → each li.supplier_name
+      3. vw_get_ras_data.Parent_Supplier     → ras_context.parent_supplier
+
+    Returns (is_selected, match_confidence 0.00–1.00).
+    Substring containment scores 0.90; SequenceMatcher ratio otherwise.
+    is_selected = True when best confidence ≥ 0.70.
+    """
+    if not extracted_supplier:
+        return False, Decimal("0")
+
+    known: set[str] = set()
+    if ras_context.supplier_name:
+        known.add(ras_context.supplier_name.strip())
+    if ras_context.parent_supplier:
+        known.add(ras_context.parent_supplier.strip())
+    for li in ras_context.line_items:
+        if li.supplier_name:
+            known.add(li.supplier_name.strip())
+
+    if not known:
+        return False, Decimal("0")
+
+    ext = extracted_supplier.strip().lower()
+    best = 0.0
+
+    for name in known:
+        n = name.lower()
+        if ext in n or n in ext:
+            best = max(best, 0.90)
+        else:
+            best = max(best, SequenceMatcher(None, ext, n).ratio())
+
+    conf = Decimal(str(round(best, 4)))
+    return conf >= _SELECTED_THRESHOLD, conf
+
+
+def _apply_price_alignment_boost(
+    items: list[ExtractedItem],
+    ras_context: RASContext,
+) -> None:
+    """Boost supplier_match_conf by up to 0.10 when extracted unit prices
+    align with RAS line item prices within 5 % tolerance.
+
+    Logic: if ≥50 % of matched line items have a price within tolerance,
+    boost all items in this quotation proportionally.  Mutates in-place.
+    """
+    dtl_price: dict[int, Decimal] = {
+        li.purchase_dtl_id: li.unit_price
+        for li in ras_context.line_items
+        if li.unit_price is not None and li.unit_price > 0
+    }
+    if not dtl_price:
+        return
+
+    matches = comparable = 0
+    for item in items:
+        if item.purchase_dtl_id in dtl_price and item.unit_price is not None:
+            comparable += 1
+            ras_p = dtl_price[item.purchase_dtl_id]
+            if abs(item.unit_price - ras_p) / ras_p <= _PRICE_TOLERANCE:
+                matches += 1
+
+    if comparable == 0:
+        return
+
+    price_hit_ratio = matches / comparable
+    if price_hit_ratio < 0.5:
+        return
+
+    boost = Decimal(str(round(price_hit_ratio * float(_PRICE_MAX_BOOST), 4)))
+    for item in items:
+        if item.supplier_match_conf is not None:
+            new_conf = min(Decimal("1.0"), item.supplier_match_conf + boost)
+            item.supplier_match_conf = new_conf
+            item.is_selected_quote   = new_conf >= _SELECTED_THRESHOLD
+
+    logger.debug(
+        "Price alignment boost +{} applied ({}/{} items within {}% tolerance)",
+        boost, matches, comparable, int(_PRICE_TOLERANCE * 100),
+    )
+
+
 # ── JSON parsing helpers ──
 
 
@@ -160,9 +258,13 @@ def _strip_json_fences(raw: str) -> str:
 def _parse_llm_response(
     raw: str,
     source: QuotationSource,
-    ras_supplier: Optional[str],
+    ras_context: RASContext,
 ) -> list[ExtractedItem]:
     """Parse the raw JSON string into a list of :class:`ExtractedItem`.
+
+    Supplier matching checks all three RAS sources:
+      purchase_req_mst.SUPPLIER_NAME, purchase_req_detail.SUPPLIER_NAME,
+      and vw_get_ras_data.Parent_Supplier.
 
     Pydantic handles all type coercions (str→Decimal, str→date, str→int)
     and normalises empty strings to None via the model's pre-validator.
@@ -184,40 +286,38 @@ def _parse_llm_response(
         logger.warning("LLM returned zero items for {}", source.blob_path)
         return []
 
-    # Determine if the quotation supplier matches the RAS primary supplier
+    # Multi-source supplier match → is_selected_quote + supplier_match_conf
     h_supplier: Optional[str] = header.get("supplier_name") or None
-    is_selected = False
-    if ras_supplier and h_supplier:
-        is_selected = (
-            ras_supplier.strip().lower() in h_supplier.strip().lower()
-            or h_supplier.strip().lower() in ras_supplier.strip().lower()
-        )
+    is_selected, match_conf = _compute_supplier_match(h_supplier, ras_context)
+
+    logger.info(
+        "Supplier match: extracted={!r} conf={} selected={}",
+        h_supplier, match_conf, is_selected,
+    )
 
     # Header fields shared across every item row in this quotation
     header_fields = {
-        "supplier_name":    h_supplier,
-        "supplier_address": header.get("supplier_address") or None,
-        "supplier_country": header.get("supplier_country") or None,
-        "quotation_ref_no": header.get("quotation_ref_no") or None,
-        "quotation_date":   header.get("quotation_date"),
-        "currency":         header.get("currency") or None,
-        "validity_date":    header.get("validity_date"),
-        "validity_days":    header.get("validity_days"),
-        "payment_terms":    header.get("payment_terms") or None,
+        "supplier_name":      h_supplier,
+        "supplier_address":   header.get("supplier_address") or None,
+        "supplier_country":   header.get("supplier_country") or None,
+        "quotation_ref_no":   header.get("quotation_ref_no") or None,
+        "quotation_date":     header.get("quotation_date"),
+        "currency":           header.get("currency") or None,
+        "validity_date":      header.get("validity_date"),
+        "validity_days":      header.get("validity_days"),
+        "payment_terms":      header.get("payment_terms") or None,
+        "supplier_match_conf": match_conf,
     }
 
     results: list[ExtractedItem] = []
     for raw_item in items_raw:
         try:
             item = ExtractedItem.model_validate({
-                # source linkage — set programmatically, never from LLM
                 "attachment_classify_fk": source.attachment_classify_fk,
                 "embedded_classify_fk":   source.embedded_classify_fk,
                 "is_selected_quote":      is_selected,
                 "quote_rank":             None,
-                # header fields (shared across all items in this quotation)
                 **header_fields,
-                # item-level fields from LLM — Pydantic coerces types
                 **raw_item,
             })
             results.append(item)
@@ -228,8 +328,8 @@ def _parse_llm_response(
             )
 
     logger.info(
-        "Parsed {} item(s) from LLM response (supplier={})",
-        len(results), h_supplier,
+        "Parsed {} item(s) from LLM response (supplier={} conf={})",
+        len(results), h_supplier, match_conf,
     )
     return results
 
@@ -354,12 +454,11 @@ class QuotationExtractor:
 
         raw_response = self._llm.extract(system_prompt, user_prompt, doc)
 
-        items = _parse_llm_response(
-            raw_response,
-            source,
-            ras_context.supplier_name,
-        )
+        items = _parse_llm_response(raw_response, source, ras_context)
 
         items = _align_to_ras_line_items(items, ras_context, source)
+
+        # Boost supplier_match_conf when extracted prices align with RAS prices
+        _apply_price_alignment_boost(items, ras_context)
 
         return items
