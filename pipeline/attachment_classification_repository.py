@@ -130,6 +130,18 @@ class AttachmentClassificationRepository:
 
     _CLEANUP_SP_SQL = "EXEC [ras_procurement].[usp_cleanup_pr_data] ?"
 
+    # Explicit delete for quotation_extracted_items — ensures rows are removed
+    # even if usp_cleanup_pr_data does not cover this table.
+    _DELETE_QUOTATION_ITEMS_SQL = f"""
+        DELETE qi
+          FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+          JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN {AzureTables.RAS_TRACKER} rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE rt.[purchase_req_no] = ?
+    """
+
     def __init__(self, conn_str: str) -> None:
         self._conn_str = conn_str
         self._log      = logger.bind(component="AttachmentClassificationRepository")
@@ -174,9 +186,16 @@ class AttachmentClassificationRepository:
         conn = self._connect()
         try:
             cursor = conn.cursor()
+            # Delete quotation_extracted_items first (FK child of attachment_classification)
+            cursor.execute(self._DELETE_QUOTATION_ITEMS_SQL, purchase_req_no)
+            deleted_qi = cursor.rowcount
+            # SP cleans embedded_classification, attachment_classification, BI dashboard
             cursor.execute(self._CLEANUP_SP_SQL, purchase_req_no)
             conn.commit()
-            self._log.info(f"Pre-run cleanup done for PR={purchase_req_no!r}")
+            self._log.info(
+                f"Pre-run cleanup done for PR={purchase_req_no!r} "
+                f"(deleted {deleted_qi} quotation_extracted_items row(s))"
+            )
         except pyodbc.Error as exc:
             conn.rollback()
             self._log.error(f"cleanup_for_pr failed for PR={purchase_req_no!r}: {exc}")
