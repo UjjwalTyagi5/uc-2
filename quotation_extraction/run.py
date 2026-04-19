@@ -17,16 +17,12 @@ from typing import Optional
 
 from loguru import logger
 
-from pipeline.tracker import PipelineTracker
-
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
 from .extractor import QuotationExtractor, compute_quote_ranks
 from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
-
-_METADATA_EXTRACTION_STAGE_ID = 5
 
 def run_extraction(
     purchase_req_no: str,
@@ -80,22 +76,11 @@ def run_extraction(
         config, purchase_req_no, include_all=include_all_attachments
     )
     if not sources:
-        msg = (
+        raise RuntimeError(
             f"No quotation documents found for PR={purchase_req_no!r}. "
             f"None of the attachments are classified as 'Quotation' — "
             f"this RAS cannot proceed to benchmarking."
         )
-        logger.warning(msg)
-        try:
-            PipelineTracker(config.get_azure_conn_str()).record_exception(
-                purchase_req_no, _METADATA_EXTRACTION_STAGE_ID, msg
-            )
-        except Exception:
-            logger.exception(
-                "Failed to record no-quotation exception for PR={!r}",
-                purchase_req_no,
-            )
-        return []
 
     # 3. Extract from each quotation file (read from local work/ folder)
     extractor = QuotationExtractor(config)

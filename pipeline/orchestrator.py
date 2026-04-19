@@ -46,9 +46,8 @@ from pipeline.stages.blob_upload import BlobUploadStage
 from pipeline.stages.classification import ClassificationStage
 from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
 from pipeline.stages.ingestion import IngestionStage
+from pipeline.stages.metadata_extraction import MetadataExtractionStage
 from pipeline.tracker import PipelineTracker
-
-_WORK_DIR = Path("work")
 
 
 class PipelineOrchestrator:
@@ -234,7 +233,7 @@ class PipelineOrchestrator:
             )
 
         safe_pr    = pr_no.replace("/", "_")
-        work_folder = _WORK_DIR / "procurement" / safe_pr
+        work_folder = Path(self._config.WORK_DIR) / "procurement" / safe_pr
         if work_folder.exists():
             shutil.rmtree(work_folder)
             self._log.debug(f"Removed local work folder: {work_folder}")
@@ -320,20 +319,16 @@ class PipelineOrchestrator:
 
         Current state
         -------------
-        Stage 1 — INGESTION           : records entry, creates ras_tracker row
-        Stage 2 — EMBED_DOC_EXTRACTION: stub (no work, marks stage)
-        Stage 3 — BLOB_UPLOAD         : uploads attachments to Azure Blob Storage
-        Stage 4 — CLASSIFICATION      : stub (no work, marks stage)
-
-        To add the next stage (e.g. METADATA_EXTRACTION):
-            1. Create pipeline/stages/metadata_extraction.py  (NAME="METADATA_EXTRACTION", STAGE_ID=5)
-            2. Append MetadataExtractionStage(config) to this list
-            3. Ensure STAGE_NAME=METADATA_EXTRACTION, STAGE_ID=5 exists in pipeline_stages table
+        Stage 1 — INGESTION            : records entry, creates ras_tracker row
+        Stage 2 — EMBED_DOC_EXTRACTION : downloads attachments + extracts embedded docs
+        Stage 3 — BLOB_UPLOAD          : uploads complete work folder to Azure Blob
+        Stage 4 — CLASSIFICATION       : classifies each attachment by doc_type via LLM
+        Stage 5 — METADATA_EXTRACTION  : extracts structured line items from quotations
         """
         return [
-            IngestionStage(config),            # stage 1  — creates tracker row
-            EmbedDocExtractionStage(config),   # stage 2  — saves locally + extracts embedded docs
-            BlobUploadStage(config),           # stage 3  — uploads complete work folder to blob
-            ClassificationStage(config),       # stage 4  — stub
-            # MetadataExtractionStage(config), # stage 5  — add when ready
+            IngestionStage(config),             # stage 1
+            EmbedDocExtractionStage(config),    # stage 2
+            BlobUploadStage(config),            # stage 3
+            ClassificationStage(config),        # stage 4
+            MetadataExtractionStage(config),    # stage 5
         ]
