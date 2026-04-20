@@ -563,7 +563,14 @@ def run_selection_llm_query(
             for key, group in groups.items():
                 sel = key == winning_key
                 for item in group:
-                    item.is_selected_quote = sel
+                    # Stub rows (no extracted data at all) are never marked selected —
+                    # they represent a line item missing from the quotation, not a quote.
+                    is_stub = (
+                        item.unit_price      is None
+                        and item.item_name        is None
+                        and item.item_description is None
+                    )
+                    item.is_selected_quote = sel and not is_stub
             logger.info(
                 "Selection LLM: source #{} selected (supplier={!r}); "
                 "{} other source(s) deselected",
