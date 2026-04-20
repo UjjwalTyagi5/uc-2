@@ -19,7 +19,7 @@ from loguru import logger
 
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
-from .extractor import QuotationExtractor, compute_quote_ranks, run_selection_llm_query
+from .extractor import QuotationExtractor, run_selection_llm_query
 from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
@@ -116,11 +116,9 @@ def run_extraction(
         logger.warning("No items extracted for {}", purchase_req_no)
         return []
 
-    # 4. Single LLM call: ask which source best matches RAS data and mark it selected
+    # 4. Single LLM call: determine is_selected_quote + quote_rank per DTL_ID
+    #    Falls back to programmatic ranking if LLM fails
     run_selection_llm_query(all_items, ras_ctx, config)
-
-    # 5. Compute quote_rank across all quotation sources
-    compute_quote_ranks(all_items)
 
     logger.info(
         "Extraction complete for {}: {} items from {} quotation(s)",
@@ -129,7 +127,7 @@ def run_extraction(
         len(sources),
     )
 
-    # 6. Write to DB
+    # 5. Write to DB
     if write_to_db:
         writer = ExtractionWriter(config)
         writer.write(all_items)

@@ -1,7 +1,10 @@
-## Task: Identify the Selected Quotation
+## Task: Identify the Selected Quotation and Rank All Sources
 
 You are given a purchase requisition's reference data and {n_sources} extracted quotation source(s).
-Your job is to identify which quotation was most likely selected by the buyer.
+
+You must do two things:
+1. Identify which quotation was most likely selected by the buyer.
+2. Rank every quotation source per line item by price competitiveness.
 
 ## Requisition Reference Data
 
@@ -10,7 +13,7 @@ Parent Supplier  : {parent_supplier}
 Currency         : {currency}
 
 ### Requisition Line Items
-(These are the actual values recorded by the buyer in the system — treat them as the ground truth.)
+(Actual values recorded by the buyer — treat as ground truth.)
 
 {ras_line_items_table}
 
@@ -20,14 +23,27 @@ Currency         : {currency}
 
 ## Instructions
 
-Decide which quotation source the buyer most likely selected. Apply these criteria in order:
+### Part 1 — Selected quotation
+Decide which source the buyer most likely selected. Apply in order:
+1. Supplier name closest to Primary Supplier or Parent Supplier above.
+2. Unit prices closest to the RAS recorded prices.
+3. Most recent quotation date when supplier and prices are similar.
 
-1. **Supplier match** — which supplier name is closest to the Primary Supplier or Parent Supplier above?
-2. **Price match** — which quotation's extracted unit prices are closest to the RAS recorded prices?
-3. **Latest date** — when supplier and prices are similar, prefer the most recent quotation date.
+### Part 2 — Rankings per line item
+For every DTL_ID in the requisition, rank each source:
+- Rank 1 = lowest unit price for that line item.
+- Tie-break: more recent quotation date = better rank.
+- Sources with no unit price for that line item rank last (highest number).
+- If ALL sources for a DTL_ID have no price, set every rank in that array to null.
 
 Return ONLY this JSON object — no markdown fences, no extra text:
-{{"selected_index": <integer 1 to {n_sources}>}}
 
-If it is truly impossible to determine, return:
-{{"selected_index": null}}
+{{
+  "selected_index": <integer 1 to {n_sources}, or null if cannot determine>,
+  "dtl_rankings": {{
+    "<dtl_id>": [<rank_source_1>, <rank_source_2>, ...]
+  }}
+}}
+
+The dtl_rankings array must have exactly {n_sources} elements — one per source in the same
+order as Source 1, Source 2, … above.
