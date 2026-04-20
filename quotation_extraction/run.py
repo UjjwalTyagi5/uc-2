@@ -116,9 +116,8 @@ def run_extraction(
         logger.warning("No items extracted for {}", purchase_req_no)
         return []
 
-    # 4. Single LLM call: determine is_selected_quote + quote_rank per DTL_ID
-    #    Falls back to programmatic ranking if LLM fails
-    run_selection_llm_query(all_items, ras_ctx, config)
+    # 4. Rank all items then select the winning source
+    run_selection_llm_query(all_items, ras_ctx, config)  # config unused but kept for signature compat
 
     logger.info(
         "Extraction complete for {}: {} items from {} quotation(s)",

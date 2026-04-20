@@ -498,29 +498,26 @@ def run_selection_llm_query(
     ras_context: RASContext,
     config: ExtractionConfig,
 ) -> None:
-    """Single LLM call for both is_selected_quote and quote_rank.
+    """Determine is_selected_quote and quote_rank for all extracted items.
 
-    After all files are extracted, sends one query with:
-      - RAS reference data (purchase_req_mst + purchase_req_detail values)
-      - All extracted sources summary (supplier, date, prices per DTL_ID)
+    Algorithm (fully deterministic — no LLM needed):
 
-    LLM returns:
-      selected_index  — which source the buyer chose (1-based, or null)
-      dtl_rankings    — per-DTL array of ranks in source order
+    Step 1 — Rank
+        compute_quote_ranks() assigns quote_rank per DTL_ID across all sources.
+        Rank 1 = lowest unit_price; no-price stubs rank last.
 
-    Falls back to compute_quote_ranks() if the LLM call fails or returns
-    no rankings, so ranking is always populated.
+    Step 2 — Select
+        Only sources with ≥1 non-stub item are candidates.
+        Each candidate is scored:
+            supplier_match_conf   (60 %) — how well supplier name matches RAS
+            rank-1 fraction       (40 %) — fraction of non-stub items ranked 1
+
+        The candidate with the highest score wins.  Its non-stub items get
+        is_selected_quote = True; all other items get False.
+
     Mutates items in-place.
     """
     from collections import defaultdict
-
-    groups: dict[tuple, list[ExtractedItem]] = defaultdict(list)
-    for item in all_items:
-        key = (item.attachment_classify_fk, item.embedded_classify_fk)
-        groups[key].append(item)
-
-    if not groups:
-        return
 
     def _has_data(item: ExtractedItem) -> bool:
         return (
@@ -529,94 +526,63 @@ def run_selection_llm_query(
             or item.item_description is not None
         )
 
-    # Only sources with at least one non-stub item can be selected
-    source_keys = [
-        key for key, group in groups.items()
-        if any(_has_data(item) for item in group)
-    ]
+    # ── Step 1: rank across all sources ─────────────────────────────────
+    compute_quote_ranks(all_items)
 
-    if not source_keys:
-        logger.info("Selection LLM: all sources are stub-only — no selection possible")
+    # ── Step 2: select winning source ───────────────────────────────────
+    groups: dict[tuple, list[ExtractedItem]] = defaultdict(list)
+    for item in all_items:
+        key = (item.attachment_classify_fk, item.embedded_classify_fk)
+        groups[key].append(item)
+
+    # Only consider sources that extracted at least one real item
+    candidates = {
+        key: [item for item in grp if _has_data(item)]
+        for key, grp in groups.items()
+    }
+    candidates = {k: v for k, v in candidates.items() if v}
+
+    if not candidates:
+        logger.info("Selection: all sources are stub-only — no selection possible")
         return
 
-    if len(source_keys) == 1:
-        # Only one source has real data — auto-select, skip LLM call
-        winning_key = source_keys[0]
-        for item in groups[winning_key]:
-            item.is_selected_quote = _has_data(item)
-        logger.info(
-            "Selection: single data source auto-selected (supplier={!r})",
-            groups[winning_key][0].supplier_name,
+    best_key   = None
+    best_score = -1.0
+
+    for key, non_stubs in candidates.items():
+        conf       = float(non_stubs[0].supplier_match_conf or Decimal("0"))
+        rank1_cnt  = sum(1 for item in non_stubs if item.quote_rank == 1)
+        rank1_frac = rank1_cnt / len(non_stubs)
+        score      = conf * 0.6 + rank1_frac * 0.4
+
+        logger.debug(
+            "Source key={} supplier={!r} conf={} rank1={}/{} score={:.4f}",
+            key,
+            non_stubs[0].supplier_name,
+            conf,
+            rank1_cnt,
+            len(non_stubs),
+            score,
         )
-        compute_quote_ranks(all_items)
-        return
 
-    n_sources = len(source_keys)
+        if score > best_score:
+            best_score = score
+            best_key   = key
 
-    tpl = _read_prompt("selection.txt")
-    user_prompt = tpl.format(
-        n_sources            = n_sources,
-        primary_supplier     = _na(ras_context.supplier_name),
-        parent_supplier      = _na(ras_context.parent_supplier),
-        currency             = _na(ras_context.currency),
-        ras_line_items_table = _build_ras_selection_table(ras_context),
-        sources_summary      = _build_sources_summary(source_keys, groups, ras_context),
+    # Apply winner-takes-all
+    for key, grp in groups.items():
+        sel = key == best_key
+        for item in grp:
+            item.is_selected_quote = sel and _has_data(item)
+
+    winner_supplier = candidates[best_key][0].supplier_name if best_key else None
+    logger.info(
+        "Selection: source selected supplier={!r} score={:.4f}; "
+        "{} other source(s) deselected",
+        winner_supplier,
+        best_score,
+        len(groups) - 1,
     )
-
-    system_prompt = _read_prompt("system.txt")
-    llm = ExtractionLLMClient(config)
-    rankings_applied = False
-
-    try:
-        raw  = llm.query(system_prompt, user_prompt)
-        raw  = _strip_json_fences(raw)
-        data = json.loads(raw)
-    except Exception as exc:
-        logger.warning(
-            "Selection LLM query failed — is_selected_quote=False, "
-            "falling back to programmatic ranking: {}",
-            exc,
-        )
-        compute_quote_ranks(all_items)
-        return
-
-    # ── Apply is_selected_quote ──────────────────────────────────────────
-    selected_idx = data.get("selected_index")
-    if selected_idx is not None:
-        try:
-            selected_idx = int(selected_idx)
-            if not 1 <= selected_idx <= n_sources:
-                raise ValueError(f"index {selected_idx} out of range 1–{n_sources}")
-            winning_key = source_keys[selected_idx - 1]
-            for key, group in groups.items():
-                sel = key == winning_key
-                for item in group:
-                    item.is_selected_quote = sel and _has_data(item)
-            logger.info(
-                "Selection LLM: source #{} selected (supplier={!r}); "
-                "{} other source(s) deselected",
-                selected_idx,
-                groups[winning_key][0].supplier_name,
-                n_sources - 1,
-            )
-        except (TypeError, ValueError) as exc:
-            logger.warning("Selection LLM invalid selected_index {!r}: {}", selected_idx, exc)
-    else:
-        logger.info("Selection LLM: could not determine selected source")
-
-    # ── Apply dtl_rankings ───────────────────────────────────────────────
-    dtl_rankings = data.get("dtl_rankings")
-    if dtl_rankings and isinstance(dtl_rankings, dict):
-        try:
-            _apply_llm_rankings(all_items, source_keys, groups, dtl_rankings)
-            rankings_applied = True
-            logger.info("LLM rankings applied for {} DTL_ID(s)", len(dtl_rankings))
-        except Exception as exc:
-            logger.warning("Failed to apply LLM rankings: {}", exc)
-
-    if not rankings_applied:
-        logger.info("Falling back to programmatic quote ranking")
-        compute_quote_ranks(all_items)
 
 
 # ── Quote ranking ──
