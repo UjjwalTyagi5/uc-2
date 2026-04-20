@@ -551,30 +551,38 @@ def compute_quote_ranks(
     """Assign *quote_rank* per purchase_dtl_id across all quotation sources.
 
     Sorting rules (applied in order):
-      1. unit_price ascending  — lower price = better rank
+      1. unit_price ascending  — lower price = better rank; items with no
+         unit_price are placed after all priced items.
       2. quotation_date descending (tie-breaker) — when two quotes have the
          same unit_price, the more recent quotation wins rank 1.
          Quotes with no date sort after those with a date.
 
-    Items with no purchase_dtl_id or no unit_price are left with quote_rank = None.
+    Every item for a DTL_ID gets a rank as long as at least one source for
+    that DTL_ID has a unit_price.  DTL_IDs where every source has no price
+    are left with quote_rank = None.
+    Items with no purchase_dtl_id are always left with quote_rank = None.
     Mutates the items in-place.
     """
 
     from collections import defaultdict
 
+    _MAX_PRICE = Decimal("999999999999")
+
     def _sort_key(item: ExtractedItem):
-        # Negate ordinal so that newer dates sort lower (rank 1)
-        # None dates are treated as the oldest possible (sort last)
         d = item.quotation_date
         date_key = (-d.toordinal()) if d is not None else 1  # 1 > any negative
-        return (item.unit_price, date_key)  # type: ignore[return-value]
+        price    = item.unit_price if item.unit_price is not None else _MAX_PRICE
+        return (price, date_key)
 
     by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
-        if item.purchase_dtl_id is not None and item.unit_price is not None:
+        if item.purchase_dtl_id is not None:
             by_dtl[item.purchase_dtl_id].append(item)
 
     for dtl_id, group in by_dtl.items():
+        # Skip DTL_IDs where no source extracted a price — nothing meaningful to rank
+        if not any(item.unit_price is not None for item in group):
+            continue
         sorted_group = sorted(group, key=_sort_key)
         for rank, item in enumerate(sorted_group, 1):
             item.quote_rank = rank
