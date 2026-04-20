@@ -116,8 +116,9 @@ def run_extraction(
         logger.warning("No items extracted for {}", purchase_req_no)
         return []
 
-    # 4. Winner-takes-all: pick the single best-matching quotation source
-    resolve_selected_quote(all_items)
+    # 4. Winner-takes-all: score each source against purchase_req_detail data
+    #    (supplier, price, qty, UOM, currency) and mark the best match selected
+    resolve_selected_quote(all_items, ras_ctx)
 
     # 5. Compute quote_rank across all quotation sources
     compute_quote_ranks(all_items)

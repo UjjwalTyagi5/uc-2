@@ -148,9 +148,16 @@ def _build_user_prompt(
 
 # ── Supplier matching ──
 
-_SELECTED_THRESHOLD = Decimal("0.70")   # min confidence to mark as selected quote
+_SELECTED_THRESHOLD = Decimal("0.70")   # min overall score to mark as selected quote
 _PRICE_TOLERANCE    = Decimal("0.05")   # 5 % — prices within this band count as matching
 _PRICE_MAX_BOOST    = Decimal("0.10")   # max confidence boost from price alignment
+
+# Weights for the multi-dimensional RAS alignment score used in resolve_selected_quote
+_W_SUPPLIER = Decimal("0.60")   # supplier name match across all RAS sources
+_W_PRICE    = Decimal("0.25")   # unit price alignment vs purchase_req_detail
+_W_QTY      = Decimal("0.08")   # quantity match vs purchase_req_detail
+_W_UOM      = Decimal("0.05")   # unit of measure match vs purchase_req_detail
+_W_CURRENCY = Decimal("0.02")   # currency header vs RAS currency
 
 
 def _compute_supplier_match(
@@ -286,16 +293,14 @@ def _parse_llm_response(
         logger.warning("LLM returned zero items for {}", source.blob_path)
         return []
 
-    # Multi-source supplier match → supplier_match_conf
+    # Multi-source supplier match — stored per item; final is_selected_quote
+    # is resolved later by resolve_selected_quote after all files are extracted.
     h_supplier: Optional[str] = header.get("supplier_name") or None
-    _is_selected_fuzzy, match_conf = _compute_supplier_match(h_supplier, ras_context)
-
-    # LLM's own judgment: did it spot selection signals in the document?
-    llm_is_selected: bool = bool(header.get("is_selected_quote", False))
+    _, match_conf = _compute_supplier_match(h_supplier, ras_context)
 
     logger.info(
-        "Supplier match: extracted={!r} conf={} llm_selected={}",
-        h_supplier, match_conf, llm_is_selected,
+        "Supplier match: extracted={!r} conf={}",
+        h_supplier, match_conf,
     )
 
     # Header fields shared across every item row in this quotation
@@ -310,7 +315,6 @@ def _parse_llm_response(
         "validity_days":      header.get("validity_days"),
         "payment_terms":      header.get("payment_terms") or None,
         "supplier_match_conf": match_conf,
-        "llm_is_selected":    llm_is_selected,
     }
 
     results: list[ExtractedItem] = []
@@ -332,8 +336,8 @@ def _parse_llm_response(
             )
 
     logger.info(
-        "Parsed {} item(s) from LLM response (supplier={} conf={} llm_selected={})",
-        len(results), h_supplier, match_conf, llm_is_selected,
+        "Parsed {} item(s) from LLM response (supplier={} conf={})",
+        len(results), h_supplier, match_conf,
     )
     return results
 
@@ -404,18 +408,96 @@ def _align_to_ras_line_items(
 # ── Winner-takes-all selection ──
 
 
-def resolve_selected_quote(all_items: list[ExtractedItem]) -> None:
-    """Ensure exactly one quotation source is marked is_selected_quote = True.
+def _compute_source_alignment_score(
+    items: list[ExtractedItem],
+    ras_context: RASContext,
+) -> Decimal:
+    """Score 0–1 measuring how well one quotation source matches RAS data.
 
-    Each source is identified by (attachment_classify_fk, embedded_classify_fk).
+    Compares extracted items against purchase_req_detail (via ras_context.line_items)
+    and purchase_req_mst / vw_get_ras_data (via ras_context.supplier_name /
+    parent_supplier).  Higher = closer match to what the buyer recorded.
 
-    Selection priority (winner-takes-all):
-      1. LLM flagged as selected  AND  conf ≥ threshold  →  strongest signal
-      2. LLM flagged as selected  (conf < threshold)     →  LLM found doc-level evidence
-      3. conf ≥ threshold only                           →  programmatic fallback
-      4. Nothing qualifies                               →  all False
+    Components
+    ----------
+    supplier (0.60) — fuzzy name match across all three RAS supplier sources
+    price    (0.25) — fraction of line items whose unit_price is within 5 % of RAS price
+    qty      (0.08) — fraction of line items whose quantity matches RAS quantity (within 1 %)
+    uom      (0.05) — fraction of line items whose unit matches RAS UOM
+    currency (0.02) — 1.0 if header currency matches RAS currency, else 0.0
+    """
+    if not items:
+        return Decimal("0")
 
-    Within each priority tier the source with the highest supplier_match_conf wins.
+    # Supplier score — reuse existing fuzzy matcher (already accounts for all 3 sources)
+    _, supplier_score = _compute_supplier_match(items[0].supplier_name, ras_context)
+
+    # Build RAS lookup by dtl_id for line-level comparisons
+    ras_by_dtl = {li.purchase_dtl_id: li for li in ras_context.line_items}
+
+    price_matches = price_comparable = 0
+    qty_matches   = qty_comparable   = 0
+    uom_matches   = uom_comparable   = 0
+
+    for item in items:
+        if item.purchase_dtl_id not in ras_by_dtl:
+            continue
+        ras_li = ras_by_dtl[item.purchase_dtl_id]
+
+        # Price
+        if item.unit_price is not None and ras_li.unit_price is not None and ras_li.unit_price > 0:
+            price_comparable += 1
+            if abs(item.unit_price - ras_li.unit_price) / ras_li.unit_price <= _PRICE_TOLERANCE:
+                price_matches += 1
+
+        # Quantity
+        if item.quantity is not None and ras_li.quantity is not None and ras_li.quantity > 0:
+            qty_comparable += 1
+            if abs(item.quantity - ras_li.quantity) / ras_li.quantity <= Decimal("0.01"):
+                qty_matches += 1
+
+        # UOM
+        if item.unit is not None and ras_li.uom is not None:
+            uom_comparable += 1
+            if item.unit.strip().lower() == ras_li.uom.strip().lower():
+                uom_matches += 1
+
+    price_score    = Decimal(str(round(price_matches / price_comparable, 4))) if price_comparable else Decimal("0")
+    qty_score      = Decimal(str(round(qty_matches   / qty_comparable,   4))) if qty_comparable   else Decimal("0")
+    uom_score      = Decimal(str(round(uom_matches   / uom_comparable,   4))) if uom_comparable   else Decimal("0")
+
+    # Currency
+    ext_cur = (items[0].currency or "").strip().upper()
+    ras_cur = (ras_context.currency or "").strip().upper()
+    currency_score = Decimal("1") if ext_cur and ras_cur and ext_cur == ras_cur else Decimal("0")
+
+    score = (
+        supplier_score * _W_SUPPLIER
+        + price_score  * _W_PRICE
+        + qty_score    * _W_QTY
+        + uom_score    * _W_UOM
+        + currency_score * _W_CURRENCY
+    )
+
+    logger.debug(
+        "Alignment score: supplier={} price={} qty={} uom={} currency={} → total={}",
+        supplier_score, price_score, qty_score, uom_score, currency_score,
+        score.quantize(Decimal("0.0001")),
+    )
+    return score.quantize(Decimal("0.0001"))
+
+
+def resolve_selected_quote(
+    all_items: list[ExtractedItem],
+    ras_context: RASContext,
+) -> None:
+    """Mark exactly one quotation source as is_selected_quote = True.
+
+    After all files are extracted, scores each source against the actual
+    values recorded in purchase_req_detail (price, qty, UOM, supplier, currency).
+    The source with the highest alignment score wins.  If no source reaches
+    _SELECTED_THRESHOLD all items get False.
+
     Mutates items in-place.
     """
     from collections import defaultdict
@@ -425,58 +507,37 @@ def resolve_selected_quote(all_items: list[ExtractedItem]) -> None:
         key = (item.attachment_classify_fk, item.embedded_classify_fk)
         groups[key].append(item)
 
-    def _source_conf(group: list[ExtractedItem]) -> Decimal:
-        return group[0].supplier_match_conf or Decimal("0")
-
-    def _source_llm(group: list[ExtractedItem]) -> bool:
-        return group[0].llm_is_selected
-
-    # Bucket sources into priority tiers
-    tier1: list[tuple] = []   # LLM selected + conf >= threshold
-    tier2: list[tuple] = []   # LLM selected only
-    tier3: list[tuple] = []   # conf >= threshold only
+    best_key   = None
+    best_score = Decimal("0")
 
     for key, group in groups.items():
-        conf = _source_conf(group)
-        llm  = _source_llm(group)
-        if llm and conf >= _SELECTED_THRESHOLD:
-            tier1.append(key)
-        elif llm:
-            tier2.append(key)
-        elif conf >= _SELECTED_THRESHOLD:
-            tier3.append(key)
-
-    best_key: Optional[tuple] = None
-    best_conf = Decimal("0")
-    winning_tier: Optional[int] = None
-
-    for tier_no, candidates in ((1, tier1), (2, tier2), (3, tier3)):
-        if not candidates:
-            continue
-        # Pick highest conf within this tier
-        for key in candidates:
-            conf = _source_conf(groups[key])
-            if conf > best_conf:
-                best_conf = conf
-                best_key  = key
-                winning_tier = tier_no
-        break   # stop at first non-empty tier
-
-    # Apply winner-takes-all
-    for key, group in groups.items():
-        selected = key == best_key
-        for item in group:
-            item.is_selected_quote = selected
-
-    if best_key is not None:
+        score = _compute_source_alignment_score(group, ras_context)
         logger.info(
-            "Winner-takes-all: source key={} selected via tier {} "
-            "(conf={}); {} other source(s) deselected",
-            best_key, winning_tier, best_conf, len(groups) - 1,
+            "Source key={} alignment_score={}",
+            key, score,
+        )
+        if score > best_score:
+            best_score = score
+            best_key   = key
+
+    qualifies = best_score >= _SELECTED_THRESHOLD
+
+    for key, group in groups.items():
+        selected = qualifies and key == best_key
+        for item in group:
+            item.is_selected_quote   = selected
+            item.supplier_match_conf = best_score if selected else (item.supplier_match_conf or Decimal("0"))
+
+    if qualifies:
+        logger.info(
+            "Winner-takes-all: source key={} selected (alignment_score={}); "
+            "{} other source(s) deselected",
+            best_key, best_score, len(groups) - 1,
         )
     else:
         logger.info(
-            "Winner-takes-all: no source qualified — all is_selected_quote=False"
+            "Winner-takes-all: best score={} below threshold={} — all is_selected_quote=False",
+            best_score, _SELECTED_THRESHOLD,
         )
 
 
