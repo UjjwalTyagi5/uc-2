@@ -522,8 +522,36 @@ def run_selection_llm_query(
     if not groups:
         return
 
-    source_keys = list(groups.keys())
-    n_sources   = len(source_keys)
+    def _has_data(item: ExtractedItem) -> bool:
+        return (
+            item.unit_price      is not None
+            or item.item_name        is not None
+            or item.item_description is not None
+        )
+
+    # Only sources with at least one non-stub item can be selected
+    source_keys = [
+        key for key, group in groups.items()
+        if any(_has_data(item) for item in group)
+    ]
+
+    if not source_keys:
+        logger.info("Selection LLM: all sources are stub-only — no selection possible")
+        return
+
+    if len(source_keys) == 1:
+        # Only one source has real data — auto-select, skip LLM call
+        winning_key = source_keys[0]
+        for item in groups[winning_key]:
+            item.is_selected_quote = _has_data(item)
+        logger.info(
+            "Selection: single data source auto-selected (supplier={!r})",
+            groups[winning_key][0].supplier_name,
+        )
+        compute_quote_ranks(all_items)
+        return
+
+    n_sources = len(source_keys)
 
     tpl = _read_prompt("selection.txt")
     user_prompt = tpl.format(
@@ -563,14 +591,7 @@ def run_selection_llm_query(
             for key, group in groups.items():
                 sel = key == winning_key
                 for item in group:
-                    # Stub rows (no extracted data at all) are never marked selected —
-                    # they represent a line item missing from the quotation, not a quote.
-                    is_stub = (
-                        item.unit_price      is None
-                        and item.item_name        is None
-                        and item.item_description is None
-                    )
-                    item.is_selected_quote = sel and not is_stub
+                    item.is_selected_quote = sel and _has_data(item)
             logger.info(
                 "Selection LLM: source #{} selected (supplier={!r}); "
                 "{} other source(s) deselected",
