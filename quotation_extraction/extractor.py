@@ -435,6 +435,11 @@ def _build_sources_summary(
             if item.purchase_dtl_id is not None
         }
 
+        # Count how many line items have actual extracted prices vs stubs
+        priced_count = sum(1 for p in price_by_dtl.values() if p is not None)
+        total_count  = len(ras_prices)
+        conf         = rep.supplier_match_conf or Decimal("0")
+
         price_rows = [
             "| DTL_ID | Extracted Unit Price | RAS Unit Price |",
             "|--------|---------------------|----------------|",
@@ -446,10 +451,12 @@ def _build_sources_summary(
 
         parts.append(
             f"### Source {idx}\n"
-            f"Supplier      : {_na(rep.supplier_name)}\n"
-            f"Quotation Date: {_na(rep.quotation_date)}\n"
-            f"Ref No        : {_na(rep.quotation_ref_no)}\n"
-            f"Currency      : {_na(rep.currency)}\n\n"
+            f"Supplier             : {_na(rep.supplier_name)}\n"
+            f"Supplier Match Conf  : {conf} (0=no match, 1=exact match)\n"
+            f"Items with Price     : {priced_count}/{total_count} line items extracted\n"
+            f"Quotation Date       : {_na(rep.quotation_date)}\n"
+            f"Ref No               : {_na(rep.quotation_ref_no)}\n"
+            f"Currency             : {_na(rep.currency)}\n\n"
             + "\n".join(price_rows)
         )
 

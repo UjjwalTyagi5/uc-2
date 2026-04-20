@@ -25,9 +25,12 @@ Currency         : {currency}
 
 ### Part 1 — Selected quotation
 Decide which source the buyer most likely selected. Apply in order:
-1. Supplier name closest to Primary Supplier or Parent Supplier above.
-2. Unit prices closest to the RAS recorded prices.
-3. Most recent quotation date when supplier and prices are similar.
+1. **Supplier Match Confidence** — prefer the source with the highest confidence score (closer to 1.0 = better supplier match).
+2. **Price completeness** — strongly prefer sources that have actual extracted unit prices (Items with Price > 0) over sources with all N/A prices (stub rows with no data).
+3. **Price accuracy** — among sources with prices, prefer the one whose unit prices are closest to the RAS recorded prices.
+4. **Latest date** — when supplier and prices are similar, prefer the most recent quotation date.
+
+> A source with Supplier Match Conf = 0.0 or 0.1 and no extracted prices should almost never be selected over a source with high confidence and matching prices.
 
 ### Part 2 — Rankings per line item
 For every DTL_ID in the requisition, rank each source:

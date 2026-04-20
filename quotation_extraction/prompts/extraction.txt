@@ -109,7 +109,7 @@ Return a **single JSON object** — no markdown fences, no extra text:
       "item_level_7": "key technical specification if known, else null",
       "item_level_8": "any additional distinguishing detail, else null",
       "commodity_tag": "lowercase-slug-tag (e.g. industrial-pump, it-laptop, vehicle-hiring)",
-      "item_summary": "1–2 sentence plain-English summary of the item and its intended use"
+      "item_summary": "plain-English summary of the item and its intended use (max 20 words)"
     }}
   ]
 }}
