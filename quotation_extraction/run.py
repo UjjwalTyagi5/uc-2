@@ -19,7 +19,7 @@ from loguru import logger
 
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
-from .extractor import QuotationExtractor, compute_quote_ranks, resolve_selected_quote
+from .extractor import QuotationExtractor, compute_quote_ranks, run_selection_llm_query
 from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
@@ -116,9 +116,8 @@ def run_extraction(
         logger.warning("No items extracted for {}", purchase_req_no)
         return []
 
-    # 4. Winner-takes-all: score each source against purchase_req_detail data
-    #    (supplier, price, qty, UOM, currency) and mark the best match selected
-    resolve_selected_quote(all_items, ras_ctx)
+    # 4. Single LLM call: ask which source best matches RAS data and mark it selected
+    run_selection_llm_query(all_items, ras_ctx, config)
 
     # 5. Compute quote_rank across all quotation sources
     compute_quote_ranks(all_items)

@@ -152,12 +152,6 @@ _SELECTED_THRESHOLD = Decimal("0.70")   # min overall score to mark as selected 
 _PRICE_TOLERANCE    = Decimal("0.05")   # 5 % — prices within this band count as matching
 _PRICE_MAX_BOOST    = Decimal("0.10")   # max confidence boost from price alignment
 
-# Weights for the multi-dimensional RAS alignment score used in resolve_selected_quote
-_W_SUPPLIER = Decimal("0.60")   # supplier name match across all RAS sources
-_W_PRICE    = Decimal("0.25")   # unit price alignment vs purchase_req_detail
-_W_QTY      = Decimal("0.08")   # quantity match vs purchase_req_detail
-_W_UOM      = Decimal("0.05")   # unit of measure match vs purchase_req_detail
-_W_CURRENCY = Decimal("0.02")   # currency header vs RAS currency
 
 
 def _compute_supplier_match(
@@ -240,9 +234,7 @@ def _apply_price_alignment_boost(
     boost = Decimal(str(round(price_hit_ratio * float(_PRICE_MAX_BOOST), 4)))
     for item in items:
         if item.supplier_match_conf is not None:
-            new_conf = min(Decimal("1.0"), item.supplier_match_conf + boost)
-            item.supplier_match_conf = new_conf
-            item.is_selected_quote   = new_conf >= _SELECTED_THRESHOLD
+            item.supplier_match_conf = min(Decimal("1.0"), item.supplier_match_conf + boost)
 
     logger.debug(
         "Price alignment boost +{} applied ({}/{} items within {}% tolerance)",
@@ -405,98 +397,79 @@ def _align_to_ras_line_items(
     return matched
 
 
-# ── Winner-takes-all selection ──
+# ── LLM-based selection (post-extraction) ──
 
 
-def _compute_source_alignment_score(
-    items: list[ExtractedItem],
+def _build_ras_selection_table(ras_context: RASContext) -> str:
+    """Compact line-items table for the selection prompt."""
+    header = "| DTL_ID | Description | Qty | UOM | Unit Price | Supplier |"
+    sep    = "|--------|-------------|-----|-----|------------|----------|"
+    rows   = [header, sep]
+    for li in ras_context.line_items:
+        rows.append(
+            f"| {_na(li.purchase_dtl_id)} "
+            f"| {_na(li.item_description)} "
+            f"| {_na(li.quantity)} "
+            f"| {_na(li.uom)} "
+            f"| {_na(li.unit_price)} "
+            f"| {_na(li.supplier_name)} |"
+        )
+    return "\n".join(rows)
+
+
+def _build_sources_summary(
+    source_keys: list[tuple],
+    groups: dict[tuple, list[ExtractedItem]],
     ras_context: RASContext,
-) -> Decimal:
-    """Score 0–1 measuring how well one quotation source matches RAS data.
+) -> str:
+    """One section per extracted source showing supplier, date, and per-DTL prices."""
+    ras_prices = {li.purchase_dtl_id: li.unit_price for li in ras_context.line_items}
 
-    Compares extracted items against purchase_req_detail (via ras_context.line_items)
-    and purchase_req_mst / vw_get_ras_data (via ras_context.supplier_name /
-    parent_supplier).  Higher = closer match to what the buyer recorded.
+    parts: list[str] = []
+    for idx, key in enumerate(source_keys, 1):
+        group = groups[key]
+        rep   = group[0]
+        price_by_dtl = {
+            item.purchase_dtl_id: item.unit_price
+            for item in group
+            if item.purchase_dtl_id is not None
+        }
 
-    Components
-    ----------
-    supplier (0.60) — fuzzy name match across all three RAS supplier sources
-    price    (0.25) — fraction of line items whose unit_price is within 5 % of RAS price
-    qty      (0.08) — fraction of line items whose quantity matches RAS quantity (within 1 %)
-    uom      (0.05) — fraction of line items whose unit matches RAS UOM
-    currency (0.02) — 1.0 if header currency matches RAS currency, else 0.0
-    """
-    if not items:
-        return Decimal("0")
+        price_rows = [
+            "| DTL_ID | Extracted Unit Price | RAS Unit Price |",
+            "|--------|---------------------|----------------|",
+        ]
+        for dtl_id, ras_price in ras_prices.items():
+            price_rows.append(
+                f"| {dtl_id} | {_na(price_by_dtl.get(dtl_id))} | {_na(ras_price)} |"
+            )
 
-    # Supplier score — reuse existing fuzzy matcher (already accounts for all 3 sources)
-    _, supplier_score = _compute_supplier_match(items[0].supplier_name, ras_context)
+        parts.append(
+            f"### Source {idx}\n"
+            f"Supplier      : {_na(rep.supplier_name)}\n"
+            f"Quotation Date: {_na(rep.quotation_date)}\n"
+            f"Ref No        : {_na(rep.quotation_ref_no)}\n"
+            f"Currency      : {_na(rep.currency)}\n\n"
+            + "\n".join(price_rows)
+        )
 
-    # Build RAS lookup by dtl_id for line-level comparisons
-    ras_by_dtl = {li.purchase_dtl_id: li for li in ras_context.line_items}
-
-    price_matches = price_comparable = 0
-    qty_matches   = qty_comparable   = 0
-    uom_matches   = uom_comparable   = 0
-
-    for item in items:
-        if item.purchase_dtl_id not in ras_by_dtl:
-            continue
-        ras_li = ras_by_dtl[item.purchase_dtl_id]
-
-        # Price
-        if item.unit_price is not None and ras_li.unit_price is not None and ras_li.unit_price > 0:
-            price_comparable += 1
-            if abs(item.unit_price - ras_li.unit_price) / ras_li.unit_price <= _PRICE_TOLERANCE:
-                price_matches += 1
-
-        # Quantity
-        if item.quantity is not None and ras_li.quantity is not None and ras_li.quantity > 0:
-            qty_comparable += 1
-            if abs(item.quantity - ras_li.quantity) / ras_li.quantity <= Decimal("0.01"):
-                qty_matches += 1
-
-        # UOM
-        if item.unit is not None and ras_li.uom is not None:
-            uom_comparable += 1
-            if item.unit.strip().lower() == ras_li.uom.strip().lower():
-                uom_matches += 1
-
-    price_score    = Decimal(str(round(price_matches / price_comparable, 4))) if price_comparable else Decimal("0")
-    qty_score      = Decimal(str(round(qty_matches   / qty_comparable,   4))) if qty_comparable   else Decimal("0")
-    uom_score      = Decimal(str(round(uom_matches   / uom_comparable,   4))) if uom_comparable   else Decimal("0")
-
-    # Currency
-    ext_cur = (items[0].currency or "").strip().upper()
-    ras_cur = (ras_context.currency or "").strip().upper()
-    currency_score = Decimal("1") if ext_cur and ras_cur and ext_cur == ras_cur else Decimal("0")
-
-    score = (
-        supplier_score * _W_SUPPLIER
-        + price_score  * _W_PRICE
-        + qty_score    * _W_QTY
-        + uom_score    * _W_UOM
-        + currency_score * _W_CURRENCY
-    )
-
-    logger.debug(
-        "Alignment score: supplier={} price={} qty={} uom={} currency={} → total={}",
-        supplier_score, price_score, qty_score, uom_score, currency_score,
-        score.quantize(Decimal("0.0001")),
-    )
-    return score.quantize(Decimal("0.0001"))
+    return "\n\n".join(parts)
 
 
-def resolve_selected_quote(
+def run_selection_llm_query(
     all_items: list[ExtractedItem],
     ras_context: RASContext,
+    config: ExtractionConfig,
 ) -> None:
-    """Mark exactly one quotation source as is_selected_quote = True.
+    """Single LLM call to determine which extracted quotation was selected.
 
-    After all files are extracted, scores each source against the actual
-    values recorded in purchase_req_detail (price, qty, UOM, supplier, currency).
-    The source with the highest alignment score wins.  If no source reaches
-    _SELECTED_THRESHOLD all items get False.
+    After all files are extracted, sends one query containing:
+      - RAS reference data (purchase_req_mst + purchase_req_detail values)
+      - Summary of every extracted source (supplier, date, prices per DTL_ID)
+
+    LLM returns {"selected_index": N} (1-based) or {"selected_index": null}.
+    Winner-takes-all: only that source's items get is_selected_quote = True.
+    Falls back to all False if the LLM call fails or returns null.
 
     Mutates items in-place.
     """
@@ -507,38 +480,66 @@ def resolve_selected_quote(
         key = (item.attachment_classify_fk, item.embedded_classify_fk)
         groups[key].append(item)
 
-    best_key   = None
-    best_score = Decimal("0")
+    if not groups:
+        return
 
-    for key, group in groups.items():
-        score = _compute_source_alignment_score(group, ras_context)
-        logger.info(
-            "Source key={} alignment_score={}",
-            key, score,
+    source_keys = list(groups.keys())
+    n_sources   = len(source_keys)
+
+    tpl = _read_prompt("selection.txt")
+    user_prompt = tpl.format(
+        n_sources           = n_sources,
+        primary_supplier    = _na(ras_context.supplier_name),
+        parent_supplier     = _na(ras_context.parent_supplier),
+        currency            = _na(ras_context.currency),
+        ras_line_items_table= _build_ras_selection_table(ras_context),
+        sources_summary     = _build_sources_summary(source_keys, groups, ras_context),
+    )
+
+    system_prompt = _read_prompt("system.txt")
+    llm = ExtractionLLMClient(config)
+
+    try:
+        raw = llm.query(system_prompt, user_prompt)
+    except Exception as exc:
+        logger.warning(
+            "Selection LLM query failed — all is_selected_quote=False: {}", exc
         )
-        if score > best_score:
-            best_score = score
-            best_key   = key
+        return
 
-    qualifies = best_score >= _SELECTED_THRESHOLD
+    raw = _strip_json_fences(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Selection LLM returned invalid JSON: {!r}", raw)
+        return
+
+    selected_idx = data.get("selected_index")
+    if selected_idx is None:
+        logger.info("Selection LLM: could not determine selected source")
+        return
+
+    try:
+        selected_idx = int(selected_idx)
+        if not 1 <= selected_idx <= n_sources:
+            raise ValueError(f"index {selected_idx} out of range 1–{n_sources}")
+    except (TypeError, ValueError) as exc:
+        logger.warning("Selection LLM returned invalid index {!r}: {}", selected_idx, exc)
+        return
+
+    winning_key = source_keys[selected_idx - 1]
 
     for key, group in groups.items():
-        selected = qualifies and key == best_key
+        selected = key == winning_key
         for item in group:
-            item.is_selected_quote   = selected
-            item.supplier_match_conf = best_score if selected else (item.supplier_match_conf or Decimal("0"))
+            item.is_selected_quote = selected
 
-    if qualifies:
-        logger.info(
-            "Winner-takes-all: source key={} selected (alignment_score={}); "
-            "{} other source(s) deselected",
-            best_key, best_score, len(groups) - 1,
-        )
-    else:
-        logger.info(
-            "Winner-takes-all: best score={} below threshold={} — all is_selected_quote=False",
-            best_score, _SELECTED_THRESHOLD,
-        )
+    logger.info(
+        "Selection LLM: source #{} selected (supplier={!r}); {} other source(s) deselected",
+        selected_idx,
+        groups[winning_key][0].supplier_name,
+        n_sources - 1,
+    )
 
 
 # ── Quote ranking ──

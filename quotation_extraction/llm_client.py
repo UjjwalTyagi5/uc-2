@@ -93,6 +93,42 @@ class ExtractionLLMClient:
         # unreachable — loop always returns or raises
         raise RuntimeError("LLM retry loop exited unexpectedly")
 
+    def query(self, system_prompt: str, user_prompt: str) -> str:
+        """Text-only LLM call with the same retry logic as extract()."""
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+
+        logger.info(
+            "Calling Azure OpenAI ({}) — text-only query, ~{:.0f} kB prompt",
+            self._config.AOAI_DEPLOYMENT,
+            len(user_prompt) / 1024,
+        )
+
+        max_retries = self._config.LLM_MAX_RETRIES
+        base_delay  = self._config.LLM_RETRY_BASE_DELAY
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._llm.invoke(messages)
+                return response.content  # type: ignore[return-value]
+            except _RETRYABLE as exc:
+                if attempt >= max_retries:
+                    logger.error(
+                        "LLM query failed after {} attempt(s), giving up: {}",
+                        attempt + 1, exc,
+                    )
+                    raise
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(
+                    "LLM transient error (attempt {}/{}), retrying in {:.1f}s: {}",
+                    attempt + 1, max_retries + 1, delay, exc,
+                )
+                time.sleep(delay)
+
+        raise RuntimeError("LLM retry loop exited unexpectedly")
+
     # ── private ──
 
     def _build_messages(
