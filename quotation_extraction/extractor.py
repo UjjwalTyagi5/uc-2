@@ -529,59 +529,18 @@ def run_selection_llm_query(
     # ── Step 1: rank across all sources ─────────────────────────────────
     compute_quote_ranks(all_items)
 
-    # ── Step 2: select winning source ───────────────────────────────────
-    groups: dict[tuple, list[ExtractedItem]] = defaultdict(list)
+    # ── Step 2: mark rank-1 data items as selected ───────────────────────
+    selected = 0
     for item in all_items:
-        key = (item.attachment_classify_fk, item.embedded_classify_fk)
-        groups[key].append(item)
+        if item.quote_rank == 1 and _has_data(item):
+            item.is_selected_quote = True
+            selected += 1
+        else:
+            item.is_selected_quote = False
 
-    # Only consider sources that extracted at least one real item
-    candidates = {
-        key: [item for item in grp if _has_data(item)]
-        for key, grp in groups.items()
-    }
-    candidates = {k: v for k, v in candidates.items() if v}
-
-    if not candidates:
-        logger.info("Selection: all sources are stub-only — no selection possible")
-        return
-
-    best_key   = None
-    best_score = -1.0
-
-    for key, non_stubs in candidates.items():
-        conf       = float(non_stubs[0].supplier_match_conf or Decimal("0"))
-        rank1_cnt  = sum(1 for item in non_stubs if item.quote_rank == 1)
-        rank1_frac = rank1_cnt / len(non_stubs)
-        score      = conf * 0.6 + rank1_frac * 0.4
-
-        logger.debug(
-            "Source key={} supplier={!r} conf={} rank1={}/{} score={:.4f}",
-            key,
-            non_stubs[0].supplier_name,
-            conf,
-            rank1_cnt,
-            len(non_stubs),
-            score,
-        )
-
-        if score > best_score:
-            best_score = score
-            best_key   = key
-
-    # Apply winner-takes-all
-    for key, grp in groups.items():
-        sel = key == best_key
-        for item in grp:
-            item.is_selected_quote = sel and _has_data(item)
-
-    winner_supplier = candidates[best_key][0].supplier_name if best_key else None
     logger.info(
-        "Selection: source selected supplier={!r} score={:.4f}; "
-        "{} other source(s) deselected",
-        winner_supplier,
-        best_score,
-        len(groups) - 1,
+        "Selection: {} item(s) marked is_selected_quote=True (rank=1 with data)",
+        selected,
     )
 
 
