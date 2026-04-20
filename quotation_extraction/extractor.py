@@ -456,12 +456,24 @@ def compute_quote_ranks(
 ) -> None:
     """Assign *quote_rank* per purchase_dtl_id across all quotation sources.
 
-    Rank 1 = lowest unit_price for that line item.  Items with no
-    purchase_dtl_id or no unit_price are left with quote_rank = None.
+    Sorting rules (applied in order):
+      1. unit_price ascending  — lower price = better rank
+      2. quotation_date descending (tie-breaker) — when two quotes have the
+         same unit_price, the more recent quotation wins rank 1.
+         Quotes with no date sort after those with a date.
+
+    Items with no purchase_dtl_id or no unit_price are left with quote_rank = None.
     Mutates the items in-place.
     """
 
     from collections import defaultdict
+
+    def _sort_key(item: ExtractedItem):
+        # Negate ordinal so that newer dates sort lower (rank 1)
+        # None dates are treated as the oldest possible (sort last)
+        d = item.quotation_date
+        date_key = (-d.toordinal()) if d is not None else 1  # 1 > any negative
+        return (item.unit_price, date_key)  # type: ignore[return-value]
 
     by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
@@ -469,7 +481,7 @@ def compute_quote_ranks(
             by_dtl[item.purchase_dtl_id].append(item)
 
     for dtl_id, group in by_dtl.items():
-        sorted_group = sorted(group, key=lambda x: x.unit_price)  # type: ignore[arg-type]
+        sorted_group = sorted(group, key=_sort_key)
         for rank, item in enumerate(sorted_group, 1):
             item.quote_rank = rank
 
