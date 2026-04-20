@@ -374,7 +374,7 @@ def _align_to_ras_line_items(
                     attachment_classify_fk=source.attachment_classify_fk,
                     embedded_classify_fk=source.embedded_classify_fk,
                     purchase_dtl_id=li.purchase_dtl_id,
-                    is_selected_quote=header_donor.is_selected_quote if header_donor else False,
+                    is_selected_quote=False,
                     supplier_match_conf=Decimal("0"),
                     quote_rank=None,
                     supplier_name=header_donor.supplier_name if header_donor else None,
