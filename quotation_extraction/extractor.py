@@ -286,13 +286,16 @@ def _parse_llm_response(
         logger.warning("LLM returned zero items for {}", source.blob_path)
         return []
 
-    # Multi-source supplier match → is_selected_quote + supplier_match_conf
+    # Multi-source supplier match → supplier_match_conf
     h_supplier: Optional[str] = header.get("supplier_name") or None
-    is_selected, match_conf = _compute_supplier_match(h_supplier, ras_context)
+    _is_selected_fuzzy, match_conf = _compute_supplier_match(h_supplier, ras_context)
+
+    # LLM's own judgment: did it spot selection signals in the document?
+    llm_is_selected: bool = bool(header.get("is_selected_quote", False))
 
     logger.info(
-        "Supplier match: extracted={!r} conf={} selected={}",
-        h_supplier, match_conf, is_selected,
+        "Supplier match: extracted={!r} conf={} llm_selected={}",
+        h_supplier, match_conf, llm_is_selected,
     )
 
     # Header fields shared across every item row in this quotation
@@ -307,6 +310,7 @@ def _parse_llm_response(
         "validity_days":      header.get("validity_days"),
         "payment_terms":      header.get("payment_terms") or None,
         "supplier_match_conf": match_conf,
+        "llm_is_selected":    llm_is_selected,
     }
 
     results: list[ExtractedItem] = []
@@ -315,7 +319,7 @@ def _parse_llm_response(
             item = ExtractedItem.model_validate({
                 "attachment_classify_fk": source.attachment_classify_fk,
                 "embedded_classify_fk":   source.embedded_classify_fk,
-                "is_selected_quote":      is_selected,
+                "is_selected_quote":      False,   # resolved later by resolve_selected_quote
                 "quote_rank":             None,
                 **header_fields,
                 **raw_item,
@@ -328,8 +332,8 @@ def _parse_llm_response(
             )
 
     logger.info(
-        "Parsed {} item(s) from LLM response (supplier={} conf={})",
-        len(results), h_supplier, match_conf,
+        "Parsed {} item(s) from LLM response (supplier={} conf={} llm_selected={})",
+        len(results), h_supplier, match_conf, llm_is_selected,
     )
     return results
 
@@ -403,34 +407,62 @@ def _align_to_ras_line_items(
 def resolve_selected_quote(all_items: list[ExtractedItem]) -> None:
     """Ensure exactly one quotation source is marked is_selected_quote = True.
 
-    Each quotation source is identified by (attachment_classify_fk,
-    embedded_classify_fk).  Among all sources with supplier_match_conf ≥
-    _SELECTED_THRESHOLD, only the one with the highest confidence wins.
-    All others are set to False.  If no source meets the threshold every
-    item gets False.
+    Each source is identified by (attachment_classify_fk, embedded_classify_fk).
 
+    Selection priority (winner-takes-all):
+      1. LLM flagged as selected  AND  conf ≥ threshold  →  strongest signal
+      2. LLM flagged as selected  (conf < threshold)     →  LLM found doc-level evidence
+      3. conf ≥ threshold only                           →  programmatic fallback
+      4. Nothing qualifies                               →  all False
+
+    Within each priority tier the source with the highest supplier_match_conf wins.
     Mutates items in-place.
     """
     from collections import defaultdict
 
-    # Group by source key → collect (conf, items) per source
     groups: dict[tuple, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
         key = (item.attachment_classify_fk, item.embedded_classify_fk)
         groups[key].append(item)
 
-    # Find the best-confidence source that exceeds the selection threshold
-    best_key = None
-    best_conf = Decimal("0")
+    def _source_conf(group: list[ExtractedItem]) -> Decimal:
+        return group[0].supplier_match_conf or Decimal("0")
+
+    def _source_llm(group: list[ExtractedItem]) -> bool:
+        return group[0].llm_is_selected
+
+    # Bucket sources into priority tiers
+    tier1: list[tuple] = []   # LLM selected + conf >= threshold
+    tier2: list[tuple] = []   # LLM selected only
+    tier3: list[tuple] = []   # conf >= threshold only
 
     for key, group in groups.items():
-        # Representative conf: all items in a source share the same value
-        conf = group[0].supplier_match_conf or Decimal("0")
-        if conf >= _SELECTED_THRESHOLD and conf > best_conf:
-            best_conf = conf
-            best_key  = key
+        conf = _source_conf(group)
+        llm  = _source_llm(group)
+        if llm and conf >= _SELECTED_THRESHOLD:
+            tier1.append(key)
+        elif llm:
+            tier2.append(key)
+        elif conf >= _SELECTED_THRESHOLD:
+            tier3.append(key)
 
-    # Apply winner-takes-all: only best_key items get True
+    best_key: Optional[tuple] = None
+    best_conf = Decimal("0")
+    winning_tier: Optional[int] = None
+
+    for tier_no, candidates in ((1, tier1), (2, tier2), (3, tier3)):
+        if not candidates:
+            continue
+        # Pick highest conf within this tier
+        for key in candidates:
+            conf = _source_conf(groups[key])
+            if conf > best_conf:
+                best_conf = conf
+                best_key  = key
+                winning_tier = tier_no
+        break   # stop at first non-empty tier
+
+    # Apply winner-takes-all
     for key, group in groups.items():
         selected = key == best_key
         for item in group:
@@ -438,13 +470,13 @@ def resolve_selected_quote(all_items: list[ExtractedItem]) -> None:
 
     if best_key is not None:
         logger.info(
-            "Winner-takes-all: source key={} selected (conf={}); {} other source(s) deselected",
-            best_key, best_conf, len(groups) - 1,
+            "Winner-takes-all: source key={} selected via tier {} "
+            "(conf={}); {} other source(s) deselected",
+            best_key, winning_tier, best_conf, len(groups) - 1,
         )
     else:
         logger.info(
-            "Winner-takes-all: no source met threshold={} — all is_selected_quote=False",
-            _SELECTED_THRESHOLD,
+            "Winner-takes-all: no source qualified — all is_selected_quote=False"
         )
 
 

@@ -86,6 +86,7 @@ Return a **single JSON object** — no markdown fences, no extra text:
   "validity_date": "YYYY-MM-DD or null",
   "validity_days": "integer or null",
   "payment_terms": "string or null",
+  "is_selected_quote": "true if this appears to be the selected/awarded quotation, else false",
   "items": [
     {{
       "purchase_dtl_id": "integer from DTL_ID column if matched, else null",
@@ -125,3 +126,7 @@ Return a **single JSON object** — no markdown fences, no extra text:
 - For matched items set purchase_dtl_id to the integer DTL_ID from the table.
 - supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
 - commodity_tag should be a lowercase hyphenated slug that uniquely identifies the commodity family.
+- `is_selected_quote` at the header level must be `true` if ANY of these conditions hold:
+    (a) The document contains visible selection signals: approval/acceptance stamp, authorised signature, "accepted", "awarded", "order confirmed", "PO will be raised", or similar language.
+    (b) The supplier name in the document closely matches the **Primary Supplier** or **Parent Supplier** listed in the RAS header, or any supplier name shown in the line-items table above.
+  Set it to `false` if none of these conditions are met, or if the document is clearly a non-selected comparison quote.

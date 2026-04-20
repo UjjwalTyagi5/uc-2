@@ -48,6 +48,7 @@ class ExtractedItem(BaseModel):
     embedded_classify_fk:   Optional[uuid.UUID] = None
     purchase_dtl_id:         Optional[int]       = None
     is_selected_quote:       bool                = False
+    llm_is_selected:         bool                = False   # LLM signal — not persisted to DB
     supplier_match_conf:     Optional[Decimal]   = None
     quote_rank:              Optional[int]       = None
 
