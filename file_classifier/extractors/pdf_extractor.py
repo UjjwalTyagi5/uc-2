@@ -18,6 +18,14 @@ class PdfExtractor(BaseExtractor):
 
         with pdfplumber.open(buf) as pdf:
             total_pages = len(pdf.pages)
+
+            if total_pages == 0:
+                logger.warning("PDF has no pages", filename=filename)
+                return ExtractionResult(
+                    text_content="[Empty or corrupt PDF — no pages found]",
+                    metadata={"total_pages": 0, "extraction_method": "failed"},
+                )
+
             pages_to_process = min(total_pages, MAX_PAGES)
 
             text_parts = []
@@ -58,6 +66,12 @@ class PdfExtractor(BaseExtractor):
         buf = io.BytesIO(file_bytes)
 
         with pdfplumber.open(buf) as pdf:
+            if not pdf.pages:
+                return ExtractionResult(
+                    text_content="[Empty or corrupt PDF — no pages to render as image]",
+                    metadata={"total_pages": total_pages, "extraction_method": "failed"},
+                )
+
             page = pdf.pages[0]
             img = page.to_image(resolution=200)
 
