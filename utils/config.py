@@ -206,6 +206,12 @@ class AppConfig:
         # 1 = sequential (safe default); raise to 2-8 to speed up large batches.
         self.PIPELINE_WORKERS  = int(_optional("PIPELINE_WORKERS",  "1"))
 
+        # Number of files within a single PR to classify in parallel.
+        # Combined with PIPELINE_WORKERS this gives PIPELINE_WORKERS *
+        # CLASSIFICATION_WORKERS concurrent LLM calls — size it against the
+        # Azure OpenAI deployment's RPM/TPM quota.
+        self.CLASSIFICATION_WORKERS = int(_optional("CLASSIFICATION_WORKERS", "4"))
+
         # ── Blob upload settings ───────────────────────────────────────────
         # BLOB_MAX_RETRIES : how many times to retry a single file upload
         #                    before giving up  (default 3)

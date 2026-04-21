@@ -31,6 +31,7 @@ Responsibility
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from utils.config import AppConfig
@@ -92,46 +93,30 @@ class ClassificationStage(BaseStage):
         # Lazy import — avoids loading heavy LLM / extraction deps at module level
         from file_classifier.classifier.classifier import classify_file
 
-        classified_count = 0
-        error_count      = 0
+        # ── Collect every file in this PR into a flat task list ──────────────
+        # Tasks are tagged "parent" or "embedded" so the worker knows which
+        # repository method to call and how to build the blob_path.
+        file_tasks: list[dict] = []
 
         for att_dir in sorted(pr_work_dir.iterdir()):
             if not att_dir.is_dir():
                 continue
-
             att_id = att_dir.name
 
-            # ── Classify parent files ─────────────────────────────────────
             for file_path in sorted(att_dir.iterdir()):
-                if not file_path.is_file():
-                    continue
+                if file_path.is_file():
+                    file_tasks.append({
+                        "kind":       "parent",
+                        "file_path":  file_path,
+                        "att_id":     att_id,
+                    })
 
-                doc_type, confidence = self._classify_single_file(
-                    file_path, classify_file,
-                )
-                try:
-                    self._att_repo.update_parent_classification(
-                        attachment_id       = att_id,
-                        doc_type            = doc_type,
-                        classification_conf = confidence,
-                    )
-                    classified_count += 1
-                    self._log.info(
-                        f"Classified parent {file_path.name!r}: "
-                        f"{doc_type} (conf={confidence:.2f})"
-                    )
-                except Exception as exc:
-                    self._log.opt(exception=True).error(
-                        f"DB update failed for parent file "
-                        f"{file_path.name!r}: {exc}"
-                    )
-                    error_count += 1
-
-            # ── Classify embedded files ───────────────────────────────────
             extracted_dir = att_dir / "extracted"
             if not extracted_dir.exists() or not extracted_dir.is_dir():
                 continue
 
+            # Resolve parent_pk once per attachment (outside the worker pool)
+            # rather than re-querying for every embedded file.
             parent_pk = self._att_repo.get_parent_pk(att_id)
             if parent_pk is None:
                 self._log.warning(
@@ -141,37 +126,55 @@ class ClassificationStage(BaseStage):
                 continue
 
             for emb_file in sorted(extracted_dir.iterdir()):
-                if not emb_file.is_file():
-                    continue
+                if emb_file.is_file():
+                    file_tasks.append({
+                        "kind":       "embedded",
+                        "file_path":  emb_file,
+                        "att_id":     att_id,
+                        "parent_pk":  parent_pk,
+                        "blob_path":  f"procurement/{safe_pr}/{att_id}/extracted/{emb_file.name}",
+                    })
 
-                doc_type, confidence = self._classify_single_file(
-                    emb_file, classify_file,
-                )
-                blob_path = (
-                    f"procurement/{safe_pr}/{att_id}/extracted/{emb_file.name}"
-                )
+        if not file_tasks:
+            self._log.info(
+                f"No files to classify for PR={purchase_req_no!r}"
+            )
+            self._finish(purchase_req_no)
+            return
+
+        # ── Classify files in parallel ───────────────────────────────────────
+        # LLM calls dominate wall-clock; threads let multiple requests stay
+        # in-flight against Azure OpenAI at once.
+        max_workers = max(
+            1, min(self._config.CLASSIFICATION_WORKERS, len(file_tasks))
+        )
+        classified_count = 0
+        error_count      = 0
+
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix=f"classify-{safe_pr}",
+        ) as pool:
+            futures = {
+                pool.submit(self._process_file_task, task, classify_file): task
+                for task in file_tasks
+            }
+            for future in as_completed(futures):
+                task = futures[future]
                 try:
-                    self._att_repo.update_embedded_classification(
-                        attachment_classification_id = parent_pk,
-                        file_path                    = blob_path,
-                        doc_type                     = doc_type,
-                        classification_conf          = confidence,
-                    )
+                    future.result()
                     classified_count += 1
-                    self._log.info(
-                        f"Classified embedded {emb_file.name!r}: "
-                        f"{doc_type} (conf={confidence:.2f})"
-                    )
                 except Exception as exc:
                     self._log.opt(exception=True).error(
-                        f"DB update failed for embedded file "
-                        f"{emb_file.name!r}: {exc}"
+                        f"Classification task failed for "
+                        f"{task['file_path'].name!r}: {exc}"
                     )
                     error_count += 1
 
         self._log.info(
             f"Classification complete: {classified_count} file(s) classified, "
-            f"{error_count} error(s) for PR={purchase_req_no!r}"
+            f"{error_count} error(s) for PR={purchase_req_no!r} "
+            f"(workers={max_workers})"
         )
         self._finish(purchase_req_no)
 
@@ -193,6 +196,37 @@ class ClassificationStage(BaseStage):
             self._log.error(
                 f"BI dashboard sync failed for PR={purchase_req_no!r} "
                 f"(non-fatal, continuing): {exc}"
+            )
+
+    def _process_file_task(self, task: dict, classify_file_fn) -> None:
+        """
+        Worker body for the per-PR ThreadPoolExecutor: classify one file and
+        write the result to the appropriate table. Raises on DB failure so the
+        main loop can count it as an error.
+        """
+        file_path = task["file_path"]
+        doc_type, confidence = self._classify_single_file(file_path, classify_file_fn)
+
+        if task["kind"] == "parent":
+            self._att_repo.update_parent_classification(
+                attachment_id       = task["att_id"],
+                doc_type            = doc_type,
+                classification_conf = confidence,
+            )
+            self._log.info(
+                f"Classified parent {file_path.name!r}: "
+                f"{doc_type} (conf={confidence:.2f})"
+            )
+        else:
+            self._att_repo.update_embedded_classification(
+                attachment_classification_id = task["parent_pk"],
+                file_path                    = task["blob_path"],
+                doc_type                     = doc_type,
+                classification_conf          = confidence,
+            )
+            self._log.info(
+                f"Classified embedded {file_path.name!r}: "
+                f"{doc_type} (conf={confidence:.2f})"
             )
 
     def _classify_single_file(
