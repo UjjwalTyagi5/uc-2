@@ -57,6 +57,9 @@ _SUPPORTED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
 }
 
+# Image extensions eligible for the pre-LLM "trivial image" heuristic.
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif"}
+
 
 class ClassificationStage(BaseStage):
     """
@@ -205,7 +208,18 @@ class ClassificationStage(BaseStage):
         main loop can count it as an error.
         """
         file_path = task["file_path"]
-        doc_type, confidence = self._classify_single_file(file_path, classify_file_fn)
+
+        # Short-circuit trivial images (logos, signatures, watermarks,
+        # thumbnails) before paying for an LLM call.
+        trivial, reason = self._is_trivial_image(file_path)
+        if trivial:
+            self._log.info(
+                f"Skipped trivial image {file_path.name!r} ({reason}) — "
+                f"marking as Others"
+            )
+            doc_type, confidence = "Others", 0.0
+        else:
+            doc_type, confidence = self._classify_single_file(file_path, classify_file_fn)
 
         if task["kind"] == "parent":
             self._att_repo.update_parent_classification(
@@ -228,6 +242,65 @@ class ClassificationStage(BaseStage):
                 f"Classified embedded {file_path.name!r}: "
                 f"{doc_type} (conf={confidence:.2f})"
             )
+
+    def _is_trivial_image(self, file_path: Path) -> tuple[bool, str]:
+        """
+        Heuristic pre-filter that returns (True, reason) if an image is almost
+        certainly a logo, signature, watermark, icon, or thumbnail — i.e. a
+        file the LLM would classify as "Others" anyway. Returns (False, "")
+        for non-images and for images that look like real document scans.
+
+        Signals used (all derived from pixel data, not file size):
+          • Long-edge < 200px               → icon/logo
+          • Aspect ratio > 5:1              → header strip / divider / barcode
+          • Long < 400 and short < 200      → sub-thumbnail
+          • > 97% near-white pixels         → signature / watermark / stamp
+          • < 16 unique colours             → flat logo artwork
+        """
+        if file_path.suffix.lower() not in _IMAGE_EXTENSIONS:
+            return False, ""
+
+        try:
+            from PIL import Image
+        except ImportError:
+            return False, ""
+
+        try:
+            with Image.open(file_path) as img:
+                img.load()
+                w, h = img.size
+                long_edge  = max(w, h)
+                short_edge = max(min(w, h), 1)
+
+                if long_edge < 200:
+                    return True, f"tiny {w}x{h}"
+
+                if long_edge / short_edge > 5:
+                    return True, f"extreme aspect {w}x{h}"
+
+                if long_edge < 400 and short_edge < 200:
+                    return True, f"sub-thumbnail {w}x{h}"
+
+                gray = img.convert("L")
+                hist = gray.histogram()
+                total = sum(hist)
+                if total:
+                    near_white_ratio = sum(hist[230:]) / total
+                    if near_white_ratio > 0.97:
+                        return True, f"mostly white ({near_white_ratio:.0%})"
+
+                try:
+                    colors = img.convert("RGB").getcolors(maxcolors=256)
+                    if colors is not None and len(colors) < 16:
+                        return True, f"flat palette ({len(colors)} colors)"
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            # If we can't even decode it, the LLM won't do better — skip.
+            return True, f"unreadable ({exc.__class__.__name__})"
+
+        return False, ""
 
     def _classify_single_file(
         self,
