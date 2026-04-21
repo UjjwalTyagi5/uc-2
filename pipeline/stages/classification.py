@@ -252,6 +252,8 @@ class ClassificationStage(BaseStage):
 
         Signals used (all derived from pixel data, not file size):
           • Long-edge < 200px               → icon/logo
+          • Short-edge < 150px              → logo/banner/header (even if wide)
+          • Aspect > 3:1 and short < 250px  → banner strip / divider
           • Aspect ratio > 5:1              → header strip / divider / barcode
           • Long < 400 and short < 200      → sub-thumbnail
           • > 97% near-white pixels         → signature / watermark / stamp
@@ -275,8 +277,20 @@ class ClassificationStage(BaseStage):
                 if long_edge < 200:
                     return True, f"tiny {w}x{h}"
 
+                # A real page scan — even a low-DPI A4 — has a short edge
+                # well over 150px. Anything shorter on its short side is
+                # structurally a logo, banner, or header strip.
+                if short_edge < 150:
+                    return True, f"short edge {w}x{h} (logo/banner/header)"
+
                 if long_edge / short_edge > 5:
                     return True, f"extreme aspect {w}x{h}"
+
+                # Wider-than-tall images with a small short edge are
+                # banners/dividers/headers — covers the gap between the
+                # "short edge" and "extreme aspect" rules above.
+                if long_edge / short_edge > 3 and short_edge < 250:
+                    return True, f"banner aspect {w}x{h}"
 
                 if long_edge < 400 and short_edge < 200:
                     return True, f"sub-thumbnail {w}x{h}"
