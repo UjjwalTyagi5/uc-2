@@ -235,10 +235,16 @@ class AppConfig:
         # Optional at startup — required only by LLM-based stages.
         # Validated lazily: stages that use LLM will fail with a clear message
         # if these are missing.
-        self.AOAI_ENDPOINT    = _optional("AZURE_OPENAI_ENDPOINT",   "")
-        self.AOAI_API_KEY     = _optional("AZURE_OPENAI_API_KEY",    "")
-        self.AOAI_DEPLOYMENT  = _optional("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
-        self.AOAI_API_VERSION = _optional("AZURE_OPENAI_API_VERSION","2025-04-01-preview")
+        self.AOAI_ENDPOINT             = _optional("AZURE_OPENAI_ENDPOINT",             "")
+        self.AOAI_API_KEY              = _optional("AZURE_OPENAI_API_KEY",              "")
+        self.AOAI_DEPLOYMENT           = _optional("AZURE_OPENAI_DEPLOYMENT",           "gpt-4o")
+        self.AOAI_API_VERSION          = _optional("AZURE_OPENAI_API_VERSION",          "2025-04-01-preview")
+        self.AOAI_EMBEDDING_DEPLOYMENT = _optional("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+
+        # ── Pinecone ───────────────────────────────────────────────────────
+        # Required only by the EMBEDDINGS stage (stage 6).
+        self.PINECONE_API_KEY    = _optional("PINECONE_API_KEY",    "")
+        self.PINECONE_INDEX_NAME = _optional("PINECONE_INDEX_NAME", "")
 
         # ── Quotation extraction tuning ────────────────────────────────────
         self.MAX_PAGES            = int(_optional("EXTRACTION_MAX_PAGES",           "20"))

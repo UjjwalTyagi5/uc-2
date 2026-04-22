@@ -46,6 +46,7 @@ from pipeline.stages.blob_upload import BlobUploadStage
 from pipeline.stages.classification import ClassificationStage
 from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
 from pipeline.stages.ingestion import IngestionStage
+from pipeline.stages.embeddings import EmbeddingsStage
 from pipeline.stages.metadata_extraction import MetadataExtractionStage
 from pipeline.tracker import PipelineTracker
 
@@ -354,6 +355,7 @@ class PipelineOrchestrator:
         Stage 3 — BLOB_UPLOAD          : uploads complete work folder to Azure Blob
         Stage 4 — CLASSIFICATION       : classifies each attachment by doc_type via LLM
         Stage 5 — METADATA_EXTRACTION  : extracts structured line items from quotations
+        Stage 6 — EMBEDDINGS           : embeds selected items and upserts to Pinecone
         """
         return [
             IngestionStage(config),             # stage 1
@@ -361,4 +363,5 @@ class PipelineOrchestrator:
             BlobUploadStage(config),            # stage 3
             ClassificationStage(config),        # stage 4
             MetadataExtractionStage(config),    # stage 5
+            EmbeddingsStage(config),            # stage 6
         ]
