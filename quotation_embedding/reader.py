@@ -28,7 +28,7 @@ _FETCH_SQL = f"""
     JOIN {AzureTables.RAS_TRACKER} rt
       ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
     LEFT JOIN {AzureTables.PURCHASE_REQ_DETAIL} prd
-      ON qi.[purchase_dtl_id] = prd.[PURCHASE_REQ_DTL_ID]
+      ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
     WHERE rt.[purchase_req_no] = ?
       AND qi.[is_selected_quote] = 1
     ORDER BY qi.[purchase_dtl_id]
