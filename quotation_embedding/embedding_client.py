@@ -28,6 +28,7 @@ class EmbeddingClient:
             api_version=config.AOAI_API_VERSION,
         )
         self._deployment   = config.AOAI_EMBEDDING_DEPLOYMENT
+        self._dimensions   = config.EMBEDDING_DIMENSIONS
         self._batch_size   = config.EMBEDDING_BATCH_SIZE
         self._max_retries  = config.LLM_MAX_RETRIES
         self._base_delay   = config.LLM_RETRY_BASE_DELAY
@@ -57,6 +58,7 @@ class EmbeddingClient:
                 response = self._client.embeddings.create(
                     model=self._deployment,
                     input=texts,
+                    dimensions=self._dimensions,
                 )
                 return [e.embedding for e in response.data]
             except _transient as exc:
