@@ -78,11 +78,18 @@ DELETE FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS}
 
 
 def _p(val: object) -> object:
-    """Convert Python types to pyodbc-safe values."""
+    """Convert Python types to pyodbc-safe values.
+
+    Decimal → float: pyodbc fast_executemany fails when Decimal objects have
+    varying scale across rows (e.g. Decimal("1.00000") vs Decimal("1.5")).
+    SQL Server accepts float for all DECIMAL columns and rounds to column scale.
+    """
     if val is None:
         return None
     if isinstance(val, bool):
         return 1 if val else 0
+    if isinstance(val, Decimal):
+        return float(val)
     return val
 
 
