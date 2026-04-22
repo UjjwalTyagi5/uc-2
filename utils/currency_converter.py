@@ -28,8 +28,8 @@ from db.tables import AzureTables
 _EUR_CUR_ID = 3
 
 # STATUS_ID value that means "active/live" in EXCHANGE_RATE.
-# Confirm against live DB: SELECT DISTINCT STATUS_ID FROM [ras_procurement].[EXCHANGE_RATE]
-_ACTIVE_STATUS_ID = 1
+# Confirmed from live DB: all active rate rows have STATUS_ID = 10.
+_ACTIVE_STATUS_ID = 10
 
 # Conversion direction — MUST be confirmed against the live DB before deploy.
 # Run: SELECT cm.CURRENCY, er.CONVERSION_RATE FROM EXCHANGE_RATE er
