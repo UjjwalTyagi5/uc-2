@@ -1,0 +1,18 @@
+## Current Item to Benchmark
+
+{current_item}
+
+## Historical Similar Items
+
+{historical_table}
+
+---
+
+Based on the historical data above, provide your price benchmark analysis.
+
+Respond ONLY with a JSON object in this exact format:
+{{
+  "bp_unit_price": <recommended benchmark unit price as a number, or null>,
+  "inflation_pct": <estimated price change % vs historical average as a number (positive = price went up), or null>,
+  "summary": "<2-4 sentence analysis explaining the benchmark price and trend>"
+}}
