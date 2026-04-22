@@ -18,6 +18,28 @@ class PineconeWriter:
         self._top_k       = config.PINECONE_TOP_K
         self._threshold   = config.PINECONE_THRESHOLD
 
+    def delete_for_pr(self, purchase_req_no: str) -> None:
+        """Delete all vectors for a PR before re-embedding.
+
+        Uses a metadata filter on purchase_req_no. Wrapped in try/except so
+        a failure (e.g. index doesn't support filter-delete) only warns.
+        """
+        try:
+            self._index.delete(
+                filter={"purchase_req_no": {"$eq": purchase_req_no}},
+                namespace=self._namespace,
+            )
+            logger.info(
+                "Pinecone: deleted existing vectors for PR={}",
+                purchase_req_no,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Pinecone: could not delete existing vectors for PR={} — "
+                "stale vectors may remain: {}",
+                purchase_req_no, exc,
+            )
+
     def upsert(self, vectors: list[dict]) -> None:
         """Upsert vectors in batches.
 
