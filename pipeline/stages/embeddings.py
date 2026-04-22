@@ -54,6 +54,14 @@ class EmbeddingsStage(BaseStage):
         self._tracker = PipelineTracker(config.get_azure_conn_str())
 
     def execute(self, purchase_req_no: str) -> None:
+        if not self._config.PINECONE_API_KEY or not self._config.PINECONE_INDEX_NAME:
+            self._log.warning(
+                f"PINECONE_API_KEY or PINECONE_INDEX_NAME not set — "
+                f"skipping embedding for PR={purchase_req_no!r}"
+            )
+            self._tracker.advance_stage(purchase_req_no, self.STAGE_ID)
+            return
+
         count = run_embedding(purchase_req_no, config=self._config)
 
         self._log.info(
