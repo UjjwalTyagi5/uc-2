@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from loguru import logger
@@ -275,6 +277,16 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SHEET_NAME",
         help="Sheet name to read (default: first sheet).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of PRs to process in parallel (default: 1 — sequential). "
+            "Set to 3–5 for I/O-bound workloads; each worker opens its own DB connections."
+        ),
+    )
     return parser
 
 
@@ -305,47 +317,90 @@ def main() -> None:
     )
 
     # ── Run pipeline for each PR ───────────────────────────────────────────
-    orchestrator = PipelineOrchestrator(config)
+    orchestrator  = PipelineOrchestrator(config)
     azure_conn_str = config.get_azure_conn_str()
+    workers        = max(1, args.workers)
+    total          = len(pr_nos)
 
     succeeded = 0
     failed    = 0
     skipped   = 0
 
-    for idx, pr_no in enumerate(pr_nos, 1):
-        # Guard: skip PRs that don't exist in purchase_req_mst — there is
-        # nothing to process and we must not create a ras_tracker row for them.
+    def _process_one(pr_no: str, idx: int) -> str:
+        """Run one PR through the full pipeline. Returns 'ok', 'failed', or 'skipped'."""
         if not _pr_exists_in_mst(pr_no, azure_conn_str):
             logger.warning(
-                f"[{idx}/{len(pr_nos)}] PR={pr_no!r} not found in purchase_req_mst — skipping"
+                f"[{idx}/{total}] PR={pr_no!r} not found in purchase_req_mst — skipping"
             )
-            skipped += 1
-            continue
+            return "skipped"
 
-        logger.info(f"[{idx}/{len(pr_nos)}] Starting full pipeline for PR={pr_no!r}")
+        logger.info(f"[{idx}/{total}] Starting full pipeline for PR={pr_no!r}")
         try:
             result = orchestrator.run_single(pr_no)
             if result.succeeded:
-                succeeded += 1
-                logger.info(f"[{idx}/{len(pr_nos)}] PR={pr_no!r} — SUCCESS")
+                logger.info(f"[{idx}/{total}] PR={pr_no!r} — SUCCESS")
+                return "ok"
             else:
-                failed += 1
                 stage = result.failed_stage
                 logger.error(
-                    f"[{idx}/{len(pr_nos)}] PR={pr_no!r} — FAILED at "
+                    f"[{idx}/{total}] PR={pr_no!r} — FAILED at "
                     f"stage={stage.stage_name!r}: {stage.error}"
                 )
+                return "failed"
         except Exception as exc:
-            failed += 1
             logger.opt(exception=True).error(
-                f"[{idx}/{len(pr_nos)}] PR={pr_no!r} — unexpected error: {exc}"
+                f"[{idx}/{total}] PR={pr_no!r} — unexpected error: {exc}"
             )
+            return "failed"
+
+    if workers == 1:
+        for idx, pr_no in enumerate(pr_nos, 1):
+            outcome = _process_one(pr_no, idx)
+            if outcome == "ok":
+                succeeded += 1
+            elif outcome == "failed":
+                failed += 1
+            else:
+                skipped += 1
+    else:
+        logger.info(f"Running with {workers} parallel workers")
+        counter_lock = threading.Lock()
+        completed    = 0
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_pr = {
+                executor.submit(_process_one, pr_no, i): pr_no
+                for i, pr_no in enumerate(pr_nos, 1)
+            }
+            for future in as_completed(future_to_pr):
+                pr_no = future_to_pr[future]
+                with counter_lock:
+                    completed += 1
+
+                try:
+                    outcome = future.result()
+                except Exception as exc:
+                    logger.opt(exception=True).error(
+                        f"PR={pr_no!r} — unexpected thread error: {exc}"
+                    )
+                    outcome = "failed"
+
+                if outcome == "ok":
+                    with counter_lock:
+                        succeeded += 1
+                elif outcome == "failed":
+                    with counter_lock:
+                        failed += 1
+                else:
+                    with counter_lock:
+                        skipped += 1
 
     # ── Summary ────────────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("Excel pipeline run summary")
     logger.info(f"  Excel file : {excel_path.name}")
-    logger.info(f"  Total PRs  : {len(pr_nos)}")
+    logger.info(f"  Workers    : {workers}")
+    logger.info(f"  Total PRs  : {total}")
     logger.info(f"  Succeeded  : {succeeded}")
     logger.info(f"  Failed     : {failed}")
     logger.info(f"  Skipped    : {skipped}  (not found in purchase_req_mst)")
