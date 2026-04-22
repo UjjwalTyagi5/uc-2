@@ -247,8 +247,8 @@ class AppConfig:
         self.PINECONE_INDEX_NAME = _optional("PINECONE_INDEX_NAME", "")
 
         # ── Embedding tuning ───────────────────────────────────────────────
-        # Output dimensions for text-embedding-3-large (max 3072; 1536 recommended).
-        self.EMBEDDING_DIMENSIONS  = int(_optional("EMBEDDING_DIMENSIONS",  "1536"))
+        # Output dimensions for text-embedding-3-large (max 3072).
+        self.EMBEDDING_DIMENSIONS  = int(_optional("EMBEDDING_DIMENSIONS",  "3072"))
         # Number of texts sent to the embeddings API in one request.
         self.EMBEDDING_BATCH_SIZE  = int(_optional("EMBEDDING_BATCH_SIZE",  "100"))
         # Number of vectors upserted to Pinecone in one request.
