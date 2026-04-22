@@ -23,8 +23,8 @@ class EmbeddingClient:
 
     def __init__(self, config: AppConfig) -> None:
         self._client = AzureOpenAI(
-            azure_endpoint=config.AOAI_ENDPOINT,
-            api_key=config.AOAI_API_KEY,
+            azure_endpoint=config.AOAI_EMBEDDING_ENDPOINT,
+            api_key=config.AOAI_EMBEDDING_API_KEY,
             api_version=config.AOAI_API_VERSION,
         )
         self._deployment   = config.AOAI_EMBEDDING_DEPLOYMENT
