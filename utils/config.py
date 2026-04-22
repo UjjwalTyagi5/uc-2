@@ -248,6 +248,7 @@ class AppConfig:
         # Required only by the EMBEDDINGS stage (stage 6).
         self.PINECONE_API_KEY    = _optional("PINECONE_API_KEY",    "")
         self.PINECONE_INDEX_NAME = _optional("PINECONE_INDEX_NAME", "")
+        self.PINECONE_NAMESPACE  = _optional("PINECONE_NAMESPACE",  "")
 
         # ── Embedding tuning ───────────────────────────────────────────────
         # Output dimensions for text-embedding-3-large (max 3072).

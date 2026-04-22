@@ -13,6 +13,7 @@ class PineconeWriter:
     def __init__(self, config: AppConfig) -> None:
         pc = Pinecone(api_key=config.PINECONE_API_KEY)
         self._index       = pc.Index(config.PINECONE_INDEX_NAME)
+        self._namespace   = config.PINECONE_NAMESPACE or None
         self._batch_size  = config.PINECONE_UPSERT_BATCH
         self._top_k       = config.PINECONE_TOP_K
         self._threshold   = config.PINECONE_THRESHOLD
@@ -29,7 +30,7 @@ class PineconeWriter:
             return
         for start in range(0, len(vectors), self._batch_size):
             batch = vectors[start : start + self._batch_size]
-            self._index.upsert(vectors=batch)
+            self._index.upsert(vectors=batch, namespace=self._namespace)
             logger.debug(
                 "Pinecone upserted batch {}-{} ({} vectors)",
                 start + 1, start + len(batch), len(batch),
@@ -70,6 +71,7 @@ class PineconeWriter:
             vector=vector,
             top_k=k,
             include_metadata=True,
+            namespace=self._namespace,
             filter=filter,
         )
         return [
