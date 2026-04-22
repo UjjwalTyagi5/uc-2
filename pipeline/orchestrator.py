@@ -285,6 +285,15 @@ class PipelineOrchestrator:
         pr_result = PRResult(purchase_req_no=pr_no, stage_results=stage_results)
         if pr_result.succeeded:
             self._log.success(f"PR={pr_no!r} completed all stages successfully")
+            # All data is now in Azure Blob + DB — local work folder no longer needed.
+            if work_folder.exists():
+                try:
+                    shutil.rmtree(work_folder)
+                    self._log.info(f"Removed local work folder: {work_folder}")
+                except Exception as exc:
+                    self._log.warning(
+                        f"Could not remove work folder {work_folder}: {exc}"
+                    )
         else:
             failed = pr_result.failed_stage
             self._log.opt(exception=failed.error).error(
