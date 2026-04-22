@@ -43,7 +43,7 @@ import pyodbc
 from loguru import logger
 
 _DEADLOCK_STATE  = "40001"
-_DEADLOCK_RETRIES = 4
+_DEADLOCK_RETRIES = 8
 _DEADLOCK_BASE_DELAY = 0.5   # seconds
 
 from db.tables import AzureTables
