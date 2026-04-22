@@ -184,12 +184,15 @@ class AttachmentClassificationRepository:
           4. vw_get_ras_data_for_bidashboard
         """
         if self.get_tracker_uuid(purchase_req_no) is None:
-            self._log.debug(
-                f"cleanup_for_pr skipped — no ras_tracker row for PR={purchase_req_no!r}"
+            self._log.info(
+                f"PR={purchase_req_no!r} is new — no existing DB rows to clean up"
             )
             return
 
-        self._log.debug(f"cleanup_for_pr PR={purchase_req_no!r}")
+        self._log.info(
+            f"PR={purchase_req_no!r} already exists in tracker — "
+            f"this is a retry; DB cleanup started"
+        )
 
         for attempt in range(_DEADLOCK_RETRIES + 1):
             conn = self._connect()
@@ -200,7 +203,7 @@ class AttachmentClassificationRepository:
                 cursor.execute(self._CLEANUP_SP_SQL, purchase_req_no)
                 conn.commit()
                 self._log.info(
-                    f"Pre-run cleanup done for PR={purchase_req_no!r} "
+                    f"DB cleanup done for PR={purchase_req_no!r} "
                     f"(deleted {deleted_qi} quotation_extracted_items row(s))"
                 )
                 return  # success
