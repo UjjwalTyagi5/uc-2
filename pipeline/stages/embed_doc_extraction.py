@@ -34,7 +34,7 @@ from pathlib import Path
 
 from utils.config import AppConfig
 from attachment_blob_sync.sync import AttachmentBlobSync
-from embed_doc_extraction.extractor import SUPPORTED_PARENTS, FileExtractor
+from embed_doc_extraction.extractor import ARCHIVE_EXTENSIONS, SUPPORTED_PARENTS, FileExtractor
 from pipeline.attachment_classification_repository import (
     AttachmentClassificationRepository,
 )
@@ -108,6 +108,23 @@ class EmbedDocExtractionStage(BaseStage):
             output_dir = att_dir / "extracted"
             output_dir.mkdir(exist_ok=True)
 
+            # First pass — expand any standalone archives (ZIP / RAR / 7z / TAR)
+            # directly into att_dir so their contents are treated as regular
+            # attachments. The archive itself is deleted by extract_archive().
+            for archive_file in sorted(att_dir.iterdir()):
+                if not archive_file.is_file():
+                    continue
+                if archive_file.suffix.lower() not in ARCHIVE_EXTENSIONS:
+                    continue
+                self._log.info(
+                    f"Expanding standalone archive: {archive_file.name} "
+                    f"(att_id={att_id})"
+                )
+                extractor.parent_prefix = ""
+                extractor.extract_archive(str(archive_file), str(att_dir))
+
+            # Second pass — process supported parent files for embedded extraction.
+            # Re-reads att_dir so files unpacked from archives are included.
             for file_path in sorted(att_dir.iterdir()):
                 if not file_path.is_file():
                     continue

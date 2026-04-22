@@ -81,8 +81,10 @@ class BaseStage(ABC):
 
         except Exception as exc:
             duration = time.perf_counter() - start
-            # opt(exception=True) writes the full stack trace to the log file
-            self._log.opt(exception=True).error(
+            # Exceptions with _suppress_traceback=True are expected outcomes
+            # (e.g. no quotation found) — log as plain text, no stack dump.
+            show_tb = not getattr(exc, "_suppress_traceback", False)
+            self._log.opt(exception=show_tb).error(
                 f"Stage={self.NAME!r} failed for PR={purchase_req_no!r} "
                 f"after {duration:.2f}s: {exc}"
             )

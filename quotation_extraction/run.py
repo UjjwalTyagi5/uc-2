@@ -24,6 +24,15 @@ from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
 
+class NoQuotationFoundError(RuntimeError):
+    """Raised when a PR has no attachments classified as 'Quotation'.
+
+    Treated as an expected pipeline outcome (not a bug), so base.py logs
+    it as a plain warning rather than a full traceback.
+    """
+    _suppress_traceback = True
+
+
 def run_extraction(
     purchase_req_no: str,
     *,
@@ -76,10 +85,9 @@ def run_extraction(
         config, purchase_req_no, include_all=include_all_attachments
     )
     if not sources:
-        raise RuntimeError(
+        raise NoQuotationFoundError(
             f"No quotation documents found for PR={purchase_req_no!r}. "
-            f"None of the attachments are classified as 'Quotation' — "
-            f"this RAS cannot proceed to benchmarking."
+            f"None of the attachments are classified as 'Quotation'."
         )
 
     # 3. Extract from each quotation file (read from local work/ folder)
