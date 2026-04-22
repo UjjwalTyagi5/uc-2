@@ -171,7 +171,11 @@ class AttachmentClassificationRepository:
         finally:
             conn.close()
 
-    def cleanup_for_pr(self, purchase_req_no: str) -> None:
+    def cleanup_for_pr(
+        self,
+        purchase_req_no: str,
+        pinecone_writer=None,
+    ) -> None:
         """
         Deletes all pipeline output rows for this PR before (re-)processing.
 
@@ -182,6 +186,9 @@ class AttachmentClassificationRepository:
           2. embedded_attachment_classification
           3. attachment_classification
           4. vw_get_ras_data_for_bidashboard
+
+        If pinecone_writer is supplied its delete_for_pr() is called immediately
+        after the DB cleanup so both stores are wiped in the same cleanup step.
         """
         if self.get_tracker_uuid(purchase_req_no) is None:
             self._log.info(
@@ -206,6 +213,11 @@ class AttachmentClassificationRepository:
                     f"DB cleanup done for PR={purchase_req_no!r} "
                     f"(deleted {deleted_qi} quotation_extracted_items row(s))"
                 )
+
+                # Wipe Pinecone vectors for this PR at the same time as DB cleanup
+                if pinecone_writer is not None:
+                    pinecone_writer.delete_for_pr(purchase_req_no)
+
                 return  # success
             except pyodbc.Error as exc:
                 conn.rollback()

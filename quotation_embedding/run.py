@@ -95,9 +95,8 @@ def run_embedding(
             },
         })
 
-    # 5. Delete stale vectors then upsert fresh ones
+    # 5. Upsert vectors (stale ones already deleted in cleanup_for_pr)
     writer = PineconeWriter(config)
-    writer.delete_for_pr(purchase_req_no)
     writer.upsert(vectors)
 
     return len(vectors)

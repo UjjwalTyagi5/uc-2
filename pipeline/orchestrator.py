@@ -87,6 +87,10 @@ class PipelineOrchestrator:
         self._tracker    = PipelineTracker(config.get_azure_conn_str())
         self._att_repo   = AttachmentClassificationRepository(config.get_azure_conn_str())
 
+        # Build Pinecone writer once (None if not configured) so cleanup_for_pr
+        # can delete vectors at the same time as the DB cleanup SP.
+        self._pinecone_writer = self._build_pinecone_writer(config)
+
         # Load stage definitions from DB — single source of truth
         self._registry = StageRegistry(config.get_azure_conn_str())
 
@@ -161,8 +165,8 @@ class PipelineOrchestrator:
         """
         self._log.info(f"Forced single-PR reprocess: PR={purchase_req_no!r}")
 
-        # Step 1 — clean child tables (SP needs tracker row for FK lookup)
-        self._att_repo.cleanup_for_pr(purchase_req_no)
+        # Step 1 — clean child tables + Pinecone vectors
+        self._att_repo.cleanup_for_pr(purchase_req_no, self._pinecone_writer)
 
         # Step 2 — delete exceptions + tracker row (PR now looks brand new)
         self._tracker.reset_for_reprocess(purchase_req_no)
@@ -244,7 +248,7 @@ class PipelineOrchestrator:
         # then wipe the local work folder so we download fresh from source.
         # Safe for new PRs — the SP and rmtree are both no-ops when nothing exists.
         try:
-            self._att_repo.cleanup_for_pr(pr_no)
+            self._att_repo.cleanup_for_pr(pr_no, self._pinecone_writer)
         except Exception as exc:
             self._log.opt(exception=True).error(
                 f"Pre-run DB cleanup failed for PR={pr_no!r} — aborting PR: {exc}"
@@ -342,6 +346,14 @@ class PipelineOrchestrator:
                     )
 
         self._log.info("=" * 60)
+
+    @staticmethod
+    def _build_pinecone_writer(config: AppConfig):
+        """Returns a PineconeWriter if Pinecone is configured, else None."""
+        if not config.PINECONE_API_KEY or not config.PINECONE_INDEX_NAME:
+            return None
+        from quotation_embedding.pinecone_writer import PineconeWriter
+        return PineconeWriter(config)
 
     @staticmethod
     def _build_default_stages(config: AppConfig) -> List[BaseStage]:
