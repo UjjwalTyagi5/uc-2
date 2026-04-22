@@ -19,7 +19,7 @@ class BlobReader:
             account_url=config.BLOB_ACCOUNT_URL,
             credential=config.BLOB_ACCOUNT_KEY,
         )
-        self._container = config.BLOB_CONTAINER
+        self._container = config.BLOB_CONTAINER_NAME
         self._work_root = pathlib.Path(
             tempfile.mkdtemp(prefix="qe_work_")
         )

@@ -41,9 +41,6 @@ from pipeline.attachment_classification_repository import (
 from pipeline.stages.base import BaseStage
 from pipeline.tracker import PipelineTracker
 
-_WORK_DIR = Path("work")
-
-
 class EmbedDocExtractionStage(BaseStage):
     """
     ATTACHMENT domain — stage 2.
@@ -58,19 +55,32 @@ class EmbedDocExtractionStage(BaseStage):
 
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
-        self._config   = config
-        self._tracker  = PipelineTracker(config.get_azure_conn_str())
-        self._att_repo = AttachmentClassificationRepository(config.get_azure_conn_str())
+        self._config    = config
+        self._work_dir  = Path(config.WORK_DIR)
+        self._tracker   = PipelineTracker(config.get_azure_conn_str())
+        self._att_repo  = AttachmentClassificationRepository(config.get_azure_conn_str())
 
     def execute(self, purchase_req_no: str) -> None:
         safe_pr     = purchase_req_no.replace("/", "_")
-        pr_work_dir = _WORK_DIR / "procurement" / safe_pr
+        pr_work_dir = self._work_dir / "procurement" / safe_pr
 
-        # ── Step 1: Download attachments to local work/ ────────────────────
-        saved = AttachmentBlobSync(self._config).save_locally(purchase_req_no)
+        # ── Step 1: Download attachments + sync BI dashboard ─────────────────
+        # Both reads happen here because we're already connected to on-prem.
+        # BI dashboard data must be in Azure before METADATA_EXTRACTION reads it.
+        blob_sync = AttachmentBlobSync(self._config)
+        saved = blob_sync.save_locally(purchase_req_no)
         self._log.info(
             f"Saved {saved} attachment(s) to work/ for PR={purchase_req_no!r}"
         )
+
+        try:
+            blob_sync.sync_bi_dashboard_for_pr(purchase_req_no)
+        except Exception as exc:
+            # Non-fatal — log and continue; context_builder handles missing data gracefully
+            self._log.error(
+                f"BI dashboard sync failed for PR={purchase_req_no!r} "
+                f"(non-fatal, continuing): {exc}"
+            )
 
         if not pr_work_dir.exists() or saved == 0:
             self._log.warning(
@@ -151,7 +161,7 @@ class EmbedDocExtractionStage(BaseStage):
                 if delta:
                     self._log.debug(
                         f"  {file_path.name}: {delta} embedded file(s) → "
-                        f"{output_dir.relative_to(_WORK_DIR)}"
+                        f"{output_dir.relative_to(self._work_dir)}"
                     )
 
         self._log.info(

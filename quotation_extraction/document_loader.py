@@ -32,23 +32,37 @@ _HTML_EXTS = {".htm", ".html"}
 def load_document(
     file_path: str | pathlib.Path,
     max_pages: int = 20,
+    work_dir: Optional[pathlib.Path] = None,
 ) -> DocumentContent:
-    """Load a file and return an LLM-ready :class:`DocumentContent`."""
+    """Load a file and return an LLM-ready :class:`DocumentContent`.
 
+    Parameters
+    ----------
+    work_dir:
+        Directory under which any intermediate files (e.g. rendered page
+        images) should be written.  Defaults to the source file's own
+        directory so that all temp output stays inside the per-RAS work
+        folder and is cleaned up together with it.  Currently all rendering
+        is done in-memory; this parameter exists to guarantee the right
+        location is used if disk-backed rendering is ever added.
+    """
     fp = pathlib.Path(file_path)
     ext = fp.suffix.lower()
-    logger.debug("Loading document: {} (ext={})", fp.name, ext)
+    # Use the file's own directory as the default so temp files always stay
+    # inside the per-RAS work folder.
+    wdir = work_dir or fp.parent
+    logger.debug("Loading document: {} (ext={}, work_dir={})", fp.name, ext, wdir)
 
     if ext == ".pdf":
-        return _load_pdf(fp, max_pages)
+        return _load_pdf(fp, max_pages, wdir)
     if ext in (".xlsx", ".xls"):
-        return _load_spreadsheet(fp)
+        return _load_spreadsheet(fp, wdir)
     if ext == ".docx":
-        return _load_docx(fp)
+        return _load_docx(fp, wdir)
     if ext == ".doc":
-        return _load_doc_legacy(fp, max_pages)
+        return _load_doc_legacy(fp, max_pages, wdir)
     if ext in (".pptx", ".ppt"):
-        return _load_presentation(fp, max_pages)
+        return _load_presentation(fp, max_pages, wdir)
     if ext in _IMAGE_EXTS:
         return _load_image(fp)
     if ext in _TEXT_EXTS:
@@ -59,13 +73,13 @@ def load_document(
         return _load_msg(fp)
 
     logger.warning("Unsupported extension '{}' — attempting fitz render", ext)
-    return _try_fitz_render(fp, max_pages)
+    return _try_fitz_render(fp, max_pages, wdir)
 
 
 # ── PDF ──
 
 
-def _load_pdf(fp: pathlib.Path, max_pages: int) -> DocumentContent:
+def _load_pdf(fp: pathlib.Path, max_pages: int, work_dir: pathlib.Path) -> DocumentContent:
     import fitz  # PyMuPDF
 
     doc = fitz.open(str(fp))
@@ -76,14 +90,14 @@ def _load_pdf(fp: pathlib.Path, max_pages: int) -> DocumentContent:
         pix = doc[i].get_pixmap(dpi=200)
         images.append(base64.b64encode(pix.tobytes("png")).decode())
     doc.close()
-    logger.debug("PDF rendered: {} pages → {} images", page_count, total)
+    logger.debug("PDF rendered: {} pages → {} images (work_dir={})", page_count, total, work_dir)
     return DocumentContent(images=images, source_path=str(fp), page_count=total)
 
 
 # ── Spreadsheets ──
 
 
-def _load_spreadsheet(fp: pathlib.Path) -> DocumentContent:
+def _load_spreadsheet(fp: pathlib.Path, work_dir: pathlib.Path) -> DocumentContent:
     ext = fp.suffix.lower()
     parts: list[str] = []
 
@@ -94,7 +108,7 @@ def _load_spreadsheet(fp: pathlib.Path) -> DocumentContent:
 
     if not parts or all(p.strip() == "" for p in parts):
         logger.info("Spreadsheet text empty — falling back to image render")
-        return _try_fitz_render(fp, max_pages=20)
+        return _try_fitz_render(fp, max_pages=20, work_dir=work_dir)
 
     text = "\n\n".join(parts)
     return DocumentContent(text=text, source_path=str(fp), page_count=1)
@@ -138,7 +152,7 @@ def _parse_xls(fp: pathlib.Path) -> list[str]:
 # ── DOCX ──
 
 
-def _load_docx(fp: pathlib.Path) -> DocumentContent:
+def _load_docx(fp: pathlib.Path, work_dir: pathlib.Path) -> DocumentContent:
     from docx import Document as DocxDocument
 
     doc = DocxDocument(str(fp))
@@ -159,7 +173,7 @@ def _load_docx(fp: pathlib.Path) -> DocumentContent:
 
     if not text.strip():
         logger.info("DOCX text empty — falling back to image render")
-        return _try_fitz_render(fp, max_pages=20)
+        return _try_fitz_render(fp, max_pages=20, work_dir=work_dir)
 
     return DocumentContent(text=text, source_path=str(fp), page_count=1)
 
@@ -170,9 +184,10 @@ def _load_docx(fp: pathlib.Path) -> DocumentContent:
 def _load_doc_legacy(
     fp: pathlib.Path,
     max_pages: int,
+    work_dir: pathlib.Path,
 ) -> DocumentContent:
     try:
-        return _try_fitz_render(fp, max_pages)
+        return _try_fitz_render(fp, max_pages, work_dir)
     except Exception:
         logger.debug("fitz failed on .doc — trying OLE text extraction")
 
@@ -202,13 +217,14 @@ def _load_doc_legacy(
 def _load_presentation(
     fp: pathlib.Path,
     max_pages: int,
+    work_dir: pathlib.Path,
 ) -> DocumentContent:
     ext = fp.suffix.lower()
     if ext == ".pptx":
         text = _parse_pptx_text(fp)
         if text and text.strip():
             return DocumentContent(text=text, source_path=str(fp), page_count=1)
-    return _try_fitz_render(fp, max_pages)
+    return _try_fitz_render(fp, max_pages, work_dir)
 
 
 def _parse_pptx_text(fp: pathlib.Path) -> Optional[str]:
@@ -300,6 +316,7 @@ def _load_msg(fp: pathlib.Path) -> DocumentContent:
 def _try_fitz_render(
     fp: pathlib.Path,
     max_pages: int,
+    work_dir: pathlib.Path,
 ) -> DocumentContent:
     import fitz
 
@@ -309,6 +326,8 @@ def _try_fitz_render(
     total = min(page_count, max_pages)
     for i in range(total):
         pix = doc[i].get_pixmap(dpi=200)
+        # Render in-memory as base64; work_dir is available here if disk
+        # caching is ever needed (files would land inside the per-RAS folder).
         images.append(base64.b64encode(pix.tobytes("png")).decode())
     doc.close()
     if not images:

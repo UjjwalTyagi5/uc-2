@@ -136,11 +136,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m pipeline",
         description=(
-            "RAS attachment processing pipeline.\n"
-            "Fetches every unprocessed PURCHASE_REQ_NO and runs it through "
-            "all registered pipeline stages (blob upload, classification, …)."
+            "RAS attachment processing pipeline.\n\n"
+            "Default (no --pr-no): fetches every unprocessed PR and runs all stages.\n"
+            "With --pr-no: deletes ALL existing pipeline data for that PR and\n"
+            "             reprocesses it from scratch through every stage."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--pr-no",
+        default=None,
+        metavar="PURCHASE_REQ_NO",
+        help=(
+            "Force a full reprocess of one specific PR (e.g. R_260652/2026). "
+            "Wipes all existing pipeline output for this PR then re-runs every "
+            "stage from scratch. Cannot be combined with --limit."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -149,7 +160,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=(
             "Cap the number of PRs processed in this run.  "
-            "Omit to process every pending PR."
+            "Omit to process every pending PR.  Ignored when --pr-no is set."
         ),
     )
     return parser
@@ -167,9 +178,24 @@ def main() -> None:
 
     _verify_connections(config)
 
-    # Re-queue completed PRs whose source data changed since last processing.
-    # Runs before the main pipeline so the pipeline picks up re-queued PRs
-    # in the same run.
+    orchestrator = PipelineOrchestrator(config, limit=args.limit)
+
+    # ── Single-PR forced reprocess ────────────────────────────────────────
+    if args.pr_no:
+        logger.info(
+            f"Single-PR reprocess requested for PR={args.pr_no!r} — "
+            f"all existing pipeline data will be wiped and rebuilt from scratch"
+        )
+        try:
+            result = orchestrator.run_single(args.pr_no)
+        except Exception as exc:
+            logger.opt(exception=True).critical(
+                f"Unexpected error during single-PR reprocess: {exc}"
+            )
+            sys.exit(1)
+        sys.exit(0 if result.succeeded else 1)
+
+    # ── Normal batch run ──────────────────────────────────────────────────
     try:
         requeued = SourceChangeDetector(config).detect_and_requeue()
         if requeued:
@@ -185,7 +211,6 @@ def main() -> None:
         logger.opt(exception=True).critical(f"Unexpected pipeline error: {exc}")
         sys.exit(1)
 
-    # Exit with a non-zero code if any PR failed so CI/schedulers can detect it
     any_failed = any(not r.succeeded for r in results)
     sys.exit(1 if any_failed else 0)
 

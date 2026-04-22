@@ -36,8 +36,15 @@ Cleanup path (called from PipelineOrchestrator before each PR run)
 
 from __future__ import annotations
 
+import random
+import time
+
 import pyodbc
 from loguru import logger
+
+_DEADLOCK_STATE  = "40001"
+_DEADLOCK_RETRIES = 4
+_DEADLOCK_BASE_DELAY = 0.5   # seconds
 
 from db.tables import AzureTables
 
@@ -130,6 +137,18 @@ class AttachmentClassificationRepository:
 
     _CLEANUP_SP_SQL = "EXEC [ras_procurement].[usp_cleanup_pr_data] ?"
 
+    # Explicit delete for quotation_extracted_items — ensures rows are removed
+    # even if usp_cleanup_pr_data does not cover this table.
+    _DELETE_QUOTATION_ITEMS_SQL = f"""
+        DELETE qi
+          FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+          JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN {AzureTables.RAS_TRACKER} rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE rt.[purchase_req_no] = ?
+    """
+
     def __init__(self, conn_str: str) -> None:
         self._conn_str = conn_str
         self._log      = logger.bind(component="AttachmentClassificationRepository")
@@ -171,18 +190,34 @@ class AttachmentClassificationRepository:
             return
 
         self._log.debug(f"cleanup_for_pr PR={purchase_req_no!r}")
-        conn = self._connect()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(self._CLEANUP_SP_SQL, purchase_req_no)
-            conn.commit()
-            self._log.info(f"Pre-run cleanup done for PR={purchase_req_no!r}")
-        except pyodbc.Error as exc:
-            conn.rollback()
-            self._log.error(f"cleanup_for_pr failed for PR={purchase_req_no!r}: {exc}")
-            raise
-        finally:
-            conn.close()
+
+        for attempt in range(_DEADLOCK_RETRIES + 1):
+            conn = self._connect()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(self._DELETE_QUOTATION_ITEMS_SQL, purchase_req_no)
+                deleted_qi = cursor.rowcount
+                cursor.execute(self._CLEANUP_SP_SQL, purchase_req_no)
+                conn.commit()
+                self._log.info(
+                    f"Pre-run cleanup done for PR={purchase_req_no!r} "
+                    f"(deleted {deleted_qi} quotation_extracted_items row(s))"
+                )
+                return  # success
+            except pyodbc.Error as exc:
+                conn.rollback()
+                is_deadlock = exc.args[0] == _DEADLOCK_STATE
+                if not is_deadlock or attempt >= _DEADLOCK_RETRIES:
+                    self._log.error(f"cleanup_for_pr failed for PR={purchase_req_no!r}: {exc}")
+                    raise
+                delay = _DEADLOCK_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+                self._log.warning(
+                    f"Deadlock in cleanup_for_pr for PR={purchase_req_no!r} "
+                    f"(attempt {attempt + 1}/{_DEADLOCK_RETRIES}), retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+            finally:
+                conn.close()
 
     def upsert_parent(
         self,

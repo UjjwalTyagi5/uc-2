@@ -1,0 +1,52 @@
+## Task: Identify the Selected Quotation and Rank All Sources
+
+You are given a purchase requisition's reference data and {n_sources} extracted quotation source(s).
+
+You must do two things:
+1. Identify which quotation was most likely selected by the buyer.
+2. Rank every quotation source per line item by price competitiveness.
+
+## Requisition Reference Data
+
+Primary Supplier : {primary_supplier}
+Parent Supplier  : {parent_supplier}
+Currency         : {currency}
+
+### Requisition Line Items
+(Actual values recorded by the buyer — treat as ground truth.)
+
+{ras_line_items_table}
+
+## Extracted Quotation Sources
+
+{sources_summary}
+
+## Instructions
+
+### Part 1 — Selected quotation
+Decide which source the buyer most likely selected. Apply in order:
+1. **Supplier Match Confidence** — prefer the source with the highest confidence score (closer to 1.0 = better supplier match).
+2. **Price completeness** — strongly prefer sources that have actual extracted unit prices (Items with Price > 0) over sources with all N/A prices (stub rows with no data).
+3. **Price accuracy** — among sources with prices, prefer the one whose unit prices are closest to the RAS recorded prices.
+4. **Latest date** — when supplier and prices are similar, prefer the most recent quotation date.
+
+> A source with Supplier Match Conf = 0.0 or 0.1 and no extracted prices should almost never be selected over a source with high confidence and matching prices.
+
+### Part 2 — Rankings per line item
+For every DTL_ID in the requisition, rank each source:
+- Rank 1 = lowest unit price for that line item.
+- Tie-break: more recent quotation date = better rank.
+- Sources with no unit price for that line item rank last (highest number).
+- If ALL sources for a DTL_ID have no price, set every rank in that array to null.
+
+Return ONLY this JSON object — no markdown fences, no extra text:
+
+{{
+  "selected_index": <integer 1 to {n_sources}, or null if cannot determine>,
+  "dtl_rankings": {{
+    "<dtl_id>": [<rank_source_1>, <rank_source_2>, ...]
+  }}
+}}
+
+The dtl_rankings array must have exactly {n_sources} elements — one per source in the same
+order as Source 1, Source 2, … above.

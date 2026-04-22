@@ -46,9 +46,9 @@ from pipeline.stages.blob_upload import BlobUploadStage
 from pipeline.stages.classification import ClassificationStage
 from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
 from pipeline.stages.ingestion import IngestionStage
+from pipeline.stages.embeddings import EmbeddingsStage
+from pipeline.stages.metadata_extraction import MetadataExtractionStage
 from pipeline.tracker import PipelineTracker
-
-_WORK_DIR = Path("work")
 
 
 class PipelineOrchestrator:
@@ -143,6 +143,36 @@ class PipelineOrchestrator:
         self._log_summary(results)
         return results
 
+    def run_single(self, purchase_req_no: str) -> PRResult:
+        """
+        Force a full reprocess of one specific PR from scratch.
+
+        Steps (order matters — child tables must be cleaned while tracker exists):
+          1. cleanup_for_pr  — SP deletes quotation_extracted_items,
+                               embedded_attachment_classification,
+                               attachment_classification, BI dashboard rows
+                               (uses ras_tracker FK lookup, so must run first)
+          2. reset_for_reprocess — deletes ras_pipeline_exceptions then the
+                               ras_tracker row so the PR looks brand new
+          3. _process_pr     — wipes local work folder, runs all stages
+
+        Use this when you need to reprocess a specific PR regardless of its
+        current pipeline state (including EXCEPTION or COMPLETED).
+        """
+        self._log.info(f"Forced single-PR reprocess: PR={purchase_req_no!r}")
+
+        # Step 1 — clean child tables (SP needs tracker row for FK lookup)
+        self._att_repo.cleanup_for_pr(purchase_req_no)
+
+        # Step 2 — delete exceptions + tracker row (PR now looks brand new)
+        self._tracker.reset_for_reprocess(purchase_req_no)
+
+        # Step 3 — _process_pr calls cleanup_for_pr again but it's a no-op
+        #           (tracker gone), then wipes work folder and runs all stages
+        result = self._process_pr(purchase_req_no)
+        self._log_summary([result])
+        return result
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -234,7 +264,7 @@ class PipelineOrchestrator:
             )
 
         safe_pr    = pr_no.replace("/", "_")
-        work_folder = _WORK_DIR / "procurement" / safe_pr
+        work_folder = Path(self._config.WORK_DIR) / "procurement" / safe_pr
         if work_folder.exists():
             shutil.rmtree(work_folder)
             self._log.debug(f"Removed local work folder: {work_folder}")
@@ -320,20 +350,18 @@ class PipelineOrchestrator:
 
         Current state
         -------------
-        Stage 1 — INGESTION           : records entry, creates ras_tracker row
-        Stage 2 — EMBED_DOC_EXTRACTION: stub (no work, marks stage)
-        Stage 3 — BLOB_UPLOAD         : uploads attachments to Azure Blob Storage
-        Stage 4 — CLASSIFICATION      : stub (no work, marks stage)
-
-        To add the next stage (e.g. METADATA_EXTRACTION):
-            1. Create pipeline/stages/metadata_extraction.py  (NAME="METADATA_EXTRACTION", STAGE_ID=5)
-            2. Append MetadataExtractionStage(config) to this list
-            3. Ensure STAGE_NAME=METADATA_EXTRACTION, STAGE_ID=5 exists in pipeline_stages table
+        Stage 1 — INGESTION            : records entry, creates ras_tracker row
+        Stage 2 — EMBED_DOC_EXTRACTION : downloads attachments + extracts embedded docs
+        Stage 3 — BLOB_UPLOAD          : uploads complete work folder to Azure Blob
+        Stage 4 — CLASSIFICATION       : classifies each attachment by doc_type via LLM
+        Stage 5 — METADATA_EXTRACTION  : extracts structured line items from quotations
+        Stage 6 — EMBEDDINGS           : embeds selected items and upserts to Pinecone
         """
         return [
-            IngestionStage(config),            # stage 1  — creates tracker row
-            EmbedDocExtractionStage(config),   # stage 2  — saves locally + extracts embedded docs
-            BlobUploadStage(config),           # stage 3  — uploads complete work folder to blob
-            ClassificationStage(config),       # stage 4  — stub
-            # MetadataExtractionStage(config), # stage 5  — add when ready
+            IngestionStage(config),             # stage 1
+            EmbedDocExtractionStage(config),    # stage 2
+            BlobUploadStage(config),            # stage 3
+            ClassificationStage(config),        # stage 4
+            MetadataExtractionStage(config),    # stage 5
+            EmbeddingsStage(config),            # stage 6
         ]
