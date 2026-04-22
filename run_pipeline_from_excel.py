@@ -34,6 +34,7 @@ from loguru import logger
 
 from utils.config import AppConfig
 from db.connection import connect_with_retry
+from db.tables import AzureTables
 from pipeline.orchestrator import PipelineOrchestrator
 
 _LOG_DIR = Path("logs")
@@ -200,6 +201,26 @@ def _read_pr_nos_from_excel(
     return pr_nos
 
 
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+_CHECK_MST_SQL = f"SELECT 1 FROM {AzureTables.PURCHASE_REQ_MST} WHERE [PURCHASE_REQ_NO] = ?"
+
+
+def _pr_exists_in_mst(pr_no: str, conn_str: str) -> bool:
+    """Return True if the PR exists in purchase_req_mst, False otherwise."""
+    try:
+        conn = connect_with_retry(conn_str, autocommit=True)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(_CHECK_MST_SQL, pr_no)
+            return cursor.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(f"Could not verify PR={pr_no!r} in purchase_req_mst: {exc}")
+        return False
+
+
 # ── DB smoke-test ──────────────────────────────────────────────────────────────
 
 def _verify_connections(config: AppConfig) -> None:
@@ -285,11 +306,22 @@ def main() -> None:
 
     # ── Run pipeline for each PR ───────────────────────────────────────────
     orchestrator = PipelineOrchestrator(config)
+    azure_conn_str = config.get_azure_conn_str()
 
     succeeded = 0
     failed    = 0
+    skipped   = 0
 
     for idx, pr_no in enumerate(pr_nos, 1):
+        # Guard: skip PRs that don't exist in purchase_req_mst — there is
+        # nothing to process and we must not create a ras_tracker row for them.
+        if not _pr_exists_in_mst(pr_no, azure_conn_str):
+            logger.warning(
+                f"[{idx}/{len(pr_nos)}] PR={pr_no!r} not found in purchase_req_mst — skipping"
+            )
+            skipped += 1
+            continue
+
         logger.info(f"[{idx}/{len(pr_nos)}] Starting full pipeline for PR={pr_no!r}")
         try:
             result = orchestrator.run_single(pr_no)
@@ -316,6 +348,7 @@ def main() -> None:
     logger.info(f"  Total PRs  : {len(pr_nos)}")
     logger.info(f"  Succeeded  : {succeeded}")
     logger.info(f"  Failed     : {failed}")
+    logger.info(f"  Skipped    : {skipped}  (not found in purchase_req_mst)")
     logger.info("=" * 60)
 
     sys.exit(1 if failed else 0)
