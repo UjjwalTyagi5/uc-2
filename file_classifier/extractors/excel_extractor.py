@@ -12,13 +12,17 @@ MAX_SHEETS_DETAILED = 8  # extract full content for first N sheets; summarize th
 
 def _open_excel_file(buf: io.BytesIO) -> pd.ExcelFile:
     """Try openpyxl first, fall back to xlrd. Handles .xls files that are actually xlsx internally."""
+    errors = []
     for engine in ("openpyxl", "xlrd"):
         try:
             buf.seek(0)
             return pd.ExcelFile(buf, engine=engine)
-        except Exception:
+        except Exception as e:
+            errors.append(f"{engine}: {e}")
             continue
-    raise ValueError("Failed to open Excel file with both openpyxl and xlrd engines")
+    raise ValueError(
+        f"Failed to open Excel file with both engines: {'; '.join(errors)}"
+    )
 
 
 class ExcelExtractor(BaseExtractor):

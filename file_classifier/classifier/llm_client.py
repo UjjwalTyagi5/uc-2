@@ -125,7 +125,13 @@ def _create_completion(client, model: str, **kwargs) -> str:
                 _models_without_temperature.add(model)
                 extra.pop("temperature", None)
                 continue  # retry immediately without counting as a failure
-            raise  # other BadRequestErrors are permanent
+            if "content_filter" in str(e):
+                logger.warning(
+                    "Azure content filter triggered — document will be classified as Others",
+                    model=model,
+                    error_code=getattr(e, "code", "unknown"),
+                )
+            raise  # all BadRequestErrors are permanent
 
         except Exception as e:
             last_error = e

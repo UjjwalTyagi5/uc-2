@@ -23,9 +23,11 @@ Usage
 from __future__ import annotations
 
 import os
+import posixpath
 import shutil
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 
 import extract_msg
@@ -49,6 +51,17 @@ EXTRACT_EXTENSIONS = (
 SKIP_EXTENSIONS = (".emf", ".bin")
 
 ARCHIVE_EXTENSIONS = (".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.bz2")
+
+# Worksheet names whose media/embeddings should be skipped during XLSX extraction.
+# Matched case-insensitively after strip(). The MPBC template's "Guidelines - Notes"
+# sheet only contains screenshots of the MPBC format itself — not real deliverables.
+SKIP_SHEET_NAMES = ("guidelines - notes",)
+
+_OOXML_NS = {
+    "w":  "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "r":  "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "pr": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
 
 FILE_SIGNATURES = [
     (b"%PDF",               ".pdf"),
@@ -294,6 +307,122 @@ class FileExtractor:
         except Exception as exc:
             logger.warning(f"OLE bin error ({os.path.basename(bin_path)}): {exc}")
 
+    # ── XLSX sheet-based media skip (e.g. MPBC "Guidelines - Notes") ───────
+
+    def _media_to_skip_for_xlsx(self, tmp_dir: str) -> tuple[set[str], list[str]]:
+        """
+        Return ({basenames to skip}, [matched sheet names]).
+
+        Builds a media-reference graph for every worksheet, then returns
+        basenames referenced *only* by skip-listed sheets. Safe on non-xlsx
+        OOXML (returns empty) and degrades to empty on any parse error.
+        """
+        workbook_xml = os.path.join(tmp_dir, "xl", "workbook.xml")
+        workbook_rels = os.path.join(tmp_dir, "xl", "_rels", "workbook.xml.rels")
+        if not (os.path.exists(workbook_xml) and os.path.exists(workbook_rels)):
+            return set(), []
+
+        try:
+            # Map rId -> worksheet file (posix path relative to xl/)
+            rel_root = ET.parse(workbook_rels).getroot()
+            rid_to_target: dict[str, str] = {}
+            for rel in rel_root.findall("pr:Relationship", _OOXML_NS):
+                rid_to_target[rel.get("Id", "")] = rel.get("Target", "")
+
+            # Sheet name -> worksheet file inside xl/
+            wb_root = ET.parse(workbook_xml).getroot()
+            sheets: list[tuple[str, str]] = []  # (name, worksheet_path_relative_to_xl)
+            for sh in wb_root.iter("{%s}sheet" % _OOXML_NS["w"]):
+                name = sh.get("name", "")
+                rid = sh.get("{%s}id" % _OOXML_NS["r"], "")
+                target = rid_to_target.get(rid, "")
+                if name and target:
+                    sheets.append((name, target))
+
+            if not sheets:
+                return set(), []
+
+            # Collect media paths per sheet.
+            sheet_media: dict[str, set[str]] = {}
+            for name, ws_target in sheets:
+                ws_path_in_xl = posixpath.normpath(ws_target)  # e.g. "worksheets/sheet1.xml"
+                sheet_media[name] = self._collect_media_for_worksheet(tmp_dir, ws_path_in_xl)
+
+            matched = [n for n in [s[0] for s in sheets]
+                       if n.strip().lower() in SKIP_SHEET_NAMES]
+            if not matched:
+                return set(), []
+
+            skip_union: set[str] = set()
+            for n in matched:
+                skip_union |= sheet_media.get(n, set())
+
+            keep_union: set[str] = set()
+            for name, media in sheet_media.items():
+                if name not in matched:
+                    keep_union |= media
+
+            to_skip = skip_union - keep_union
+            basenames = {posixpath.basename(p) for p in to_skip}
+            return basenames, matched
+        except Exception as exc:
+            logger.warning(f"XLSX sheet-skip parse failed, extracting all media: {exc}")
+            return set(), []
+
+    def _collect_media_for_worksheet(self, tmp_dir: str, ws_path_in_xl: str) -> set[str]:
+        """
+        Walk a worksheet's .rels → drawing/vmlDrawing/embedding → their .rels,
+        returning the set of media/embedding paths (relative to xl/, posix form).
+        """
+        media: set[str] = set()
+        ws_rels_path = posixpath.join(
+            "worksheets", "_rels", posixpath.basename(ws_path_in_xl) + ".rels"
+        )
+        rels_fs = os.path.join(tmp_dir, "xl", *ws_rels_path.split("/"))
+        if not os.path.exists(rels_fs):
+            return media
+
+        ws_dir = posixpath.dirname(ws_path_in_xl)  # "worksheets"
+        try:
+            root = ET.parse(rels_fs).getroot()
+        except Exception:
+            return media
+
+        for rel in root.findall("pr:Relationship", _OOXML_NS):
+            target = rel.get("Target", "")
+            if not target:
+                continue
+            resolved = posixpath.normpath(posixpath.join(ws_dir, target))
+            lower = resolved.lower()
+            # Direct embedding reference (OLE object .bin etc.)
+            if lower.startswith("embeddings/") or lower.startswith("media/"):
+                media.add(resolved)
+                continue
+            # Drawings/vmlDrawings: follow their own rels to reach media/embeddings.
+            if lower.startswith("drawings/"):
+                drawing_basename = posixpath.basename(resolved)
+                drawing_rels = posixpath.join(
+                    "drawings", "_rels", drawing_basename + ".rels"
+                )
+                drels_fs = os.path.join(tmp_dir, "xl", *drawing_rels.split("/"))
+                if not os.path.exists(drels_fs):
+                    continue
+                try:
+                    droot = ET.parse(drels_fs).getroot()
+                except Exception:
+                    continue
+                for drel in droot.findall("pr:Relationship", _OOXML_NS):
+                    dtarget = drel.get("Target", "")
+                    if not dtarget:
+                        continue
+                    dresolved = posixpath.normpath(
+                        posixpath.join("drawings", dtarget)
+                    )
+                    dlower = dresolved.lower()
+                    if dlower.startswith("media/") or dlower.startswith("embeddings/"):
+                        media.add(dresolved)
+        return media
+
     # ── XLSX / DOCX / PPTX (Office Open XML) ───────────────────────────────
 
     def extract_from_ooxml(self, file_path: str, out: str) -> bool:
@@ -302,6 +431,14 @@ class FileExtractor:
             with tempfile.TemporaryDirectory() as tmp:
                 with zipfile.ZipFile(file_path, "r") as zr:
                     zr.extractall(tmp)
+
+                skip_basenames, matched_sheets = self._media_to_skip_for_xlsx(tmp)
+                if skip_basenames:
+                    logger.info(
+                        f"Skipping {len(skip_basenames)} media/embedding file(s) "
+                        f"from sheet(s) {matched_sheets} in "
+                        f"{os.path.basename(file_path)}"
+                    )
 
                 for prefix in ("xl", "word", "ppt"):
                     for sub in ("media", "embeddings"):
@@ -312,6 +449,9 @@ class FileExtractor:
                         for fn in os.listdir(folder):
                             src = os.path.join(folder, fn)
                             if not os.path.isfile(src):
+                                continue
+                            if prefix == "xl" and fn in skip_basenames:
+                                logger.debug(f"  Skipped (sheet-filter): {fn}")
                                 continue
                             if fn.lower().endswith(".bin"):
                                 self._extract_from_bin(src, out)
