@@ -11,6 +11,7 @@ from loguru import logger
 
 from db.crud import BaseRepository
 from db.tables import AzureTables
+from utils.currency_converter import CurrencyConverter
 
 from .config import ExtractionConfig
 from .models import ExtractedItem
@@ -51,12 +52,14 @@ INSERT INTO {AzureTables.QUOTATION_EXTRACTED_ITEMS} (
     [item_level_7],
     [item_level_8],
     [commodity_tag],
-    [item_summary]
+    [item_summary],
+    [unit_price_eur],
+    [total_price_eur]
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?
 )
 """
 
@@ -119,6 +122,8 @@ def _item_to_row(item: ExtractedItem) -> list:
         _p(item.item_level_8),
         _p(item.commodity_tag),
         _p(item.item_summary),
+        _p(item.unit_price_eur),
+        _p(item.total_price_eur),
     ]
 
 
@@ -141,6 +146,11 @@ class ExtractionWriter(BaseRepository):
 
         if replace:
             self._delete_existing(items)
+
+        converter = CurrencyConverter(self._conn_str)
+        for item in items:
+            item.unit_price_eur  = converter.to_eur(item.unit_price,  item.currency, item.quotation_date)
+            item.total_price_eur = converter.to_eur(item.total_price, item.currency, item.quotation_date)
 
         rows = [_item_to_row(item) for item in items]
         self._execute_many(_INSERT_SQL, rows)

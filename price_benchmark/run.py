@@ -89,7 +89,8 @@ def run_benchmark(
 
         low_unit, low_total, last_unit, last_total = _compute_low_last(historical)
 
-        llm_out = llm.analyze(row, historical)
+        curr_unit_eur = _to_decimal(row.get("unit_price_eur"))
+        llm_out = llm.analyze(row, historical, curr_unit_eur=curr_unit_eur)
 
         bp_unit = _to_decimal(llm_out.get("bp_unit_price"))
         infl    = _to_decimal(llm_out.get("inflation_pct"))
@@ -190,25 +191,34 @@ def _compute_low_last(
     Optional[Decimal], Optional[Decimal],
     Optional[Decimal], Optional[Decimal],
 ]:
-    """Return (low_unit, low_total, last_unit, last_total) from historical items.
+    """Return (low_unit, low_total, last_unit, last_total) in EUR where available.
 
-    low  = row with the minimum unit_price
+    Prefers unit_price_eur / total_price_eur; falls back to raw unit_price /
+    total_price for items where the EUR conversion was not available.
+
+    low  = row with the minimum EUR (or raw) unit price
     last = row with the most recent quotation_date
     """
-    priced = [it for it in items if it.unit_price is not None]
+    def _eur_unit(it: HistoricalItem) -> Optional[Decimal]:
+        return it.unit_price_eur if it.unit_price_eur is not None else it.unit_price
+
+    def _eur_total(it: HistoricalItem) -> Optional[Decimal]:
+        return it.total_price_eur if it.total_price_eur is not None else it.total_price
+
+    priced = [it for it in items if _eur_unit(it) is not None]
     dated  = [it for it in items if it.quotation_date is not None]
 
     low_unit = low_total = last_unit = last_total = None
 
     if priced:
-        low_item  = min(priced, key=lambda it: it.unit_price)  # type: ignore[arg-type]
-        low_unit  = low_item.unit_price
-        low_total = low_item.total_price
+        low_item  = min(priced, key=_eur_unit)  # type: ignore[arg-type]
+        low_unit  = _eur_unit(low_item)
+        low_total = _eur_total(low_item)
 
     if dated:
         last_item  = max(dated, key=lambda it: it.quotation_date)  # type: ignore[arg-type]
-        last_unit  = last_item.unit_price
-        last_total = last_item.total_price
+        last_unit  = _eur_unit(last_item)
+        last_total = _eur_total(last_item)
 
     return low_unit, low_total, last_unit, last_total
 

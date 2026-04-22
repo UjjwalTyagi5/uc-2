@@ -88,6 +88,10 @@ class ExtractedItem(BaseModel):
     commodity_tag: Optional[str] = None
     item_summary:  Optional[str] = None
 
+    # ── EUR-normalised prices (populated by ExtractionWriter, not the LLM) ──
+    unit_price_eur:  Optional[Decimal] = None
+    total_price_eur: Optional[Decimal] = None
+
 
 class QuotationSource(BaseModel):
     """Identifies one quotation file to be processed.

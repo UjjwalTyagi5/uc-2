@@ -40,6 +40,8 @@ class AzureTables:
     EMBEDDED_ATTACHMENT_CLASSIFICATION = "[ras_procurement].[embedded_attachment_classification]"
     QUOTATION_EXTRACTED_ITEMS          = "[ras_procurement].[quotation_extracted_items]"
     BENCHMARK_RESULT                   = "[ras_procurement].[benchmark_result]"
+    CURRENCY_MST                       = "[ras_procurement].[currency_mst]"
+    EXCHANGE_RATE                      = "[ras_procurement].[EXCHANGE_RATE]"
 
     # ── BI dashboard ───────────────────────────────────────────────────────
     BI_DASHBOARD = "[ras_procurement].[vw_get_ras_data_for_bidashboard]"

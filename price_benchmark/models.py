@@ -20,6 +20,8 @@ class HistoricalItem:
     currency:        Optional[str]
     quotation_date:  Optional[date]
     supplier_name:   Optional[str]
+    unit_price_eur:  Optional[Decimal] = None
+    total_price_eur: Optional[Decimal] = None
 
 
 @dataclass

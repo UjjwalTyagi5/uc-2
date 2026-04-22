@@ -27,7 +27,9 @@ _FETCH_SQL = f"""
         qi.[unit],
         qi.[currency],
         qi.[quotation_date],
-        qi.[supplier_name]
+        qi.[supplier_name],
+        qi.[unit_price_eur],
+        qi.[total_price_eur]
     FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
     JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
       ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]

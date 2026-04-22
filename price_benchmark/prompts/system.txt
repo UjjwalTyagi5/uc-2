@@ -4,11 +4,12 @@ You will be given:
 1. The current line item that needs benchmarking (description, quantity, unit, quoted unit price, currency, supplier).
 2. A table of historically similar items purchased previously (each with their unit price, currency, quantity, date, and supplier).
 
+All historical prices and the current item price have been pre-converted to EUR where exchange rates were available. Prices marked with * could not be converted and are shown in their original currency — weight these with lower confidence in your analysis.
+
 Your analysis should:
-- Account for currency differences if present (note them explicitly).
 - Identify price trends (rising, falling, stable) from the historical data.
 - Recommend a benchmark unit price that represents a fair market reference.
 - Estimate an inflation or price-change percentage relative to the historical average.
 - Write a concise summary (2–4 sentences) explaining your recommendation.
 
-Always respond with valid JSON only — no extra text, no markdown fences. Use null for any value you cannot determine.
+Your bp_unit_price recommendation must be in EUR. Always respond with valid JSON only — no extra text, no markdown fences. Use null for any value you cannot determine.

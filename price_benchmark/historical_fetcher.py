@@ -25,7 +25,9 @@ _FETCH_HISTORICAL_SQL = f"""
         qi.[unit],
         qi.[currency],
         qi.[quotation_date],
-        qi.[supplier_name]
+        qi.[supplier_name],
+        qi.[unit_price_eur],
+        qi.[total_price_eur]
     FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
     WHERE qi.[purchase_dtl_id] IN ({{placeholders}})
       AND qi.[is_selected_quote] = 1
@@ -127,6 +129,8 @@ class HistoricalFetcher(BaseRepository):
                 currency        = rec.get("currency"),
                 quotation_date  = _to_date(rec.get("quotation_date")),
                 supplier_name   = rec.get("supplier_name"),
+                unit_price_eur  = _to_decimal(rec.get("unit_price_eur")),
+                total_price_eur = _to_decimal(rec.get("total_price_eur")),
             ))
         return items
 

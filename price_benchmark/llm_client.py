@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +38,7 @@ class BenchmarkLLMClient:
         self,
         row: dict,
         historical_items: list[HistoricalItem],
+        curr_unit_eur: Optional[Decimal] = None,
     ) -> dict:
         """Return LLM benchmark analysis for one selected line item.
 
@@ -53,7 +55,7 @@ class BenchmarkLLMClient:
             Keys: ``bp_unit_price`` (float|None), ``inflation_pct`` (float|None),
             ``summary`` (str).  Empty dict on parse failure.
         """
-        current_block    = _format_current_item(row)
+        current_block    = _format_current_item(row, curr_unit_eur)
         historical_block = _format_historical_table(historical_items)
 
         user_prompt = self._analysis_tmpl.format(
@@ -75,16 +77,25 @@ class BenchmarkLLMClient:
 
 # ── Formatting helpers ─────────────────────────────────────────────────────────
 
-def _format_current_item(row: dict) -> str:
+def _format_current_item(row: dict, curr_unit_eur: Optional[Decimal] = None) -> str:
+    raw_price = row.get("unit_price")
+    currency  = row.get("currency") or ""
+    if curr_unit_eur is not None and currency.upper() != "EUR":
+        price_str = f"{curr_unit_eur} EUR  (original: {raw_price} {currency})"
+    elif curr_unit_eur is not None:
+        price_str = f"{curr_unit_eur} EUR"
+    else:
+        price_str = f"{raw_price} {currency}"
+
     lines = [
-        f"- Item name       : {row.get('item_name') or 'N/A'}",
-        f"- Description     : {row.get('item_description') or 'N/A'}",
-        f"- Category        : {' > '.join(filter(None, [row.get(f'item_level_{i}') for i in range(1, 9)]))}",
-        f"- Commodity tag   : {row.get('commodity_tag') or 'N/A'}",
-        f"- Quantity        : {row.get('quantity')} {row.get('unit') or ''}",
-        f"- Quoted unit price: {row.get('unit_price')} {row.get('currency') or ''}",
-        f"- Supplier        : {row.get('supplier_name') or 'N/A'}",
-        f"- Quotation date  : {row.get('quotation_date') or 'N/A'}",
+        f"- Item name        : {row.get('item_name') or 'N/A'}",
+        f"- Description      : {row.get('item_description') or 'N/A'}",
+        f"- Category         : {' > '.join(filter(None, [row.get(f'item_level_{i}') for i in range(1, 9)]))}",
+        f"- Commodity tag    : {row.get('commodity_tag') or 'N/A'}",
+        f"- Quantity         : {row.get('quantity')} {row.get('unit') or ''}",
+        f"- Quoted unit price: {price_str}",
+        f"- Supplier         : {row.get('supplier_name') or 'N/A'}",
+        f"- Quotation date   : {row.get('quotation_date') or 'N/A'}",
     ]
     return "\n".join(lines)
 
@@ -93,20 +104,34 @@ def _format_historical_table(items: list[HistoricalItem]) -> str:
     if not items:
         return "No historical data available."
 
-    header = "| # | Supplier | Date | Qty | Unit | Unit Price | Currency |"
-    sep    = "|---|----------|------|-----|------|------------|----------|"
-    rows   = []
+    header = "| # | Supplier | Date | Qty | Unit | Unit Price (EUR) | Orig. Currency |"
+    sep    = "|---|----------|------|-----|------|-----------------|----------------|"
+    rows: list[str] = []
+    has_unconverted = False
+
     for i, it in enumerate(items, 1):
+        if it.unit_price_eur is not None:
+            eur_label = str(it.unit_price_eur)
+        elif it.unit_price is not None:
+            eur_label = f"{it.unit_price} *"
+            has_unconverted = True
+        else:
+            eur_label = "N/A"
+
         rows.append(
             f"| {i} "
             f"| {it.supplier_name or 'N/A'} "
             f"| {it.quotation_date or 'N/A'} "
             f"| {it.quantity or 'N/A'} "
             f"| {it.unit or 'N/A'} "
-            f"| {it.unit_price or 'N/A'} "
+            f"| {eur_label} "
             f"| {it.currency or 'N/A'} |"
         )
-    return "\n".join([header, sep] + rows)
+
+    result = "\n".join([header, sep] + rows)
+    if has_unconverted:
+        result += "\n* price shown in original currency — no EUR rate available"
+    return result
 
 
 def _parse_response(raw: str, dtl_id: Optional[int]) -> dict:
