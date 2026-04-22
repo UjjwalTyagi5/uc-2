@@ -11,7 +11,7 @@ from typing import Optional
 
 from loguru import logger
 
-from .config import EmbeddingConfig
+from utils.config import AppConfig
 from .embedding_client import EmbeddingClient
 from .pinecone_writer import PineconeWriter
 from .reader import EmbeddingItemReader
@@ -20,7 +20,7 @@ from .reader import EmbeddingItemReader
 def run_embedding(
     purchase_req_no: str,
     *,
-    config: Optional[EmbeddingConfig] = None,
+    config: Optional[AppConfig] = None,
 ) -> int:
     """Embed is_selected_quote=1 items for one PR and upsert to Pinecone.
 
@@ -43,7 +43,7 @@ def run_embedding(
         Number of vectors upserted.
     """
     if config is None:
-        config = EmbeddingConfig()
+        config = AppConfig()
 
     # 1. Fetch selected items (one per DTL_ID)
     reader = EmbeddingItemReader(config.get_azure_conn_str())

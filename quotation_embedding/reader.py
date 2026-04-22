@@ -18,6 +18,8 @@ _FETCH_SQL = f"""
         qi.[item_level_6],
         qi.[item_level_7],
         qi.[item_level_8],
+        qi.[item_name],
+        qi.[item_description],
         qi.[item_summary],
         prd.[C_DATETIME] AS [item_created_date]
     FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi

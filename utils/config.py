@@ -246,6 +246,16 @@ class AppConfig:
         self.PINECONE_API_KEY    = _optional("PINECONE_API_KEY",    "")
         self.PINECONE_INDEX_NAME = _optional("PINECONE_INDEX_NAME", "")
 
+        # ── Embedding tuning ───────────────────────────────────────────────
+        # Number of texts sent to the embeddings API in one request.
+        self.EMBEDDING_BATCH_SIZE  = int(_optional("EMBEDDING_BATCH_SIZE",  "100"))
+        # Number of vectors upserted to Pinecone in one request.
+        self.PINECONE_UPSERT_BATCH = int(_optional("PINECONE_UPSERT_BATCH", "100"))
+        # Number of nearest neighbours returned by Pinecone similarity search.
+        self.PINECONE_TOP_K        = int(_optional("PINECONE_TOP_K",        "10"))
+        # Minimum similarity score to include a match (0.0–1.0).
+        self.PINECONE_THRESHOLD    = float(_optional("PINECONE_THRESHOLD",  "0.75"))
+
         # ── Quotation extraction tuning ────────────────────────────────────
         self.MAX_PAGES            = int(_optional("EXTRACTION_MAX_PAGES",           "20"))
         self.LLM_TEMPERATURE      = float(_optional("EXTRACTION_LLM_TEMPERATURE",  "0"))
