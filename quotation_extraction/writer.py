@@ -7,6 +7,8 @@ bulk-insert via fast_executemany for better performance.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from loguru import logger
 
 from db.crud import BaseRepository
@@ -149,8 +151,11 @@ class ExtractionWriter(BaseRepository):
 
         converter = CurrencyConverter(self._conn_str)
         for item in items:
-            item.unit_price_eur  = converter.to_eur(item.unit_price,  item.currency, item.quotation_date)
-            item.total_price_eur = converter.to_eur(item.total_price, item.currency, item.quotation_date)
+            eur_unit  = converter.to_eur(item.unit_price,  item.currency, item.quotation_date)
+            eur_total = converter.to_eur(item.total_price, item.currency, item.quotation_date)
+            # Quantize to match DB column precision: DECIMAL(18,4) and DECIMAL(18,2)
+            item.unit_price_eur  = eur_unit.quantize(Decimal("0.0001"))  if eur_unit  is not None else None
+            item.total_price_eur = eur_total.quantize(Decimal("0.01"))   if eur_total is not None else None
 
         rows = [_item_to_row(item) for item in items]
         self._execute_many(_INSERT_SQL, rows)
