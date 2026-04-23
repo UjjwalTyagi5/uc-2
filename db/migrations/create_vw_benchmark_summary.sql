@@ -109,8 +109,8 @@ OUTER APPLY (
 ) proposals
 
 OUTER APPLY (
-    SELECT STRING_AGG(sub.[PURCHASE_REQ_NO], ', ')
-               WITHIN GROUP (ORDER BY sub.[PURCHASE_REQ_NO]) AS similar_purchase_req_nos
+    SELECT '[' + STRING_AGG('"' + sub.[PURCHASE_REQ_NO] + '"', ',')
+               WITHIN GROUP (ORDER BY sub.[PURCHASE_REQ_NO]) + ']' AS similar_purchase_req_nos
     FROM (
         SELECT DISTINCT prm2.[PURCHASE_REQ_NO]
         FROM OPENJSON(br.[similar_dtl_ids]) j
