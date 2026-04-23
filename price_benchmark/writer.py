@@ -15,31 +15,29 @@ _MERGE_SQL = f"""
       ON  target.[purchase_dtl_id] = src.[purchase_dtl_id]
     WHEN MATCHED THEN
         UPDATE SET
-            [bp_unit_price]        = ?,
-            [bp_total_price]       = ?,
-            [low_hist_unit_price]  = ?,
-            [low_hist_total_price] = ?,
-            [last_hist_unit_price] = ?,
-            [last_hist_total_price]= ?,
-            [inflation_pct]        = ?,
-            [similar_dtl_ids]      = ?,
-            [summary]              = ?,
-            [updated_at]           = SYSUTCDATETIME()
+            [bp_unit_price]       = ?,
+            [bp_total_price]      = ?,
+            [low_hist_item_fk]    = ?,
+            [last_hist_item_fk]   = ?,
+            [inflation_pct]       = ?,
+            [cpi_inflation_pct]   = ?,
+            [similar_dtl_ids]     = ?,
+            [summary]             = ?,
+            [updated_at]          = SYSUTCDATETIME()
     WHEN NOT MATCHED THEN
         INSERT (
             [extracted_item_uuid_fk],
             [purchase_dtl_id],
             [bp_unit_price],
             [bp_total_price],
-            [low_hist_unit_price],
-            [low_hist_total_price],
-            [last_hist_unit_price],
-            [last_hist_total_price],
+            [low_hist_item_fk],
+            [last_hist_item_fk],
             [inflation_pct],
+            [cpi_inflation_pct],
             [similar_dtl_ids],
             [summary]
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
 
@@ -59,11 +57,10 @@ class BenchmarkWriter(BaseRepository):
                 # WHEN MATCHED UPDATE
                 result.bp_unit_price,
                 result.bp_total_price,
-                result.low_hist_unit_price,
-                result.low_hist_total_price,
-                result.last_hist_unit_price,
-                result.last_hist_total_price,
+                result.low_hist_item_fk,
+                result.last_hist_item_fk,
                 result.inflation_pct,
+                result.cpi_inflation_pct,
                 result.similar_dtl_ids,
                 result.summary,
                 # WHEN NOT MATCHED INSERT
@@ -71,11 +68,10 @@ class BenchmarkWriter(BaseRepository):
                 result.purchase_dtl_id,
                 result.bp_unit_price,
                 result.bp_total_price,
-                result.low_hist_unit_price,
-                result.low_hist_total_price,
-                result.last_hist_unit_price,
-                result.last_hist_total_price,
+                result.low_hist_item_fk,
+                result.last_hist_item_fk,
                 result.inflation_pct,
+                result.cpi_inflation_pct,
                 result.similar_dtl_ids,
                 result.summary,
             )

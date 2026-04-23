@@ -19,6 +19,7 @@ from .models import HistoricalItem
 _FETCH_HISTORICAL_SQL = f"""
     SELECT
         qi.[purchase_dtl_id],
+        qi.[extracted_item_uuid_pk],
         qi.[unit_price],
         qi.[total_price],
         qi.[quantity],
@@ -26,9 +27,18 @@ _FETCH_HISTORICAL_SQL = f"""
         qi.[currency],
         qi.[quotation_date],
         qi.[supplier_name],
+        qi.[supplier_country],
         qi.[unit_price_eur],
-        qi.[total_price_eur]
+        qi.[total_price_eur],
+        rt.[purchase_req_no],
+        prm.[C_DATETIME] AS [pr_c_datetime]
     FROM {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+    JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+      ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+    JOIN {AzureTables.RAS_TRACKER} rt
+      ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+    LEFT JOIN {AzureTables.PURCHASE_REQ_MST} prm
+      ON rt.[purchase_req_no] = prm.[PURCHASE_REQ_NO]
     WHERE qi.[purchase_dtl_id] IN ({{placeholders}})
       AND qi.[is_selected_quote] = 1
 """
@@ -85,9 +95,23 @@ class HistoricalFetcher(BaseRepository):
         if not vectors:
             return []
 
+        # Filter to: not current PR + created before this item's creation date.
+        # item_created_date is stored in Pinecone metadata as ISO string; ISO strings
+        # compare correctly lexicographically so $lt works for date ordering.
+        pinecone_filter: dict = {"purchase_req_no": {"$ne": exclude_pr}}
+        item_created = row.get("item_created_date")
+        if item_created:
+            created_str = (
+                item_created.isoformat()
+                if hasattr(item_created, "isoformat")
+                else str(item_created)[:10]
+            )
+            if created_str:
+                pinecone_filter["item_created_date"] = {"$lt": created_str}
+
         matches = self._pinecone.query(
             vector=vectors[0],
-            filter={"purchase_req_no": {"$ne": exclude_pr}},
+            filter=pinecone_filter,
         )
         if not matches:
             logger.debug(
@@ -121,16 +145,20 @@ class HistoricalFetcher(BaseRepository):
         for row in rows:
             rec = dict(zip(cols, row))
             items.append(HistoricalItem(
-                purchase_dtl_id = int(rec["purchase_dtl_id"]),
-                unit_price      = _to_decimal(rec.get("unit_price")),
-                total_price     = _to_decimal(rec.get("total_price")),
-                quantity        = _to_decimal(rec.get("quantity")),
-                unit            = rec.get("unit"),
-                currency        = rec.get("currency"),
-                quotation_date  = _to_date(rec.get("quotation_date")),
-                supplier_name   = rec.get("supplier_name"),
-                unit_price_eur  = _to_decimal(rec.get("unit_price_eur")),
-                total_price_eur = _to_decimal(rec.get("total_price_eur")),
+                purchase_dtl_id        = int(rec["purchase_dtl_id"]),
+                extracted_item_uuid_pk = str(rec["extracted_item_uuid_pk"]) if rec.get("extracted_item_uuid_pk") else None,
+                unit_price             = _to_decimal(rec.get("unit_price")),
+                total_price            = _to_decimal(rec.get("total_price")),
+                quantity               = _to_decimal(rec.get("quantity")),
+                unit                   = rec.get("unit"),
+                currency               = rec.get("currency"),
+                quotation_date         = _to_date(rec.get("quotation_date")),
+                supplier_name          = rec.get("supplier_name"),
+                supplier_country       = rec.get("supplier_country"),
+                unit_price_eur         = _to_decimal(rec.get("unit_price_eur")),
+                total_price_eur        = _to_decimal(rec.get("total_price_eur")),
+                purchase_req_no        = rec.get("purchase_req_no"),
+                pr_c_datetime          = _to_date(rec.get("pr_c_datetime")),
             ))
         return items
 

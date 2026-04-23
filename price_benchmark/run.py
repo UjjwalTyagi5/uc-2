@@ -21,6 +21,8 @@ from loguru import logger
 from pipeline.tracker import PipelineTracker
 from utils.config import AppConfig
 
+from utils.cpi_inflation import compute_cpi_inflation_pct
+
 from .historical_fetcher import HistoricalFetcher
 from .llm_client import BenchmarkLLMClient
 from .models import BenchmarkResult, HistoricalItem
@@ -87,7 +89,24 @@ def run_benchmark(
 
         historical = fetcher.fetch(row, exclude_pr=purchase_req_no)
 
-        low_unit, low_total, last_unit, last_total = _compute_low_last(historical)
+        low_item, last_item = _compute_low_last(historical)
+
+        low_uuid  = low_item.extracted_item_uuid_pk  if low_item  else None
+        last_uuid = last_item.extracted_item_uuid_pk if last_item else None
+
+        # CPI inflation: from low_hist PR's C_DATETIME to current PR's C_DATETIME
+        cpi_pct: Optional[Decimal] = None
+        if low_item and low_item.pr_c_datetime:
+            current_pr_dt = row.get("pr_c_datetime")
+            if current_pr_dt:
+                end_year   = current_pr_dt.year if hasattr(current_pr_dt, "year") else None
+                start_year = low_item.pr_c_datetime.year
+                if end_year and start_year != end_year:
+                    raw_cpi = compute_cpi_inflation_pct(
+                        low_item.supplier_country, start_year, end_year
+                    )
+                    if raw_cpi is not None:
+                        cpi_pct = _to_decimal(raw_cpi)
 
         curr_unit_eur = _to_decimal(row.get("unit_price_eur"))
         llm_out = llm.analyze(row, historical, curr_unit_eur=curr_unit_eur)
@@ -106,11 +125,10 @@ def run_benchmark(
             purchase_dtl_id        = int(dtl_id),
             bp_unit_price          = bp_unit,
             bp_total_price         = bp_total,
-            low_hist_unit_price    = low_unit,
-            low_hist_total_price   = low_total,
-            last_hist_unit_price   = last_unit,
-            last_hist_total_price  = last_total,
+            low_hist_item_fk       = low_uuid,
+            last_hist_item_fk      = last_uuid,
             inflation_pct          = infl,
+            cpi_inflation_pct      = cpi_pct,
             similar_dtl_ids        = similar_ids,
             summary                = summary or None,
         ))
@@ -187,40 +205,24 @@ def run_all_pending(
 
 def _compute_low_last(
     items: list[HistoricalItem],
-) -> tuple[
-    Optional[Decimal], Optional[Decimal],
-    Optional[Decimal], Optional[Decimal],
-]:
-    """Return (low_unit, low_total, last_unit, last_total) in EUR where available.
+) -> tuple[Optional[HistoricalItem], Optional[HistoricalItem]]:
+    """Return (low_item, last_item) — cheapest and most-recent historical items.
 
-    Prefers unit_price_eur / total_price_eur; falls back to raw unit_price /
-    total_price for items where the EUR conversion was not available.
+    low  = item with the minimum EUR unit price (falls back to raw when EUR is None)
+    last = item with the most recent quotation_date
 
-    low  = row with the minimum EUR (or raw) unit price
-    last = row with the most recent quotation_date
+    Returns (None, None) when no usable items are available.
     """
     def _eur_unit(it: HistoricalItem) -> Optional[Decimal]:
         return it.unit_price_eur if it.unit_price_eur is not None else it.unit_price
 
-    def _eur_total(it: HistoricalItem) -> Optional[Decimal]:
-        return it.total_price_eur if it.total_price_eur is not None else it.total_price
-
     priced = [it for it in items if _eur_unit(it) is not None]
     dated  = [it for it in items if it.quotation_date is not None]
 
-    low_unit = low_total = last_unit = last_total = None
+    low_item  = min(priced, key=_eur_unit) if priced else None  # type: ignore[arg-type]
+    last_item = max(dated,  key=lambda it: it.quotation_date) if dated else None  # type: ignore[arg-type]
 
-    if priced:
-        low_item  = min(priced, key=_eur_unit)  # type: ignore[arg-type]
-        low_unit  = _eur_unit(low_item)
-        low_total = _eur_total(low_item)
-
-    if dated:
-        last_item  = max(dated, key=lambda it: it.quotation_date)  # type: ignore[arg-type]
-        last_unit  = _eur_unit(last_item)
-        last_total = _eur_total(last_item)
-
-    return low_unit, low_total, last_unit, last_total
+    return low_item, last_item
 
 
 def _to_decimal(value: object) -> Optional[Decimal]:
