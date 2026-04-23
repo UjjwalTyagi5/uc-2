@@ -56,7 +56,11 @@ SELECT
     proposals.l2_unit_price_eur,
     proposals.l2_currency,
     proposals.l2_supplier_name,
-    proposals.l2_supplier_country
+    proposals.l2_supplier_country,
+
+    -- Similar items from Pinecone
+    br.[similar_dtl_ids],
+    sim.[similar_purchase_req_nos]
 
 FROM [ras_procurement].[benchmark_result] br
 
@@ -102,4 +106,17 @@ OUTER APPLY (
           AND (p.[is_selected_quote] = 0 OR p.[is_selected_quote] IS NULL)
           AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
     ) p
-) proposals;
+) proposals
+
+OUTER APPLY (
+    SELECT STRING_AGG(sub.[PURCHASE_REQ_NO], ', ')
+               WITHIN GROUP (ORDER BY sub.[PURCHASE_REQ_NO]) AS similar_purchase_req_nos
+    FROM (
+        SELECT DISTINCT prm2.[PURCHASE_REQ_NO]
+        FROM OPENJSON(br.[similar_dtl_ids]) j
+        JOIN [ras_procurement].[purchase_req_detail] prd2
+          ON prd2.[PURCHASE_DTL_ID] = CAST(j.[value] AS INT)
+        JOIN [ras_procurement].[purchase_req_mst] prm2
+          ON prm2.[PURCHASE_REQ_ID] = prd2.[PURCHASE_REQ_ID]
+    ) sub
+) sim;
