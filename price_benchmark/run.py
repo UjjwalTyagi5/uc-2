@@ -97,26 +97,26 @@ def run_benchmark(
         # CPI inflation: from low_hist PR's C_DATETIME to current PR's C_DATETIME
         cpi_pct: Optional[Decimal] = None
         if not low_item:
-            logger.debug("dtl_id={}: CPI skipped — no low_hist item", dtl_id)
+            logger.info("dtl_id={}: CPI skipped — no low_hist item", dtl_id)
         elif not low_item.pr_c_datetime:
-            logger.debug("dtl_id={}: CPI skipped — low_hist pr_c_datetime is None (PR={})",
-                         dtl_id, low_item.purchase_req_no)
+            logger.info("dtl_id={}: CPI skipped — low_hist pr_c_datetime is None (low_hist PR={})",
+                        dtl_id, low_item.purchase_req_no)
         else:
             current_pr_dt = row.get("pr_c_datetime")
             if not current_pr_dt:
-                logger.debug("dtl_id={}: CPI skipped — current pr_c_datetime is None", dtl_id)
+                logger.info("dtl_id={}: CPI skipped — current PR pr_c_datetime is None", dtl_id)
             else:
                 start_year = low_item.pr_c_datetime.year
                 end_year   = current_pr_dt.year if hasattr(current_pr_dt, "year") else None
                 if not end_year:
-                    logger.debug("dtl_id={}: CPI skipped — could not read end_year from {!r}",
-                                 dtl_id, current_pr_dt)
+                    logger.info("dtl_id={}: CPI skipped — could not read end_year from {!r}",
+                                dtl_id, current_pr_dt)
                 elif start_year == end_year:
-                    logger.debug("dtl_id={}: CPI skipped — same year ({}) for both PRs",
-                                 dtl_id, start_year)
+                    logger.info("dtl_id={}: CPI skipped — same year ({}) for both PRs",
+                                dtl_id, start_year)
                 else:
-                    logger.debug(
-                        "dtl_id={}: CPI calc start={} end={} country={!r}",
+                    logger.info(
+                        "dtl_id={}: CPI calc start_year={} end_year={} country={!r}",
                         dtl_id, start_year, end_year, low_item.supplier_country,
                     )
                     raw_cpi = compute_cpi_inflation_pct(
@@ -124,8 +124,9 @@ def run_benchmark(
                     )
                     if raw_cpi is not None:
                         cpi_pct = _to_decimal(raw_cpi)
+                        logger.info("dtl_id={}: CPI inflation = {}%", dtl_id, raw_cpi)
                     else:
-                        logger.debug(
+                        logger.info(
                             "dtl_id={}: CPI returned None for country={!r} {}-{}",
                             dtl_id, low_item.supplier_country, start_year, end_year,
                         )
