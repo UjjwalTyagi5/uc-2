@@ -117,8 +117,7 @@ def run_benchmark(
                         dtl_id, start_year, end_year, low_item.supplier_country,
                     )
                     raw_cpi = compute_cpi_inflation_pct(
-                        low_item.supplier_country, start_year, end_year,
-                        conn_str=conn_str,
+                        low_item.supplier_country, start_year, end_year
                     )
                     if raw_cpi is not None:
                         cpi_pct = _to_decimal(raw_cpi)

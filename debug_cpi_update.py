@@ -159,7 +159,7 @@ def main(uuid: str) -> None:
         print(f"\n[STOP] start_year ({start_year}) > end_year ({end_year}) — invalid range.")
         return
 
-    cpi_pct = compute_cpi_inflation_pct(supplier_country, start_year, end_year, conn_str=conn_str)
+    cpi_pct = compute_cpi_inflation_pct(supplier_country, start_year, end_year)
     print(f"\n[STEP 5] compute_cpi_inflation_pct result = {cpi_pct}")
 
     if cpi_pct is None:
