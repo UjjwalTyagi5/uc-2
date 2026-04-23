@@ -95,23 +95,12 @@ class HistoricalFetcher(BaseRepository):
         if not vectors:
             return []
 
-        # Filter to: not current PR + created before this item's creation date.
-        # item_created_date is stored in Pinecone metadata as ISO string; ISO strings
-        # compare correctly lexicographically so $lt works for date ordering.
-        pinecone_filter: dict = {"purchase_req_no": {"$ne": exclude_pr}}
-        item_created = row.get("item_created_date")
-        if item_created:
-            created_str = (
-                item_created.isoformat()
-                if hasattr(item_created, "isoformat")
-                else str(item_created)[:10]
-            )
-            if created_str:
-                pinecone_filter["item_created_date"] = {"$lt": created_str}
-
+        # Pinecone filter: exclude current PR only.
+        # Date filtering is done in Python after the query because Pinecone's
+        # $lt/$gt operators only accept numbers, not ISO date strings.
         matches = self._pinecone.query(
             vector=vectors[0],
-            filter=pinecone_filter,
+            filter={"purchase_req_no": {"$ne": exclude_pr}},
         )
         if not matches:
             logger.debug(
@@ -119,6 +108,22 @@ class HistoricalFetcher(BaseRepository):
                 row.get("purchase_dtl_id"),
             )
             return []
+
+        # Post-filter: keep only items created strictly before this item.
+        # item_created_date stored as ISO string in metadata; ISO strings compare
+        # correctly lexicographically so plain string < works for date ordering.
+        item_created = row.get("item_created_date")
+        if item_created:
+            cutoff = (
+                item_created.isoformat()
+                if hasattr(item_created, "isoformat")
+                else str(item_created)
+            )
+            matches = [
+                m for m in matches
+                if m.get("metadata", {}).get("item_created_date", "") not in ("", None)
+                and m["metadata"]["item_created_date"] < cutoff
+            ]
 
         dtl_ids = [
             int(m["metadata"]["purchase_dtl_id"])
