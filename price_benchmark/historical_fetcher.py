@@ -37,8 +37,10 @@ _FETCH_HISTORICAL_SQL = f"""
       ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
     JOIN {AzureTables.RAS_TRACKER} rt
       ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+    LEFT JOIN {AzureTables.PURCHASE_REQ_DETAIL} prd
+      ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
     LEFT JOIN {AzureTables.PURCHASE_REQ_MST} prm
-      ON rt.[purchase_req_no] = prm.[PURCHASE_REQ_NO]
+      ON prd.[PURCHASE_REQ_ID] = prm.[PURCHASE_REQ_ID]
     WHERE qi.[purchase_dtl_id] IN ({{placeholders}})
       AND qi.[is_selected_quote] = 1
 """
