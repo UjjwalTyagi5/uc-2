@@ -68,6 +68,13 @@ ranked AS (
 SELECT
     [purchase_req_no],
 
+    -- presence flags
+    CAST(MAX(CASE WHEN [doc_type] = 'MPBC'              THEN 1 ELSE 0 END) AS BIT) AS is_mpbc,
+    CAST(MAX(CASE WHEN [doc_type] = 'RFQ'               THEN 1 ELSE 0 END) AS BIT) AS is_rfq,
+    CAST(MAX(CASE WHEN [doc_type] = 'BER'               THEN 1 ELSE 0 END) AS BIT) AS is_ber,
+    CAST(MAX(CASE WHEN [doc_type] = 'E-Auction Results' THEN 1 ELSE 0 END) AS BIT) AS is_eauction,
+    CAST(MAX(CASE WHEN [doc_type] = 'Quotation'         THEN 1 ELSE 0 END) AS BIT) AS is_quotation,
+
     -- MPBC
     MAX(CASE WHEN [doc_type] = 'MPBC' AND rn = 1 THEN [file_name]           END) AS mpbc_file_name,
     MAX(CASE WHEN [doc_type] = 'MPBC' AND rn = 1 THEN [classification_conf] END) AS mpbc_conf,
