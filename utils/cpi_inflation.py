@@ -32,7 +32,7 @@ except ImportError:
     )
 
 _WB_URL = "https://api.worldbank.org/v2/country/{code}/indicator/FP.CPI.TOTL.ZG"
-_REQUEST_TIMEOUT = 10   # seconds
+_REQUEST_TIMEOUT = 30   # seconds
 
 
 # ── Country resolution ─────────────────────────────────────────────────────────
