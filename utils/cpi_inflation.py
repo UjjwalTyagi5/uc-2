@@ -122,13 +122,22 @@ def compute_cpi_inflation_pct(
     if start_year >= end_year:
         return None
 
+    if not _DEPS_OK:
+        logger.debug("CPI: pycountry/rapidfuzz not installed — returning None")
+        return None
+
+    if not country_str:
+        logger.debug("CPI: country_str is None/empty — returning None")
+        return None
+
     code = resolve_country_code(country_str)
     if not code:
-        logger.debug("CPI: could not resolve country={!r} — skipping", country_str)
+        logger.debug("CPI: could not resolve country={!r} — returning None", country_str)
         return None
 
     rates = _fetch_cpi_rates(code, start_year, end_year)
     if not rates:
+        logger.debug("CPI: no World Bank data for country={!r} {}-{}", code, start_year, end_year)
         return None
 
     factor = 1.0
