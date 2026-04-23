@@ -26,3 +26,15 @@ ALTER TABLE [ras_procurement].[benchmark_result]
     ADD [low_hist_item_fk]  UNIQUEIDENTIFIER NULL,
         [last_hist_item_fk] UNIQUEIDENTIFIER NULL,
         [cpi_inflation_pct] DECIMAL(10, 4)   NULL;
+
+-- Step 3: add FK constraints so every non-NULL low/last reference
+--         must exist in quotation_extracted_items
+ALTER TABLE [ras_procurement].[benchmark_result]
+    ADD CONSTRAINT [FK_benchmark_result_low_hist_item]
+        FOREIGN KEY ([low_hist_item_fk])
+        REFERENCES [ras_procurement].[quotation_extracted_items] ([extracted_item_uuid_pk]);
+
+ALTER TABLE [ras_procurement].[benchmark_result]
+    ADD CONSTRAINT [FK_benchmark_result_last_hist_item]
+        FOREIGN KEY ([last_hist_item_fk])
+        REFERENCES [ras_procurement].[quotation_extracted_items] ([extracted_item_uuid_pk]);
