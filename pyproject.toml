@@ -33,5 +33,9 @@ dependencies = [
     "structlog>=24.0.0",
     "tabulate>=0.9.0",
     "pinecone>=3.0.0",
+    # price_benchmark CPI inflation dependencies
+    "pycountry>=23.12.11",
+    "rapidfuzz>=3.0.0",
+    "requests>=2.31.0",
 ]
 
