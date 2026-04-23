@@ -119,8 +119,10 @@ def compute_cpi_inflation_pct(
         Cumulative percentage change, e.g. 12.34 means prices rose 12.34%.
         None when country is unresolvable, no WB data exists, or start >= end.
     """
-    if start_year >= end_year:
+    if start_year > end_year:
         return None
+    if start_year == end_year:
+        return 0.0
 
     if not _DEPS_OK:
         logger.warning("CPI: pycountry/rapidfuzz not installed — run: pip install pycountry rapidfuzz")

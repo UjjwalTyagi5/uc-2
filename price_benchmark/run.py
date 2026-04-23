@@ -111,9 +111,6 @@ def run_benchmark(
                 if not end_year:
                     logger.info("dtl_id={}: CPI skipped — could not read end_year from {!r}",
                                 dtl_id, current_pr_dt)
-                elif start_year == end_year:
-                    logger.info("dtl_id={}: CPI skipped — same year ({}) for both PRs",
-                                dtl_id, start_year)
                 else:
                     logger.info(
                         "dtl_id={}: CPI calc start_year={} end_year={} country={!r}",

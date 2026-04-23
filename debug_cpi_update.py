@@ -155,8 +155,8 @@ def main(uuid: str) -> None:
     print(f"         start_year   = {start_year}  (low_hist PR)")
     print(f"         end_year     = {end_year}    (current PR)")
 
-    if start_year >= end_year:
-        print(f"\n[STOP] start_year ({start_year}) >= end_year ({end_year}) — same year, no CPI span.")
+    if start_year > end_year:
+        print(f"\n[STOP] start_year ({start_year}) > end_year ({end_year}) — invalid range.")
         return
 
     cpi_pct = compute_cpi_inflation_pct(supplier_country, start_year, end_year)
