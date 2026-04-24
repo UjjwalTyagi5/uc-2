@@ -24,6 +24,8 @@ SELECT
     qi.[commodity_tag],
     qi.[unit_price]         AS primary_unit_price,
     qi.[unit_price_eur]     AS primary_unit_price_eur,
+    qi.[total_price]        AS primary_total_price,
+    qi.[total_price_eur]    AS primary_total_price_eur,
     qi.[currency]           AS primary_currency,
     qi.[supplier_name]      AS primary_supplier_name,
     qi.[supplier_country]   AS primary_supplier_country,
