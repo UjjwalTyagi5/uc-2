@@ -49,6 +49,8 @@ SELECT
     -- L1 = lowest-priced proposal for this line item (is_selected_quote = 0 or NULL)
     proposals.l1_unit_price,
     proposals.l1_unit_price_eur,
+    proposals.l1_total_price,
+    proposals.l1_total_price_eur,
     proposals.l1_currency,
     proposals.l1_supplier_name,
     proposals.l1_supplier_country,
@@ -56,6 +58,8 @@ SELECT
     -- L2 = second lowest-priced proposal for this line item
     proposals.l2_unit_price,
     proposals.l2_unit_price_eur,
+    proposals.l2_total_price,
+    proposals.l2_total_price_eur,
     proposals.l2_currency,
     proposals.l2_supplier_name,
     proposals.l2_supplier_country,
@@ -85,11 +89,15 @@ OUTER APPLY (
     SELECT
         MAX(CASE WHEN rn = 1 THEN p.unit_price       END) AS l1_unit_price,
         MAX(CASE WHEN rn = 1 THEN p.unit_price_eur   END) AS l1_unit_price_eur,
+        MAX(CASE WHEN rn = 1 THEN p.total_price      END) AS l1_total_price,
+        MAX(CASE WHEN rn = 1 THEN p.total_price_eur  END) AS l1_total_price_eur,
         MAX(CASE WHEN rn = 1 THEN p.currency         END) AS l1_currency,
         MAX(CASE WHEN rn = 1 THEN p.supplier_name    END) AS l1_supplier_name,
         MAX(CASE WHEN rn = 1 THEN p.supplier_country END) AS l1_supplier_country,
         MAX(CASE WHEN rn = 2 THEN p.unit_price       END) AS l2_unit_price,
         MAX(CASE WHEN rn = 2 THEN p.unit_price_eur   END) AS l2_unit_price_eur,
+        MAX(CASE WHEN rn = 2 THEN p.total_price      END) AS l2_total_price,
+        MAX(CASE WHEN rn = 2 THEN p.total_price_eur  END) AS l2_total_price_eur,
         MAX(CASE WHEN rn = 2 THEN p.currency         END) AS l2_currency,
         MAX(CASE WHEN rn = 2 THEN p.supplier_name    END) AS l2_supplier_name,
         MAX(CASE WHEN rn = 2 THEN p.supplier_country END) AS l2_supplier_country
@@ -97,6 +105,8 @@ OUTER APPLY (
         SELECT
             p.[unit_price],
             p.[unit_price_eur],
+            p.[total_price],
+            p.[total_price_eur],
             p.[currency],
             p.[supplier_name],
             p.[supplier_country],
