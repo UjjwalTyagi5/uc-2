@@ -137,6 +137,36 @@ class AttachmentClassificationRepository:
 
     _CLEANUP_SP_SQL = "EXEC [ras_procurement].[usp_cleanup_pr_data] ?"
 
+    # NULL out low_hist_item_fk on OTHER PRs' benchmark rows that reference
+    # this PR's quotation items — must run before deleting those items.
+    _NULL_LOW_HIST_FK_SQL = f"""
+        UPDATE br
+           SET br.[low_hist_item_fk] = NULL
+          FROM {AzureTables.BENCHMARK_RESULT} br
+          JOIN {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+            ON br.[low_hist_item_fk] = qi.[extracted_item_uuid_pk]
+          JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN {AzureTables.RAS_TRACKER} rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE rt.[purchase_req_no] = ?
+    """
+
+    # NULL out last_hist_item_fk on OTHER PRs' benchmark rows that reference
+    # this PR's quotation items — must run before deleting those items.
+    _NULL_LAST_HIST_FK_SQL = f"""
+        UPDATE br
+           SET br.[last_hist_item_fk] = NULL
+          FROM {AzureTables.BENCHMARK_RESULT} br
+          JOIN {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+            ON br.[last_hist_item_fk] = qi.[extracted_item_uuid_pk]
+          JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN {AzureTables.RAS_TRACKER} rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE rt.[purchase_req_no] = ?
+    """
+
     # Must run before _DELETE_QUOTATION_ITEMS_SQL — benchmark_result has a FK
     # to quotation_extracted_items, so child rows must be removed first.
     _DELETE_BENCHMARK_RESULTS_SQL = f"""
@@ -219,6 +249,8 @@ class AttachmentClassificationRepository:
             conn = self._connect()
             try:
                 cursor = conn.cursor()
+                cursor.execute(self._NULL_LOW_HIST_FK_SQL, purchase_req_no)
+                cursor.execute(self._NULL_LAST_HIST_FK_SQL, purchase_req_no)
                 cursor.execute(self._DELETE_BENCHMARK_RESULTS_SQL, purchase_req_no)
                 deleted_br = cursor.rowcount
                 cursor.execute(self._DELETE_QUOTATION_ITEMS_SQL, purchase_req_no)
