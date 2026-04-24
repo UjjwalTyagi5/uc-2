@@ -13,6 +13,13 @@ SELECT
     br.[extracted_item_uuid_fk],
     br.[purchase_dtl_id],
     prm.[PURCHASE_REQ_NO],
+
+    -- PR / line-item context
+    prd.[ITEMDESCRIPTION]        AS item_description,
+    prd.[Insourcing_flag]        AS insourcing_flag,
+    prm.[JUSTIFICATION]          AS justification,
+    prm.[LAST_APPROVED_COMMENTS] AS last_approved_comments,
+
     br.[bp_unit_price]    AS recommended_unit_price,
     br.[bp_total_price]   AS recommended_total_price,
     br.[inflation_pct]    AS recommended_inflation_pct,
@@ -27,6 +34,7 @@ SELECT
     qi.[total_price]        AS primary_total_price,
     qi.[total_price_eur]    AS primary_total_price_eur,
     qi.[currency]           AS primary_currency,
+    qi.[payment_terms]      AS primary_payment_terms,
     qi.[supplier_name]      AS primary_supplier_name,
     qi.[supplier_country]   AS primary_supplier_country,
     qi.[quotation_date]     AS primary_quotation_date,
@@ -52,6 +60,7 @@ SELECT
     proposals.l1_total_price,
     proposals.l1_total_price_eur,
     proposals.l1_currency,
+    proposals.l1_payment_terms,
     proposals.l1_supplier_name,
     proposals.l1_supplier_country,
 
@@ -61,6 +70,7 @@ SELECT
     proposals.l2_total_price,
     proposals.l2_total_price_eur,
     proposals.l2_currency,
+    proposals.l2_payment_terms,
     proposals.l2_supplier_name,
     proposals.l2_supplier_country,
 
@@ -87,19 +97,21 @@ LEFT JOIN [ras_procurement].[quotation_extracted_items] lst
 
 OUTER APPLY (
     SELECT
-        MAX(CASE WHEN rn = 1 THEN p.unit_price       END) AS l1_unit_price,
-        MAX(CASE WHEN rn = 1 THEN p.unit_price_eur   END) AS l1_unit_price_eur,
-        MAX(CASE WHEN rn = 1 THEN p.total_price      END) AS l1_total_price,
-        MAX(CASE WHEN rn = 1 THEN p.total_price_eur  END) AS l1_total_price_eur,
-        MAX(CASE WHEN rn = 1 THEN p.currency         END) AS l1_currency,
-        MAX(CASE WHEN rn = 1 THEN p.supplier_name    END) AS l1_supplier_name,
+        MAX(CASE WHEN rn = 1 THEN p.unit_price      END) AS l1_unit_price,
+        MAX(CASE WHEN rn = 1 THEN p.unit_price_eur  END) AS l1_unit_price_eur,
+        MAX(CASE WHEN rn = 1 THEN p.total_price     END) AS l1_total_price,
+        MAX(CASE WHEN rn = 1 THEN p.total_price_eur END) AS l1_total_price_eur,
+        MAX(CASE WHEN rn = 1 THEN p.currency        END) AS l1_currency,
+        MAX(CASE WHEN rn = 1 THEN p.payment_terms   END) AS l1_payment_terms,
+        MAX(CASE WHEN rn = 1 THEN p.supplier_name   END) AS l1_supplier_name,
         MAX(CASE WHEN rn = 1 THEN p.supplier_country END) AS l1_supplier_country,
-        MAX(CASE WHEN rn = 2 THEN p.unit_price       END) AS l2_unit_price,
-        MAX(CASE WHEN rn = 2 THEN p.unit_price_eur   END) AS l2_unit_price_eur,
-        MAX(CASE WHEN rn = 2 THEN p.total_price      END) AS l2_total_price,
-        MAX(CASE WHEN rn = 2 THEN p.total_price_eur  END) AS l2_total_price_eur,
-        MAX(CASE WHEN rn = 2 THEN p.currency         END) AS l2_currency,
-        MAX(CASE WHEN rn = 2 THEN p.supplier_name    END) AS l2_supplier_name,
+        MAX(CASE WHEN rn = 2 THEN p.unit_price      END) AS l2_unit_price,
+        MAX(CASE WHEN rn = 2 THEN p.unit_price_eur  END) AS l2_unit_price_eur,
+        MAX(CASE WHEN rn = 2 THEN p.total_price     END) AS l2_total_price,
+        MAX(CASE WHEN rn = 2 THEN p.total_price_eur END) AS l2_total_price_eur,
+        MAX(CASE WHEN rn = 2 THEN p.currency        END) AS l2_currency,
+        MAX(CASE WHEN rn = 2 THEN p.payment_terms   END) AS l2_payment_terms,
+        MAX(CASE WHEN rn = 2 THEN p.supplier_name   END) AS l2_supplier_name,
         MAX(CASE WHEN rn = 2 THEN p.supplier_country END) AS l2_supplier_country
     FROM (
         SELECT
@@ -108,6 +120,7 @@ OUTER APPLY (
             p.[total_price],
             p.[total_price_eur],
             p.[currency],
+            p.[payment_terms],
             p.[supplier_name],
             p.[supplier_country],
             ROW_NUMBER() OVER (
