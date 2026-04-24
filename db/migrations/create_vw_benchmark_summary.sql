@@ -74,6 +74,10 @@ SELECT
     proposals.l2_supplier_name,
     proposals.l2_supplier_country,
 
+    -- Quotation statistics
+    quot_stats.[total_quotations],
+    quot_stats.[supplier_names],
+
     -- Similar items from Pinecone
     br.[similar_dtl_ids],
     sim.[similar_purchase_req_nos]
@@ -132,6 +136,19 @@ OUTER APPLY (
           AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
     ) p
 ) proposals
+
+OUTER APPLY (
+    SELECT
+        COUNT(*)                                                             AS total_quotations,
+        '[' + STRING_AGG('"' + s.[supplier_name] + '"', ',')
+              WITHIN GROUP (ORDER BY s.[supplier_name]) + ']'               AS supplier_names
+    FROM (
+        SELECT DISTINCT [supplier_name]
+        FROM [ras_procurement].[quotation_extracted_items]
+        WHERE [purchase_dtl_id] = br.[purchase_dtl_id]
+          AND [supplier_name]   IS NOT NULL
+    ) s
+) quot_stats
 
 OUTER APPLY (
     SELECT '[' + STRING_AGG('"' + sub.[PURCHASE_REQ_NO] + '"', ',')
