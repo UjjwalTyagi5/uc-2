@@ -205,22 +205,29 @@ def _read_pr_nos_from_excel(
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
-_CHECK_MST_SQL = f"SELECT 1 FROM {AzureTables.PURCHASE_REQ_MST} WHERE [PURCHASE_REQ_NO] = ?"
+_FETCH_STATUS_SQL = (
+    f"SELECT [PURCHASEFINALAPPROVALSTATUS] "
+    f"FROM {AzureTables.PURCHASE_REQ_MST} "
+    f"WHERE [PURCHASE_REQ_NO] = ?"
+)
 
 
-def _pr_exists_in_mst(pr_no: str, conn_str: str) -> bool:
-    """Return True if the PR exists in purchase_req_mst, False otherwise."""
+def _get_pr_approval_status(pr_no: str, conn_str: str) -> str | None:
+    """Return PURCHASEFINALAPPROVALSTATUS for the PR, or None if not found."""
     try:
         conn = connect_with_retry(conn_str, autocommit=True)
         try:
             cursor = conn.cursor()
-            cursor.execute(_CHECK_MST_SQL, pr_no)
-            return cursor.fetchone() is not None
+            cursor.execute(_FETCH_STATUS_SQL, pr_no)
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return str(row[0]).strip() if row[0] is not None else ""
         finally:
             conn.close()
     except Exception as exc:
-        logger.warning(f"Could not verify PR={pr_no!r} in purchase_req_mst: {exc}")
-        return False
+        logger.warning(f"Could not fetch status for PR={pr_no!r} from purchase_req_mst: {exc}")
+        return None
 
 
 # ── DB smoke-test ──────────────────────────────────────────────────────────────
@@ -280,11 +287,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
+        default=None,
         metavar="N",
         help=(
-            "Number of PRs to process in parallel (default: 1 — sequential). "
-            "Set to 3–5 for I/O-bound workloads; each worker opens its own DB connections."
+            "Number of PRs to process in parallel. "
+            "Defaults to EXCEL_PIPELINE_WORKERS from .env (default 3). "
+            "Each worker opens its own DB connections."
         ),
     )
     return parser
@@ -317,10 +325,19 @@ def main() -> None:
     )
 
     # ── Run pipeline for each PR ───────────────────────────────────────────
-    orchestrator  = PipelineOrchestrator(config)
-    azure_conn_str = config.get_azure_conn_str()
-    workers        = max(1, args.workers)
-    total          = len(pr_nos)
+    orchestrator       = PipelineOrchestrator(config)
+    azure_conn_str     = config.get_azure_conn_str()
+    allowed_statuses   = config.EXCEL_ALLOWED_APPROVAL_STATUSES  # list[str], may be empty
+    workers            = max(1, args.workers if args.workers is not None else config.EXCEL_PIPELINE_WORKERS)
+    total              = len(pr_nos)
+
+    if allowed_statuses:
+        logger.info(
+            f"Approval-status filter active — only processing PRs with "
+            f"PURCHASEFINALAPPROVALSTATUS in: {allowed_statuses}"
+        )
+    else:
+        logger.info("No approval-status filter configured — processing all PRs from Excel")
 
     succeeded = 0
     failed    = 0
@@ -328,9 +345,18 @@ def main() -> None:
 
     def _process_one(pr_no: str, idx: int) -> str:
         """Run one PR through the full pipeline. Returns 'ok', 'failed', or 'skipped'."""
-        if not _pr_exists_in_mst(pr_no, azure_conn_str):
+        status = _get_pr_approval_status(pr_no, azure_conn_str)
+
+        if status is None:
             logger.warning(
                 f"[{idx}/{total}] PR={pr_no!r} not found in purchase_req_mst — skipping"
+            )
+            return "skipped"
+
+        if allowed_statuses and status.upper() not in allowed_statuses:
+            logger.warning(
+                f"[{idx}/{total}] PR={pr_no!r} skipped — "
+                f"PURCHASEFINALAPPROVALSTATUS={status!r} not in allowed list"
             )
             return "skipped"
 
@@ -403,7 +429,7 @@ def main() -> None:
     logger.info(f"  Total PRs  : {total}")
     logger.info(f"  Succeeded  : {succeeded}")
     logger.info(f"  Failed     : {failed}")
-    logger.info(f"  Skipped    : {skipped}  (not found in purchase_req_mst)")
+    logger.info(f"  Skipped    : {skipped}  (not found in purchase_req_mst, or status not in allowed list)")
     logger.info("=" * 60)
 
     sys.exit(1 if failed else 0)

@@ -227,6 +227,11 @@ class AppConfig:
         # 1 = sequential (safe default); raise to 2-8 to speed up large batches.
         self.PIPELINE_WORKERS  = int(_optional("PIPELINE_WORKERS",  "1"))
 
+        # Workers for run_pipeline_from_excel.py specifically.
+        # Defaults to 3 — the Excel path is always a deliberate batch run so
+        # parallelism is safe and expected.  Set to 1 to force sequential.
+        self.EXCEL_PIPELINE_WORKERS = int(_optional("EXCEL_PIPELINE_WORKERS", "3"))
+
         # Number of files within a single PR to classify in parallel.
         # Combined with PIPELINE_WORKERS this gives PIPELINE_WORKERS *
         # CLASSIFICATION_WORKERS concurrent LLM calls — size it against the
@@ -283,6 +288,16 @@ class AppConfig:
         self.EXTRACTION_USE_OCR       = _optional("EXTRACTION_USE_OCR", "1").lower() not in ("0", "false", "no")
         # OCR model: prebuilt-layout (markdown + tables) or prebuilt-read (plain text, cheaper)
         self.AZURE_DOC_INTEL_MODEL    = _optional("AZURE_DOC_INTEL_MODEL", "prebuilt-layout")
+
+        # ── Excel pipeline approval-status filter ──────────────────────────
+        # Comma-separated PURCHASEFINALAPPROVALSTATUS values accepted by
+        # run_pipeline_from_excel.py.  PRs with any other status are skipped.
+        # Empty list = no filter (all statuses accepted).
+        self.EXCEL_ALLOWED_APPROVAL_STATUSES: list[str] = [
+            s.strip().upper()
+            for s in _optional("EXCEL_ALLOWED_APPROVAL_STATUSES", "").split(",")
+            if s.strip()
+        ]
 
     # ── Connection string builders ─────────────────────────────────────────
 
