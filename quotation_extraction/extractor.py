@@ -674,6 +674,41 @@ def _apply_llm_rankings(
         item.quote_rank = rank
 
 
+def _price_proximity_score(
+    item_value: Optional[Decimal],
+    ras_value: Optional[Decimal],
+) -> float:
+    """Return 0.0–1.0 — how close item_value is to ras_value (1.0 == within 5%).
+
+    Linear decay from 1.0 (within 5%) down to 0.0 (>=25% off).
+    Returns 0.0 when either value is missing or non-positive.
+    """
+    if item_value is None or ras_value is None:
+        return 0.0
+    if ras_value <= 0:
+        return 0.0
+    diff = abs(Decimal(str(item_value)) - ras_value) / ras_value
+    if diff <= Decimal("0.05"):
+        return 1.0
+    if diff >= Decimal("0.25"):
+        return 0.0
+    # Linear: 0.05 → 1.0, 0.25 → 0.0
+    return float(1.0 - (float(diff) - 0.05) / 0.20)
+
+
+def _price_match_score(
+    item: ExtractedItem,
+    ras_line: Optional[LineItemContext],
+) -> float:
+    """Best of unit-price-vs-RAS-PRICE and total-price-vs-RAS-REQ_VALUE proximity."""
+    if ras_line is None:
+        return 0.0
+    return max(
+        _price_proximity_score(item.unit_price,  ras_line.unit_price),
+        _price_proximity_score(item.total_price, ras_line.req_value),
+    )
+
+
 def run_selection_llm_query(
     all_items: list[ExtractedItem],
     ras_context: RASContext,
@@ -686,11 +721,15 @@ def run_selection_llm_query(
         their own quotation.  Every supplier starts from 1 independently.
 
     Step 2 — Pick ONE winning item per DTL_ID.
-        For each DTL_ID, score every competing supplier's item by
-        supplier_match_conf (highest wins).  Ties broken by whichever item
-        has more data (unit_price > item_name/description).  Exactly one
-        item per DTL_ID gets is_selected_quote=True; all others get False.
-        Items with purchase_dtl_id=None (orphans/taxes) are never selected.
+        For each DTL_ID, score every competing supplier's item by:
+          1. supplier_match_conf            — fuzzy match on supplier name
+          2. price_match_score              — proximity of item.unit_price to
+                                              RAS line PRICE OR item.total_price
+                                              to RAS REQ_VALUE (whichever fits)
+          3. has unit_price (tiebreak)
+        Highest tuple wins.  Exactly one item per DTL_ID gets
+        is_selected_quote=True; all others get False.  Items with
+        purchase_dtl_id=None (orphans/taxes) are never selected.
 
     Mutates items in-place.
     """
@@ -711,6 +750,11 @@ def run_selection_llm_query(
     for item in all_items:
         item.is_selected_quote = False
 
+    # Build dtl_id → RAS line lookup for price-proximity scoring
+    ras_by_dtl: dict[int, LineItemContext] = {
+        li.purchase_dtl_id: li for li in ras_context.line_items
+    }
+
     by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
         if item.purchase_dtl_id is not None and _has_data(item):
@@ -718,20 +762,27 @@ def run_selection_llm_query(
 
     selected = 0
     for dtl_id, candidates in by_dtl.items():
+        ras_line = ras_by_dtl.get(dtl_id)
+
         def _item_score(it: ExtractedItem) -> tuple:
-            conf = float(it.supplier_match_conf or 0)
-            data = int(it.unit_price is not None)
-            return (conf, data)
+            conf       = float(it.supplier_match_conf or 0)
+            price_fit  = _price_match_score(it, ras_line)
+            has_price  = int(it.unit_price is not None)
+            return (conf, price_fit, has_price)
 
         winner = max(candidates, key=_item_score)
         winner.is_selected_quote = True
         selected += 1
         logger.info(
-            "DTL {}: selected supplier={!r} (conf={}, unit_price={})",
+            "DTL {}: selected supplier={!r} (conf={}, price_fit={:.2f}, "
+            "unit_price={}, ras_unit={}, ras_req_value={})",
             dtl_id,
             winner.supplier_name,
             winner.supplier_match_conf,
+            _price_match_score(winner, ras_line),
             winner.unit_price,
+            ras_line.unit_price if ras_line else None,
+            ras_line.req_value  if ras_line else None,
         )
 
     logger.info(
