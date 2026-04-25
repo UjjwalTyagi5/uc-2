@@ -399,14 +399,22 @@ def _item_has_data(item: ExtractedItem) -> bool:
     return bool(item.item_name or item.unit_price or item.total_price)
 
 
-_TONNAGE_RE = re.compile(r"(\d{2,4})\s*(?:t|ton|tons|tonne|tonnes)\b", re.IGNORECASE)
+# Generic identifier token: alphanumeric tokens of length >=2 that contain
+# at least one digit (model numbers, part codes, dimensions, capacities).
+# Works for any procurement type — IT (Dell-7480, RAM-32GB), industrial
+# (650T, QMC122), services (Plan-A1), pharma (50mg, 100ml), etc.
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z0-9]*\d+[A-Za-z0-9]*")
 
 
-def _extract_tonnages(text: Optional[str]) -> set[int]:
-    """Pull machine tonnage figures (e.g. 650T, 350 tons, 120T) from a text blob."""
+def _identifier_tokens(text: Optional[str]) -> set[str]:
+    """Pull alphanumeric tokens that contain at least one digit, lowercased.
+
+    Generic across product domains — captures model numbers, part codes,
+    sizes, capacities, version numbers, dimensions, etc.
+    """
     if not text:
         return set()
-    return {int(m.group(1)) for m in _TONNAGE_RE.finditer(text)}
+    return {m.group(0).lower() for m in _IDENT_TOKEN_RE.finditer(text) if len(m.group(0)) >= 2}
 
 
 def _assign_orphans_to_uncovered(
@@ -415,11 +423,11 @@ def _assign_orphans_to_uncovered(
 ) -> list[tuple[ExtractedItem, int]]:
     """Assign orphaned items (dtl_id=None) to uncovered RAS DTL_IDs.
 
-    Scoring (best signal wins):
-      - Tonnage match (e.g. "650T" in both)              → 0.95
-      - Item code substring overlap                       → 0.85
-      - Quantity exact match                              → +0.10 boost
-      - Text similarity (SequenceMatcher) as fallback     → 0.0–1.0
+    Scoring (best signal wins, all generic across product types):
+      - Shared identifier token (model #, part code, size, etc.)  → 0.90
+      - Item code substring overlap                                → 0.85
+      - Quantity exact match                                       → +0.10 boost
+      - Text similarity (SequenceMatcher) as fallback              → 0.0–1.0
 
     A one-to-one greedy assignment is performed — best pair first, then next.
     No global threshold — any positive score wins over a blank stub row.
@@ -431,12 +439,11 @@ def _assign_orphans_to_uncovered(
         item_text = f"{item.item_name or ''} {item.item_description or ''}".strip().lower()
         ras_text  = f"{li.item_description or ''} {li.item_code or ''}".strip().lower()
 
-        # 1. Tonnage match — strongest signal for our domain
-        item_tons = _extract_tonnages(item_text)
-        ras_tons  = _extract_tonnages(ras_text)
-        if item_tons and ras_tons and item_tons & ras_tons:
-            score = 0.95
-        # 2. Item-code substring overlap (e.g. RAS code "QMC122" appears in item name)
+        # 1. Shared identifier token (any alphanumeric with digits — generic)
+        shared_idents = _identifier_tokens(item_text) & _identifier_tokens(ras_text)
+        if shared_idents:
+            score = 0.90
+        # 2. Item-code substring overlap (RAS code appears verbatim in item text)
         elif li.item_code and li.item_code.lower() in item_text:
             score = 0.85
         else:
