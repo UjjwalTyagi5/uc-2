@@ -98,16 +98,31 @@ def _build_user_prompt(
     tpl = _read_prompt("extraction.txt")
     taxonomy = _read_prompt("item_taxonomy.txt")
 
+    # Build document content string.
+    # PDFs now always provide both text and images so the vision-capable LLM
+    # sees extracted text (cheap, reliable for digital pages) AND page images
+    # (covers scanned sections).  Text is included inline; images are attached
+    # separately by the LLM client as multimodal content blocks.
     doc_content_str: str
-    if doc.is_image_based:
-        doc_content_str = (
-            f"[{doc.page_count} page(s) attached as images below]"
-        )
+    if doc.images:
+        if doc.text:
+            doc_content_str = (
+                f"[Extracted text from {doc.page_count} page(s) — "
+                f"page images are also attached below for visual reference]\n\n"
+                f"{doc.text}"
+            )
+        else:
+            doc_content_str = (
+                f"[Scanned document — {doc.page_count} page image(s) attached below, "
+                f"no extractable text]"
+            )
     else:
         doc_content_str = doc.text or "[No content extracted]"
 
     def _f(val: object) -> str:
         return str(val) if val is not None else "N/A"
+
+    raw_ras_context = _build_raw_context_block(ctx)
 
     return tpl.format(
         purchase_req_no=ctx.purchase_req_no,
@@ -143,7 +158,45 @@ def _build_user_prompt(
         line_items_table=_build_line_items_table(ctx.line_items),
         item_taxonomy=taxonomy,
         document_content=doc_content_str,
+        raw_ras_context=raw_ras_context,
     )
+
+
+# ── Raw RAS context block ──
+
+
+def _build_raw_context_block(ctx: RASContext) -> str:
+    """Format raw DB rows as a compact reference block for the LLM prompt.
+
+    Returns an empty string when all raw data is absent (non-fatal path).
+    """
+    parts: list[str] = []
+
+    if ctx.raw_mst:
+        lines = [f"  {k}: {v}" for k, v in ctx.raw_mst.items()]
+        parts.append("#### purchase_req_mst (header)\n" + "\n".join(lines))
+
+    if ctx.raw_dtl_rows:
+        cols = list(ctx.raw_dtl_rows[0].keys())
+        header = "| " + " | ".join(cols) + " |"
+        sep    = "|" + "|".join("---" for _ in cols) + "|"
+        rows   = [
+            "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
+            for r in ctx.raw_dtl_rows
+        ]
+        parts.append("#### purchase_req_detail (all line items)\n" + "\n".join([header, sep] + rows))
+
+    if ctx.raw_vw_rows:
+        cols = list(ctx.raw_vw_rows[0].keys())
+        header = "| " + " | ".join(cols) + " |"
+        sep    = "|" + "|".join("---" for _ in cols) + "|"
+        rows   = [
+            "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
+            for r in ctx.raw_vw_rows
+        ]
+        parts.append("#### vw_get_ras_data_for_bidashboard (BI context)\n" + "\n".join([header, sep] + rows))
+
+    return "\n\n".join(parts)
 
 
 # ── Supplier matching ──

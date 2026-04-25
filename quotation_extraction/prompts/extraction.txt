@@ -57,6 +57,22 @@ Column legend:
 
 ---
 
+### Additional RAS Reference Data
+
+> **Important — treat as reference only.** The fields below come directly from
+> the procurement system database. Users sometimes enter incomplete or incorrect
+> data, so these values are hints, not ground truth.
+> - **Always extract actual prices, quantities, dates, and descriptions from the
+>   quotation document itself.**
+> - Use this data only to help identify which `DTL_ID` corresponds to which item
+>   in the quotation — look for matching machine specs, item codes, quantities,
+>   tonnage, site, or any other common signal between the DB row and the PDF item.
+> - If a DB field contradicts what the quotation clearly states, trust the quotation.
+
+{raw_ras_context}
+
+---
+
 ## Item Taxonomy Guidelines
 
 {item_taxonomy}
@@ -121,6 +137,7 @@ Return a **single JSON object** — no markdown fences, no extra text:
 }}
 
 ### Rules
+- The quotation document is the primary source of truth. Extract all values (prices, quantities, dates, descriptions) from it — not from the RAS reference data.
 - All text fields MUST be in English — translate from any source language.
 - Dates must be ISO 8601 (YYYY-MM-DD).  Convert formats like "15-Apr-2026" or "15/04/26" accordingly.
 - Prices as plain numbers — strip currency symbols, commas, and thousand separators.

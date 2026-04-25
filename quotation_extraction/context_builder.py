@@ -100,6 +100,39 @@ SELECT TOP 1
 """
 
 
+# Raw SELECT * queries — capture every column; used as reference context for the LLM.
+# No TOP 1 on the VW query so all rows are returned (some PRs have multiple rows).
+_MST_RAW_SQL = f"SELECT * FROM {AzureTables.PURCHASE_REQ_MST}    WHERE [PURCHASE_REQ_NO]  = ?"
+_DTL_RAW_SQL = f"SELECT * FROM {AzureTables.PURCHASE_REQ_DETAIL}  WHERE [PURCHASE_REQ_ID]  = ? ORDER BY [ITEM_NO]"
+_VW_RAW_SQL  = f"SELECT * FROM {AzureTables.BI_DASHBOARD}         WHERE [PURCHASE_REQ_ID]  = ?"
+
+# Audit / system columns that add noise without helping the LLM match items
+_NOISE_COLS: frozenset[str] = frozenset({
+    "C_DATETIME", "U_DATETIME", "C_USER", "U_USER",
+    "C_USER_ID",  "U_USER_ID",
+})
+
+
+def _rows_to_dicts(rows: list, columns: list[str]) -> list[dict]:
+    """Convert raw pyodbc rows + column name list into clean dicts.
+
+    Strips noise columns and skips columns whose value is None or blank
+    so the LLM prompt isn't cluttered with empty fields.
+    """
+    result = []
+    for row in rows:
+        d = {
+            col: val
+            for col, val in zip(columns, row)
+            if col not in _NOISE_COLS
+            and val is not None
+            and str(val).strip() != ""
+        }
+        if d:
+            result.append(d)
+    return result
+
+
 # ── Repository ────────────────────────────────────────────────────────────────
 
 class _RASContextRepository(BaseRepository):
@@ -113,6 +146,16 @@ class _RASContextRepository(BaseRepository):
 
     def fetch_vw(self, purchase_req_id: int):
         return self._fetch_one(_VW_SQL, purchase_req_id)
+
+    # ── Raw full-column fetches (reference context for LLM) ──
+    def fetch_mst_raw(self, purchase_req_no: str) -> tuple:
+        return self._fetch_with_columns(_MST_RAW_SQL, purchase_req_no)
+
+    def fetch_dtl_raw(self, purchase_req_id: int) -> tuple:
+        return self._fetch_with_columns(_DTL_RAW_SQL, purchase_req_id)
+
+    def fetch_vw_raw(self, purchase_req_id: int) -> tuple:
+        return self._fetch_with_columns(_VW_RAW_SQL, purchase_req_id)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -256,6 +299,28 @@ def build_ras_context(
             purchase_req_id, purchase_req_no,
         )
 
+    # ── Raw full-column context (non-fatal — used only as LLM reference) ─────
+    raw_mst: dict = {}
+    raw_dtl_rows: list[dict] = []
+    raw_vw_rows: list[dict] = []
+    try:
+        mst_rows, mst_cols = repo.fetch_mst_raw(purchase_req_no)
+        raw_mst = _rows_to_dicts(mst_rows, mst_cols)[0] if mst_rows else {}
+    except Exception:
+        logger.warning("Raw MST fetch failed for PR={} — skipping", purchase_req_no)
+    try:
+        dtl_rows, dtl_cols = repo.fetch_dtl_raw(purchase_req_id)
+        raw_dtl_rows = _rows_to_dicts(dtl_rows, dtl_cols)
+    except Exception:
+        logger.warning("Raw DTL fetch failed for PR={} — skipping", purchase_req_no)
+    try:
+        vw_rows, vw_cols = repo.fetch_vw_raw(purchase_req_id)
+        raw_vw_rows = _rows_to_dicts(vw_rows, vw_cols)
+        if not raw_vw_rows:
+            logger.debug("No BI dashboard rows for PR={} — raw_vw_rows empty", purchase_req_no)
+    except Exception:
+        logger.warning("Raw VW fetch failed for PR={} — skipping", purchase_req_no)
+
     ctx = RASContext(
         purchase_req_no=purchase_req_no,
         purchase_req_id=purchase_req_id,
@@ -292,6 +357,9 @@ def build_ras_context(
         purchase_category=purchase_category,
         ras_title=ras_title,
         line_items=line_items,
+        raw_mst=raw_mst,
+        raw_dtl_rows=raw_dtl_rows,
+        raw_vw_rows=raw_vw_rows,
     )
 
     logger.info(

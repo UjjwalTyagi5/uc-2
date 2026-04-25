@@ -175,7 +175,13 @@ class RASContext:
     l8:               Optional[str]     = None
     purchase_category: Optional[str]   = None
     ras_title:         Optional[str]   = None
-    line_items: list[LineItemContext]   = field(default_factory=list)
+    line_items:   list[LineItemContext] = field(default_factory=list)
+
+    # Raw rows from DB — all columns, used as reference context in the LLM prompt.
+    # Users sometimes enter incorrect data so these are hints, not ground truth.
+    raw_mst:      dict            = field(default_factory=dict)
+    raw_dtl_rows: list[dict]      = field(default_factory=list)
+    raw_vw_rows:  list[dict]      = field(default_factory=list)
 
 
 @dataclass
