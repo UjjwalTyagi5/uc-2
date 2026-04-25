@@ -58,10 +58,13 @@ class ExtractionLLMClient:
         """
         messages = self._build_messages(system_prompt, user_prompt, document)
 
+        img_count  = len(document.images) if document.images else 0
+        img_detail = ("low" if document.text else "high") if img_count else "n/a"
         logger.info(
-            "Calling Azure OpenAI ({}) — {} image(s), ~{:.0f} kB prompt",
+            "Calling Azure OpenAI ({}) — {} image(s) detail={}, ~{:.0f} kB prompt",
             self._config.AOAI_DEPLOYMENT,
-            len(document.images) if document.images else 0,
+            img_count,
+            img_detail,
             len(user_prompt) / 1024,
         )
 
@@ -140,6 +143,13 @@ class ExtractionLLMClient:
         messages: list = [SystemMessage(content=system_prompt)]
 
         if document.is_image_based:
+            # If the document has extracted text, images serve as layout/table
+            # context only — "low" detail (~85 tokens each) is sufficient and
+            # keeps the payload small for large multi-page documents.
+            # If the document is fully scanned, images are the only content
+            # source — use "high" detail so the model can read fine print.
+            img_detail = "low" if document.text else "high"
+
             content_parts: list[dict] = [{"type": "text", "text": user_prompt}]
             for b64_img in document.images:  # type: ignore[union-attr]
                 content_parts.append(
@@ -147,7 +157,7 @@ class ExtractionLLMClient:
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:image/png;base64,{b64_img}",
-                            "detail": "high",
+                            "detail": img_detail,
                         },
                     }
                 )

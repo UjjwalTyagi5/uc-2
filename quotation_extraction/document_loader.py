@@ -79,37 +79,63 @@ def load_document(
 # ── PDF ──
 
 
-def _load_pdf(fp: pathlib.Path, max_pages: int, work_dir: pathlib.Path) -> DocumentContent:
-    """Load a PDF returning BOTH extracted text and page images.
+_SCANNED_PAGE_THRESHOLD = 50  # fewer chars than this → treat page as scanned
 
-    A PDF can be mixed — some pages have embedded text, others are scanned.
-    Sending both gives the vision-capable LLM the full picture in one call:
-    extracted text is cheaper to process while images cover scanned sections.
+
+def _load_pdf(fp: pathlib.Path, max_pages: int, work_dir: pathlib.Path) -> DocumentContent:
+    """Load a PDF with a per-page hybrid strategy.
+
+    For each page:
+      - Text page (>= 50 chars extracted): capture text + render image at
+        low DPI (100). The LLM reads the text and uses the image only for
+        layout / table context, so high resolution is not needed.
+      - Scanned page (< 50 chars extracted): render image at high DPI (200)
+        so the vision model can read fine print and table values clearly.
+
+    If the total page count exceeds max_pages, the excess is logged and skipped.
+    This per-page approach keeps the multimodal payload small for large
+    digital quotations (10+ pages with tech specs) while preserving quality
+    for scanned documents.
     """
     import fitz  # PyMuPDF
 
     doc = fitz.open(str(fp))
     page_count = len(doc)
+    if page_count > max_pages:
+        logger.warning(
+            "PDF has {} page(s) but max_pages={} — only first {} page(s) will be processed",
+            page_count, max_pages, max_pages,
+        )
     total = min(page_count, max_pages)
 
-    text_pages: list[str] = []
-    images: list[str] = []
+    text_pages:   list[str] = []
+    images:       list[str] = []
+    scanned_count = 0
+    text_count    = 0
 
     for i in range(total):
         page = doc[i]
         page_text = page.get_text("text").strip()
-        if page_text:
-            text_pages.append(page_text)
-        pix = page.get_pixmap(dpi=200)
+
+        if len(page_text) >= _SCANNED_PAGE_THRESHOLD:
+            # Digital / text page — capture text; low-res image for layout
+            text_pages.append(f"[Page {i + 1}]\n{page_text}")
+            text_count += 1
+            pix = page.get_pixmap(dpi=100)
+        else:
+            # Scanned page — high-res image is the only content source
+            scanned_count += 1
+            pix = page.get_pixmap(dpi=200)
+
         images.append(base64.b64encode(pix.tobytes("png")).decode())
 
     doc.close()
 
     text = "\n\n".join(text_pages) if text_pages else None
-    avg_chars = sum(len(p) for p in text_pages) / max(len(text_pages), 1) if text_pages else 0
     logger.debug(
-        "PDF loaded: {} page(s) — text avg {:.0f} chars/page, {} image(s) (work_dir={})",
-        total, avg_chars, len(images), work_dir,
+        "PDF loaded: {}/{} page(s) — {} text page(s) @ 100 DPI, "
+        "{} scanned page(s) @ 200 DPI",
+        total, page_count, text_count, scanned_count,
     )
     return DocumentContent(text=text, images=images, source_path=str(fp), page_count=total)
 
