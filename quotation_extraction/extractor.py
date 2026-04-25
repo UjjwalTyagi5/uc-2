@@ -703,18 +703,19 @@ def run_selection_llm_query(
 def compute_quote_ranks(
     all_items: list[ExtractedItem],
 ) -> None:
-    """Assign quote_rank as a sequential item number within each supplier.
+    """Assign quote_rank within each (supplier, DTL_ID) group.
 
-    Each supplier is ranked independently starting from 1.
-    Items are ordered by purchase_dtl_id (ascending) within the supplier.
-    All items from the same supplier covering the same DTL_ID share one rank.
+    Each supplier ranks their own quotations independently within each
+    DTL_ID, starting from 1.  Items are ordered by total_price ascending
+    (cheapest = rank 1; items with no price come last).
     Items with purchase_dtl_id=None are left with quote_rank=None.
 
-    Example — 3 suppliers, 3 DTL_IDs:
-      Stäubli   DTL 369950 → rank 1,  DTL 369951 → rank 2
-      Selplast  DTL 369950 → rank 1,  DTL 369952 → rank 2
-      Tecnomag  DTL 369951 → rank 1,  DTL 369952 → rank 2
-    All three suppliers have a rank-1 item independently.
+    Example — DTL 369952 with 4 suppliers:
+      Stäubli    has 5 quotations → ranks 1, 2, 3, 4, 5
+      Selplast   has 4 quotations → ranks 1, 2, 3, 4
+      Tecnomag   has 2 quotations → ranks 1, 2
+      Pradman    has 2 quotations → ranks 1, 2
+    Every supplier has its own independent rank-1 item per DTL_ID.
 
     Mutates items in-place.
     """
@@ -723,19 +724,24 @@ def compute_quote_ranks(
     def _supplier_key(item: ExtractedItem) -> str:
         return (item.supplier_name or "").strip().lower() or "_unknown_"
 
-    by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
+    # Reset all ranks first so re-runs are deterministic
     for item in all_items:
-        by_supplier[_supplier_key(item)].append(item)
+        item.quote_rank = None
 
-    for supplier_items in by_supplier.values():
-        # Distinct DTL_IDs for this supplier, sorted numerically
-        dtl_ids = sorted(
-            {i.purchase_dtl_id for i in supplier_items if i.purchase_dtl_id is not None}
+    by_group: dict[tuple[str, int], list[ExtractedItem]] = defaultdict(list)
+    for item in all_items:
+        if item.purchase_dtl_id is None:
+            continue  # orphans / non-line items keep quote_rank=None
+        key = (_supplier_key(item), item.purchase_dtl_id)
+        by_group[key].append(item)
+
+    for items in by_group.values():
+        # Sort by total_price ASC; nulls (stubs) go last but still get ranks.
+        items.sort(
+            key=lambda i: (i.total_price is None, float(i.total_price or 0))
         )
-        dtl_rank = {dtl_id: rank for rank, dtl_id in enumerate(dtl_ids, 1)}
-
-        for item in supplier_items:
-            item.quote_rank = dtl_rank.get(item.purchase_dtl_id)  # None when dtl_id is None
+        for rank, item in enumerate(items, 1):
+            item.quote_rank = rank
 
 
 # ── Public API ──
