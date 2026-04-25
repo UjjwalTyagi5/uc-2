@@ -688,31 +688,35 @@ def run_selection_llm_query(
 def compute_quote_ranks(
     all_items: list[ExtractedItem],
 ) -> None:
-    """Assign *quote_rank* per purchase_dtl_id across all quotation sources.
+    """Assign *quote_rank* per purchase_dtl_id, ranked by supplier.
 
-    Sorting rules (applied in order):
-      1. unit_price ascending  — lower price = better rank; items with no
-         unit_price are placed after all priced items.
-      2. quotation_date descending (tie-breaker) — when two quotes have the
-         same unit_price, the more recent quotation wins rank 1.
-         Quotes with no date sort after those with a date.
+    Ranking is supplier-based: all files from the same supplier for a given
+    DTL_ID share one rank.  This means 3 suppliers → ranks 1, 2, 3 each
+    starting fresh per DTL_ID; multiple files from the same supplier do not
+    compete against each other.
 
-    Every item for a DTL_ID gets a rank as long as at least one source for
-    that DTL_ID has a unit_price.  DTL_IDs where every source has no price
-    are left with quote_rank = None.
-    Items with no purchase_dtl_id are always left with quote_rank = None.
-    Mutates the items in-place.
+    Sorting rules per DTL_ID (applied to unique suppliers):
+      1. Best unit_price ascending — the supplier's lowest price across all
+         their files for this DTL_ID; suppliers with no price sort last.
+      2. Most-recent quotation_date descending (tie-breaker).
+
+    DTL_IDs where no supplier has any unit_price are left with quote_rank=None.
+    Items with no purchase_dtl_id are always left with quote_rank=None.
+    Mutates items in-place.
     """
-
     from collections import defaultdict
 
     _MAX_PRICE = Decimal("999999999999")
 
-    def _sort_key(item: ExtractedItem):
-        d = item.quotation_date
-        date_key = (-d.toordinal()) if d is not None else 1  # 1 > any negative
-        price    = item.unit_price if item.unit_price is not None else _MAX_PRICE
-        return (price, date_key)
+    def _supplier_key(item: ExtractedItem) -> str:
+        return (item.supplier_name or "").strip().lower() or "_unknown_"
+
+    def _best_sort_key(items: list[ExtractedItem]) -> tuple:
+        prices = [i.unit_price for i in items if i.unit_price is not None]
+        best_price = min(prices) if prices else _MAX_PRICE
+        dates = [i.quotation_date for i in items if i.quotation_date is not None]
+        latest_date = max(d.toordinal() for d in dates) if dates else 0
+        return (best_price, -latest_date)
 
     by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
@@ -720,12 +724,19 @@ def compute_quote_ranks(
             by_dtl[item.purchase_dtl_id].append(item)
 
     for dtl_id, group in by_dtl.items():
-        # Skip DTL_IDs where no source extracted a price — nothing meaningful to rank
         if not any(item.unit_price is not None for item in group):
             continue
-        sorted_group = sorted(group, key=_sort_key)
-        for rank, item in enumerate(sorted_group, 1):
-            item.quote_rank = rank
+
+        # Group items by supplier name
+        by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
+        for item in group:
+            by_supplier[_supplier_key(item)].append(item)
+
+        # Rank suppliers by their best price for this DTL_ID
+        ranked = sorted(by_supplier.values(), key=_best_sort_key)
+        for rank, supplier_items in enumerate(ranked, 1):
+            for item in supplier_items:
+                item.quote_rank = rank
 
 
 # ── Public API ──
