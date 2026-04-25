@@ -387,6 +387,65 @@ def _parse_llm_response(
     return results
 
 
+def _item_has_data(item: ExtractedItem) -> bool:
+    return bool(item.item_name or item.unit_price or item.total_price)
+
+
+def _assign_orphans_to_uncovered(
+    orphans: list[ExtractedItem],
+    uncovered_lines: list[LineItemContext],
+) -> list[tuple[ExtractedItem, int]]:
+    """Assign orphaned items (dtl_id=None) to uncovered RAS DTL_IDs.
+
+    Uses text similarity (SequenceMatcher) to find the best one-to-one
+    pairing between extracted items and RAS lines.  No domain-specific
+    heuristics — works for any procurement type (goods, services, IT, etc.).
+
+    If there are more orphans than uncovered lines, only as many are assigned
+    as there are lines; extras are dropped later as genuine ancillaries.
+    If there are more uncovered lines than orphans, the remainder become stubs.
+
+    No score threshold — any positive similarity wins over a blank stub row.
+    Items with identical similarity (e.g. all-empty RAS descriptions) are
+    assigned in extraction order to RAS lines sorted by DTL_ID.
+    """
+    if not orphans or not uncovered_lines:
+        return []
+
+    def sim(item: ExtractedItem, li: LineItemContext) -> float:
+        item_text = f"{item.item_name or ''} {item.item_description or ''}".strip().lower()
+        ras_text  = f"{li.item_description or ''} {li.item_code or ''}".strip().lower()
+        return SequenceMatcher(None, item_text, ras_text).ratio()
+
+    # Score all pairs, sort best-first
+    scored: list[tuple[float, int, int]] = []  # (score, orphan_idx, line_idx)
+    for oi, item in enumerate(orphans):
+        for li_idx, li in enumerate(uncovered_lines):
+            scored.append((sim(item, li), oi, li_idx))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    used_orphans: set[int] = set()
+    used_lines:   set[int] = set()
+    assignments:  list[tuple[ExtractedItem, int]] = []
+
+    for score, oi, li_idx in scored:
+        if oi in used_orphans or li_idx in used_lines:
+            continue
+        dtl_id = uncovered_lines[li_idx].purchase_dtl_id
+        logger.info(
+            "Assigned orphan {!r} → dtl_id={} (text-sim={:.2f})",
+            orphans[oi].item_name, dtl_id, score,
+        )
+        assignments.append((orphans[oi], dtl_id))
+        used_orphans.add(oi)
+        used_lines.add(li_idx)
+        if len(assignments) == min(len(orphans), len(uncovered_lines)):
+            break
+
+    return assignments
+
+
 def _align_to_ras_line_items(
     items: list[ExtractedItem],
     ras_context: RASContext,
@@ -394,34 +453,53 @@ def _align_to_ras_line_items(
 ) -> list[ExtractedItem]:
     """Align extracted items to exactly the RAS line items.
 
-    1. Drop any extracted item whose purchase_dtl_id is not in the RAS
-       (e.g. shipping charges, extras the LLM invented).
-    2. For any RAS line item (DTL_ID) not covered by the extraction,
-       create a stub row with DTL_ID populated but item fields as None.
+    1. Keep extracted items whose purchase_dtl_id is a valid RAS DTL_ID.
+    2. For items the LLM returned with dtl_id=None, attempt fuzzy matching
+       against uncovered RAS DTL_IDs (tonnage + text similarity).
+    3. Anything still unmatched is dropped (genuine ancillaries / extras).
+    4. For any RAS DTL_ID still uncovered, create a stub row.
 
     Result: exactly len(ras_context.line_items) rows per quotation source.
     """
     valid_dtl_ids = {li.purchase_dtl_id for li in ras_context.line_items}
     logger.debug("Valid RAS DTL_IDs: {}", sorted(valid_dtl_ids))
 
-    # Keep only items that map to a real RAS line item
-    matched: list[ExtractedItem] = []
+    # ── Step 1: strict match ──
+    matched:  list[ExtractedItem] = []
+    orphans:  list[ExtractedItem] = []
+
     for i in items:
         if i.purchase_dtl_id in valid_dtl_ids:
             matched.append(i)
+        elif _item_has_data(i):
+            orphans.append(i)
         else:
+            logger.debug("Discarding empty item (no name/price, dtl_id=None)")
+
+    # ── Step 2: fuzzy fallback for orphans ──
+    covered_dtl_ids  = {i.purchase_dtl_id for i in matched}
+    uncovered_lines  = [li for li in ras_context.line_items if li.purchase_dtl_id not in covered_dtl_ids]
+
+    if orphans and uncovered_lines:
+        for item, dtl_id in _assign_orphans_to_uncovered(orphans, uncovered_lines):
+            item.purchase_dtl_id = dtl_id
+            matched.append(item)
+            covered_dtl_ids.add(dtl_id)
+            uncovered_lines = [li for li in uncovered_lines if li.purchase_dtl_id != dtl_id]
+
+    # Items still with dtl_id=None after assignment are genuine extras
+    # (more orphans than uncovered lines — e.g. packing charges when all lines are filled)
+    for item in orphans:
+        if item.purchase_dtl_id is None:
             logger.warning(
-                "Dropped extracted item — dtl_id={} item_name={!r} desc={!r} "
-                "(not in RAS valid DTL_IDs: {})",
-                i.purchase_dtl_id,
-                i.item_name,
-                (i.item_description or "")[:120],
-                sorted(valid_dtl_ids),
+                "Dropped extra item — no uncovered RAS line remaining "
+                "for item_name={!r} desc={!r}",
+                item.item_name,
+                (item.item_description or "")[:120],
             )
 
-    # Fill missing RAS line items with stub rows
-    covered_dtl_ids = {i.purchase_dtl_id for i in matched}
-    missing = valid_dtl_ids - covered_dtl_ids
+    # ── Step 3: stubs for still-uncovered RAS lines ──
+    missing = {li.purchase_dtl_id for li in uncovered_lines}
 
     if missing:
         header_donor = matched[0] if matched else None
