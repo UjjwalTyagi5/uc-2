@@ -65,6 +65,12 @@ Optional — Quotation extraction tuning:
     EXTRACTION_LLM_MAX_TOKENS   max tokens in LLM response        (default: 16000)
     LLM_MAX_RETRIES             extra LLM attempts after failure  (default: 3)
     LLM_RETRY_BASE_DELAY        starting back-off in seconds      (default: 5.0)
+
+Optional — Azure Document Intelligence (OCR for quotation extraction):
+    AZURE_DOC_INTEL_ENDPOINT    e.g. https://myocr.cognitiveservices.azure.com/
+    AZURE_DOC_INTEL_KEY
+    AZURE_DOC_INTEL_MODEL       prebuilt-layout (default) or prebuilt-read
+    EXTRACTION_USE_OCR          set to 0/false to disable        (default: 1)
                         Set to 2–8 to process multiple PRs at the same time.
                         Each worker opens its own DB connections and work folder.
                         Keep at 1 if the DB connection limit is tight.
@@ -268,6 +274,15 @@ class AppConfig:
         self.LLM_MAX_TOKENS       = int(_optional("EXTRACTION_LLM_MAX_TOKENS",     "16000"))
         self.LLM_MAX_RETRIES      = int(_optional("LLM_MAX_RETRIES",               "3"))
         self.LLM_RETRY_BASE_DELAY = float(_optional("LLM_RETRY_BASE_DELAY",        "5.0"))
+
+        # ── Azure Document Intelligence (OCR for extraction) ───────────────
+        # Optional — falls back to image-based extraction if not configured.
+        self.AZURE_DOC_INTEL_ENDPOINT = _optional("AZURE_DOC_INTEL_ENDPOINT", "")
+        self.AZURE_DOC_INTEL_KEY      = _optional("AZURE_DOC_INTEL_KEY",      "")
+        # Set to "0" / "false" to disable OCR even if endpoint/key are set.
+        self.EXTRACTION_USE_OCR       = _optional("EXTRACTION_USE_OCR", "1").lower() not in ("0", "false", "no")
+        # OCR model: prebuilt-layout (markdown + tables) or prebuilt-read (plain text, cheaper)
+        self.AZURE_DOC_INTEL_MODEL    = _optional("AZURE_DOC_INTEL_MODEL", "prebuilt-layout")
 
     # ── Connection string builders ─────────────────────────────────────────
 

@@ -37,5 +37,7 @@ dependencies = [
     "pycountry>=23.12.11",
     "rapidfuzz>=3.0.0",
     "requests>=2.31.0",
+    # Azure Document Intelligence — OCR for quotation extraction
+    "azure-ai-documentintelligence>=1.0.0",
 ]
 

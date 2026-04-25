@@ -188,15 +188,19 @@ class RASContext:
 class DocumentContent:
     """LLM-consumable representation of a single quotation file.
 
-    Exactly one of *text* or *images* is populated:
-    * text   – plain/markdown string  (XLSX, DOCX, TXT, …)
+    Either *text* or *images* (or both) may be populated:
+    * text   – plain/markdown string  (XLSX, DOCX, TXT, OCR output, …)
     * images – list of base-64 PNG strings  (PDF pages, scanned images, …)
+
+    *ocr_source* is True when *text* was produced by Azure Document Intelligence
+    rather than native parsing — useful for prompt phrasing and logging.
     """
 
     text:        Optional[str]       = None
     images:      Optional[list[str]] = None
     source_path: str                 = ""
     page_count:  int                 = 0
+    ocr_source:  bool                = False
 
     @property
     def is_image_based(self) -> bool:

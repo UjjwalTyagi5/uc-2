@@ -19,6 +19,8 @@ from typing import Optional
 from loguru import logger
 from pydantic import ValidationError
 
+from utils.azure_doc_intel import build_client_from_config
+
 from .config import ExtractionConfig
 from .document_loader import load_document
 from .llm_client import ExtractionLLMClient
@@ -99,12 +101,18 @@ def _build_user_prompt(
     taxonomy = _read_prompt("item_taxonomy.txt")
 
     # Build document content string.
-    # PDFs now always provide both text and images so the vision-capable LLM
-    # sees extracted text (cheap, reliable for digital pages) AND page images
-    # (covers scanned sections).  Text is included inline; images are attached
-    # separately by the LLM client as multimodal content blocks.
+    # When OCR (Azure Document Intelligence) succeeds, only markdown text is
+    # provided — tables and structure are preserved, no images needed.
+    # Otherwise the LLM receives extracted text + page images (digital PDFs)
+    # or images alone (scanned PDFs / image attachments).
     doc_content_str: str
-    if doc.images:
+    if doc.ocr_source and doc.text:
+        doc_content_str = (
+            f"[OCR markdown extracted via Azure Document Intelligence "
+            f"from {doc.page_count} page(s) — tables and structure preserved]\n\n"
+            f"{doc.text}"
+        )
+    elif doc.images:
         if doc.text:
             doc_content_str = (
                 f"[Extracted text from {doc.page_count} page(s) — "
@@ -753,6 +761,11 @@ class QuotationExtractor:
     def __init__(self, config: ExtractionConfig) -> None:
         self._config = config
         self._llm = ExtractionLLMClient(config)
+        self._ocr = build_client_from_config(config)
+        if self._ocr is not None:
+            logger.info("Quotation extraction: Azure Document Intelligence OCR enabled")
+        else:
+            logger.info("Quotation extraction: OCR disabled — using image-based extraction")
 
     def extract(
         self,
@@ -768,6 +781,7 @@ class QuotationExtractor:
             file_path,
             max_pages=self._config.MAX_PAGES,
             work_dir=pathlib.Path(file_path).parent,
+            ocr_client=self._ocr,
         )
 
         system_prompt = _read_prompt("system.txt")
