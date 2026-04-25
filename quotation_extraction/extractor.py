@@ -701,37 +701,58 @@ def run_selection_llm_query(
 def compute_quote_ranks(
     all_items: list[ExtractedItem],
 ) -> None:
-    """Assign quote_rank as a sequential item number within each supplier.
+    """Assign quote_rank per purchase_dtl_id, ranking suppliers by price.
 
-    Each supplier's items are numbered 1, 2, 3 … ordered by purchase_dtl_id
-    (ascending).  Every supplier starts from 1 independently — ranks do NOT
-    compare across suppliers.
+    For each DTL_ID independently:
+      - Group all items by supplier_name.
+      - Rank suppliers 1, 2, 3 … by their best (lowest) unit_price.
+      - All items from the same supplier for that DTL_ID share one rank.
+      - Suppliers with no price sort after priced ones.
+      - Tie-breaker: most-recent quotation_date wins.
 
-    Items from the same supplier covering the same DTL_ID (across multiple
-    files) all receive the same rank number.
+    Result: if there are 3 DTL_IDs there will be 3 rank-1 entries in total
+    (one per DTL_ID), each belonging to whichever supplier quoted cheapest
+    for that item.
 
-    Items with purchase_dtl_id=None are left with quote_rank=None.
+    DTL_IDs where no supplier has a unit_price → quote_rank stays None.
+    Items with purchase_dtl_id=None → quote_rank stays None.
     Mutates items in-place.
     """
     from collections import defaultdict
 
+    _MAX_PRICE = Decimal("999999999999")
+
     def _supplier_key(item: ExtractedItem) -> str:
         return (item.supplier_name or "").strip().lower() or "_unknown_"
 
-    # Group all items by supplier
-    by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
+    def _best_sort_key(items: list[ExtractedItem]) -> tuple:
+        prices = [i.unit_price for i in items if i.unit_price is not None]
+        best_price = min(prices) if prices else _MAX_PRICE
+        dates = [i.quotation_date for i in items if i.quotation_date is not None]
+        latest_date = max(d.toordinal() for d in dates) if dates else 0
+        return (best_price, -latest_date)
+
+    # Group by DTL_ID first
+    by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
-        by_supplier[_supplier_key(item)].append(item)
+        if item.purchase_dtl_id is not None:
+            by_dtl[item.purchase_dtl_id].append(item)
 
-    for supplier_items in by_supplier.values():
-        # Collect distinct DTL_IDs for this supplier, sorted numerically
-        dtl_ids = sorted(
-            {i.purchase_dtl_id for i in supplier_items if i.purchase_dtl_id is not None}
-        )
-        dtl_rank = {dtl_id: rank for rank, dtl_id in enumerate(dtl_ids, 1)}
+    for dtl_id, group in by_dtl.items():
+        if not any(i.unit_price is not None for i in group):
+            continue  # no price data for this DTL_ID — leave rank None
 
-        for item in supplier_items:
-            item.quote_rank = dtl_rank.get(item.purchase_dtl_id)  # None if dtl_id is None
+        # Group by supplier within this DTL_ID
+        by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
+        for item in group:
+            by_supplier[_supplier_key(item)].append(item)
+
+        # Rank suppliers cheapest-first; all their items get that rank
+        for rank, supplier_items in enumerate(
+            sorted(by_supplier.values(), key=_best_sort_key), 1
+        ):
+            for item in supplier_items:
+                item.quote_rank = rank
 
 
 # ── Public API ──
