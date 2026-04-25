@@ -642,11 +642,12 @@ def run_selection_llm_query(
         Assigns each supplier a sequential item number (1, 2, 3 …) within
         their own quotation.  Every supplier starts from 1 independently.
 
-    Step 2 — Pick ONE winning supplier for the whole PR.
-        Score per supplier = avg(supplier_match_conf) across their non-stub
-        items, tie-broken by the count of non-stub items (more coverage wins).
-        Only the winning supplier's non-stub items get is_selected_quote=True;
-        all other items get False.
+    Step 2 — Pick ONE winning item per DTL_ID.
+        For each DTL_ID, score every competing supplier's item by
+        supplier_match_conf (highest wins).  Ties broken by whichever item
+        has more data (unit_price > item_name/description).  Exactly one
+        item per DTL_ID gets is_selected_quote=True; all others get False.
+        Items with purchase_dtl_id=None (orphans/taxes) are never selected.
 
     Mutates items in-place.
     """
@@ -659,39 +660,40 @@ def run_selection_llm_query(
             or item.item_description is not None
         )
 
-    def _supplier_key(item: ExtractedItem) -> str:
-        return (item.supplier_name or "").strip().lower() or "_unknown_"
-
     # ── Step 1: number each supplier's items starting from 1 ─────────────
     compute_quote_ranks(all_items)
 
-    # ── Step 2: pick ONE winning supplier ────────────────────────────────
-    by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
+    # ── Step 2: for each DTL_ID pick the best supplier item ──────────────
+    # First mark everything False
     for item in all_items:
-        by_supplier[_supplier_key(item)].append(item)
+        item.is_selected_quote = False
 
-    def _supplier_score(items: list[ExtractedItem]) -> tuple:
-        data_items = [i for i in items if _has_data(i)]
-        if not data_items:
-            return (0.0, 0)
-        avg_conf = sum(float(i.supplier_match_conf or 0) for i in data_items) / len(data_items)
-        return (avg_conf, len(data_items))
-
-    winner_key = max(by_supplier, key=lambda k: _supplier_score(by_supplier[k]))
-    winner_name = by_supplier[winner_key][0].supplier_name or winner_key
-    winner_ids  = {id(i) for i in by_supplier[winner_key] if _has_data(i)}
+    by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
+    for item in all_items:
+        if item.purchase_dtl_id is not None and _has_data(item):
+            by_dtl[item.purchase_dtl_id].append(item)
 
     selected = 0
-    for item in all_items:
-        if id(item) in winner_ids:
-            item.is_selected_quote = True
-            selected += 1
-        else:
-            item.is_selected_quote = False
+    for dtl_id, candidates in by_dtl.items():
+        def _item_score(it: ExtractedItem) -> tuple:
+            conf = float(it.supplier_match_conf or 0)
+            data = int(it.unit_price is not None)
+            return (conf, data)
+
+        winner = max(candidates, key=_item_score)
+        winner.is_selected_quote = True
+        selected += 1
+        logger.info(
+            "DTL {}: selected supplier={!r} (conf={}, unit_price={})",
+            dtl_id,
+            winner.supplier_name,
+            winner.supplier_match_conf,
+            winner.unit_price,
+        )
 
     logger.info(
-        "Selection: supplier={!r} — {} item(s) marked is_selected_quote=True",
-        winner_name, selected,
+        "Selection complete — {} DTL_ID(s) have is_selected_quote=True",
+        selected,
     )
 
 
