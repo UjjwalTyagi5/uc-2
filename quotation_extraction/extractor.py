@@ -636,22 +636,17 @@ def run_selection_llm_query(
     ras_context: RASContext,
     config: ExtractionConfig,
 ) -> None:
-    """Determine is_selected_quote and quote_rank for all extracted items.
+    """Assign quote_rank and is_selected_quote for all extracted items.
 
-    Algorithm (fully deterministic — no LLM needed):
+    Step 1 — compute_quote_ranks()
+        Assigns each supplier a sequential item number (1, 2, 3 …) within
+        their own quotation.  Every supplier starts from 1 independently.
 
-    Step 1 — Rank
-        compute_quote_ranks() assigns quote_rank per DTL_ID across all sources.
-        Rank 1 = lowest unit_price; no-price stubs rank last.
-
-    Step 2 — Select
-        Only sources with ≥1 non-stub item are candidates.
-        Each candidate is scored:
-            supplier_match_conf   (60 %) — how well supplier name matches RAS
-            rank-1 fraction       (40 %) — fraction of non-stub items ranked 1
-
-        The candidate with the highest score wins.  Its non-stub items get
-        is_selected_quote = True; all other items get False.
+    Step 2 — Pick ONE winning supplier for the whole PR.
+        Score per supplier = avg(supplier_match_conf) across their non-stub
+        items, tie-broken by the count of non-stub items (more coverage wins).
+        Only the winning supplier's non-stub items get is_selected_quote=True;
+        all other items get False.
 
     Mutates items in-place.
     """
@@ -664,21 +659,39 @@ def run_selection_llm_query(
             or item.item_description is not None
         )
 
-    # ── Step 1: rank across all sources ─────────────────────────────────
+    def _supplier_key(item: ExtractedItem) -> str:
+        return (item.supplier_name or "").strip().lower() or "_unknown_"
+
+    # ── Step 1: number each supplier's items starting from 1 ─────────────
     compute_quote_ranks(all_items)
 
-    # ── Step 2: mark rank-1 data items as selected ───────────────────────
+    # ── Step 2: pick ONE winning supplier ────────────────────────────────
+    by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
+    for item in all_items:
+        by_supplier[_supplier_key(item)].append(item)
+
+    def _supplier_score(items: list[ExtractedItem]) -> tuple:
+        data_items = [i for i in items if _has_data(i)]
+        if not data_items:
+            return (0.0, 0)
+        avg_conf = sum(float(i.supplier_match_conf or 0) for i in data_items) / len(data_items)
+        return (avg_conf, len(data_items))
+
+    winner_key = max(by_supplier, key=lambda k: _supplier_score(by_supplier[k]))
+    winner_name = by_supplier[winner_key][0].supplier_name or winner_key
+    winner_ids  = {id(i) for i in by_supplier[winner_key] if _has_data(i)}
+
     selected = 0
     for item in all_items:
-        if item.quote_rank == 1 and _has_data(item):
+        if id(item) in winner_ids:
             item.is_selected_quote = True
             selected += 1
         else:
             item.is_selected_quote = False
 
     logger.info(
-        "Selection: {} item(s) marked is_selected_quote=True (rank=1 with data)",
-        selected,
+        "Selection: supplier={!r} — {} item(s) marked is_selected_quote=True",
+        winner_name, selected,
     )
 
 
@@ -688,55 +701,37 @@ def run_selection_llm_query(
 def compute_quote_ranks(
     all_items: list[ExtractedItem],
 ) -> None:
-    """Assign *quote_rank* per purchase_dtl_id, ranked by supplier.
+    """Assign quote_rank as a sequential item number within each supplier.
 
-    Ranking is supplier-based: all files from the same supplier for a given
-    DTL_ID share one rank.  This means 3 suppliers → ranks 1, 2, 3 each
-    starting fresh per DTL_ID; multiple files from the same supplier do not
-    compete against each other.
+    Each supplier's items are numbered 1, 2, 3 … ordered by purchase_dtl_id
+    (ascending).  Every supplier starts from 1 independently — ranks do NOT
+    compare across suppliers.
 
-    Sorting rules per DTL_ID (applied to unique suppliers):
-      1. Best unit_price ascending — the supplier's lowest price across all
-         their files for this DTL_ID; suppliers with no price sort last.
-      2. Most-recent quotation_date descending (tie-breaker).
+    Items from the same supplier covering the same DTL_ID (across multiple
+    files) all receive the same rank number.
 
-    DTL_IDs where no supplier has any unit_price are left with quote_rank=None.
-    Items with no purchase_dtl_id are always left with quote_rank=None.
+    Items with purchase_dtl_id=None are left with quote_rank=None.
     Mutates items in-place.
     """
     from collections import defaultdict
 
-    _MAX_PRICE = Decimal("999999999999")
-
     def _supplier_key(item: ExtractedItem) -> str:
         return (item.supplier_name or "").strip().lower() or "_unknown_"
 
-    def _best_sort_key(items: list[ExtractedItem]) -> tuple:
-        prices = [i.unit_price for i in items if i.unit_price is not None]
-        best_price = min(prices) if prices else _MAX_PRICE
-        dates = [i.quotation_date for i in items if i.quotation_date is not None]
-        latest_date = max(d.toordinal() for d in dates) if dates else 0
-        return (best_price, -latest_date)
-
-    by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
+    # Group all items by supplier
+    by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
-        if item.purchase_dtl_id is not None:
-            by_dtl[item.purchase_dtl_id].append(item)
+        by_supplier[_supplier_key(item)].append(item)
 
-    for dtl_id, group in by_dtl.items():
-        if not any(item.unit_price is not None for item in group):
-            continue
+    for supplier_items in by_supplier.values():
+        # Collect distinct DTL_IDs for this supplier, sorted numerically
+        dtl_ids = sorted(
+            {i.purchase_dtl_id for i in supplier_items if i.purchase_dtl_id is not None}
+        )
+        dtl_rank = {dtl_id: rank for rank, dtl_id in enumerate(dtl_ids, 1)}
 
-        # Group items by supplier name
-        by_supplier: dict[str, list[ExtractedItem]] = defaultdict(list)
-        for item in group:
-            by_supplier[_supplier_key(item)].append(item)
-
-        # Rank suppliers by their best price for this DTL_ID
-        ranked = sorted(by_supplier.values(), key=_best_sort_key)
-        for rank, supplier_items in enumerate(ranked, 1):
-            for item in supplier_items:
-                item.quote_rank = rank
+        for item in supplier_items:
+            item.quote_rank = dtl_rank.get(item.purchase_dtl_id)  # None if dtl_id is None
 
 
 # ── Public API ──
