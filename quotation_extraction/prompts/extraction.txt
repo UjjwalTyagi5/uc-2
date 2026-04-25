@@ -157,7 +157,29 @@ Return a **single JSON object** — no markdown fences, no extra text:
 - Prices as plain numbers — strip currency symbols, commas, and thousand separators.
 - If a field genuinely cannot be determined from the document, return null (not an empty string, not "N/A").
 - item_level_4 through item_level_8 may be null when information is genuinely absent — do not invent brand or model names.
-- Extract ALL items found in the document, even those not present in the requisition table (set purchase_dtl_id = null for those).
-- For matched items set purchase_dtl_id to the integer DTL_ID from the table.
-- Every item that you can reasonably match to a requisition line MUST have purchase_dtl_id set to the correct integer DTL_ID. Only return null for items that genuinely do not appear in the requisition (e.g. shipping charges, packing fees, taxes). When in doubt, assign the closest matching DTL_ID rather than returning null.
 - supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
+
+**DTL_ID matching — CRITICAL:**
+
+You MUST attempt to map every quotation item row to a `purchase_dtl_id` from the RAS line items table. Do not return `null` for `purchase_dtl_id` unless the item is clearly a non-line charge (shipping, packing, GST, freight, insurance, surcharge).
+
+Use these signals **in order** to pick the right DTL_ID for each item:
+
+1. **Machine tonnage / capacity** — "650T", "350 tons", "120T IMM", "260 ton" — match these EXACTLY to the tonnage in the RAS description. A 650T item belongs to the 650T DTL_ID, never to a 350T DTL_ID.
+2. **Site / location** — "Chennai", "Ananthapur", "Site B" — match if mentioned in both quotation and RAS.
+3. **Supplier product code** — `QMC122-650`, `LP100`, `PT050SPEC`, `PT017SPEC` — these encode the machine size (e.g. PT050 = 500-ton class, PT017 = 170-ton class). Map by decoded size.
+4. **Quantity / UOM** — when only one RAS line matches the quantity, use that DTL_ID.
+5. **Position in table** — if the quotation lists items in the same order as the RAS table, use position as a last-resort signal.
+
+For supporting line items (Installation Charges, Packing Charges, Commissioning, Training) that appear once per machine in the quotation, map each to the DTL_ID of the **machine they support**, not to a separate "services" DTL_ID. If the RAS has a separate DTL_ID for installation/services, prefer that one.
+
+If the same item legitimately covers multiple DTL_IDs (one quote line for "650T + 350T installation"), emit one row per DTL_ID with the same item details.
+
+**Set `supplier_match_conf` honestly:**
+- `1.0` — exact tonnage / location / product code match
+- `0.7-0.9` — strong but not perfect match (one signal matches clearly)
+- `0.3-0.6` — weak match (only position or partial signal)
+- `< 0.3` — guessing — prefer to leave `purchase_dtl_id = null`
+
+**Coverage check before responding:**
+After listing all items, verify: for every DTL_ID in the RAS table that the supplier has clearly quoted on, you have emitted at least one item with that `purchase_dtl_id`. If you find a quoted item you forgot to emit, add it now.

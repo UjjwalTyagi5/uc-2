@@ -399,23 +399,30 @@ def _item_has_data(item: ExtractedItem) -> bool:
     return bool(item.item_name or item.unit_price or item.total_price)
 
 
+_TONNAGE_RE = re.compile(r"(\d{2,4})\s*(?:t|ton|tons|tonne|tonnes)\b", re.IGNORECASE)
+
+
+def _extract_tonnages(text: Optional[str]) -> set[int]:
+    """Pull machine tonnage figures (e.g. 650T, 350 tons, 120T) from a text blob."""
+    if not text:
+        return set()
+    return {int(m.group(1)) for m in _TONNAGE_RE.finditer(text)}
+
+
 def _assign_orphans_to_uncovered(
     orphans: list[ExtractedItem],
     uncovered_lines: list[LineItemContext],
 ) -> list[tuple[ExtractedItem, int]]:
     """Assign orphaned items (dtl_id=None) to uncovered RAS DTL_IDs.
 
-    Uses text similarity (SequenceMatcher) to find the best one-to-one
-    pairing between extracted items and RAS lines.  No domain-specific
-    heuristics — works for any procurement type (goods, services, IT, etc.).
+    Scoring (best signal wins):
+      - Tonnage match (e.g. "650T" in both)              → 0.95
+      - Item code substring overlap                       → 0.85
+      - Quantity exact match                              → +0.10 boost
+      - Text similarity (SequenceMatcher) as fallback     → 0.0–1.0
 
-    If there are more orphans than uncovered lines, only as many are assigned
-    as there are lines; extras are dropped later as genuine ancillaries.
-    If there are more uncovered lines than orphans, the remainder become stubs.
-
-    No score threshold — any positive similarity wins over a blank stub row.
-    Items with identical similarity (e.g. all-empty RAS descriptions) are
-    assigned in extraction order to RAS lines sorted by DTL_ID.
+    A one-to-one greedy assignment is performed — best pair first, then next.
+    No global threshold — any positive score wins over a blank stub row.
     """
     if not orphans or not uncovered_lines:
         return []
@@ -423,7 +430,28 @@ def _assign_orphans_to_uncovered(
     def sim(item: ExtractedItem, li: LineItemContext) -> float:
         item_text = f"{item.item_name or ''} {item.item_description or ''}".strip().lower()
         ras_text  = f"{li.item_description or ''} {li.item_code or ''}".strip().lower()
-        return SequenceMatcher(None, item_text, ras_text).ratio()
+
+        # 1. Tonnage match — strongest signal for our domain
+        item_tons = _extract_tonnages(item_text)
+        ras_tons  = _extract_tonnages(ras_text)
+        if item_tons and ras_tons and item_tons & ras_tons:
+            score = 0.95
+        # 2. Item-code substring overlap (e.g. RAS code "QMC122" appears in item name)
+        elif li.item_code and li.item_code.lower() in item_text:
+            score = 0.85
+        else:
+            # 3. Plain text similarity
+            score = SequenceMatcher(None, item_text, ras_text).ratio()
+
+        # 4. Quantity exact-match boost
+        if (
+            item.quantity is not None
+            and li.quantity is not None
+            and Decimal(str(item.quantity)) == Decimal(str(li.quantity))
+        ):
+            score = min(1.0, score + 0.10)
+
+        return score
 
     # Score all pairs, sort best-first
     scored: list[tuple[float, int, int]] = []  # (score, orphan_idx, line_idx)
@@ -790,6 +818,18 @@ class QuotationExtractor:
         raw_response = self._llm.extract(system_prompt, user_prompt, doc)
 
         items = _parse_llm_response(raw_response, source, ras_context)
+
+        # Diagnostic — log what the LLM actually returned per item before alignment.
+        # Helps pinpoint whether missing items are LLM misses, wrong-DTL maps, or
+        # alignment drops.
+        for it in items:
+            logger.debug(
+                "LLM item: dtl_id={} name={!r} price={} qty={}",
+                it.purchase_dtl_id,
+                (it.item_name or "")[:60],
+                it.unit_price,
+                it.quantity,
+            )
 
         items = _align_to_ras_line_items(items, ras_context, source)
 
