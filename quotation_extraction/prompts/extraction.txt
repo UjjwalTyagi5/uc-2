@@ -47,6 +47,12 @@ Column legend:
 - **Req Value** — total requisition value for the line (Qty × Unit Price)
 - **Prepayment / Payment Terms** — buyer-side payment conditions
 
+> **Matching tip:** Suppliers often use their own product codes (e.g. LP100, PT050SPEC, QMC122) that differ from the RAS description.
+> Use secondary signals to match when names differ:
+> - Machine tonnage / capacity (e.g. "650T", "350 tons") appearing in both the PDF and RAS description
+> - Quantity, UOM, or price proximity to a RAS line
+> - Machine model or site location if mentioned in both
+
 {line_items_table}
 
 ---
