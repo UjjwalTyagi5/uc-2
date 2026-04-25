@@ -137,15 +137,27 @@ Return a **single JSON object** — no markdown fences, no extra text:
 }}
 
 ### Rules
+
+**Required fields — never null:**
+- `item_name` — always present; use the supplier's exact product/service name from the document.
+- `item_description` — always present; include all specs, model numbers, and technical details visible in the document.
+- `item_level_1`, `item_level_2`, `item_level_3` — always fill; you can always infer broad category, sub-category, and product type from the item name alone.
+- `commodity_tag` — always present; derive from the item type.
+
+**Pricing rules:**
+- Extract `unit_price` and `total_price` separately whenever both are shown.
+- If only a total price is shown and quantity > 1: `unit_price = total_price / quantity`.
+- If only one price is shown and quantity is 1 or absent: treat it as both unit_price and total_price.
+- Never leave both unit_price and total_price null if any price figure appears in the document for that item.
+
+**General rules:**
 - The quotation document is the primary source of truth. Extract all values (prices, quantities, dates, descriptions) from it — not from the RAS reference data.
 - All text fields MUST be in English — translate from any source language.
 - Dates must be ISO 8601 (YYYY-MM-DD).  Convert formats like "15-Apr-2026" or "15/04/26" accordingly.
 - Prices as plain numbers — strip currency symbols, commas, and thousand separators.
-- Distinguish unit price from total price.  If only one price is shown assume it is the unit price unless quantity = 1.
 - If a field genuinely cannot be determined from the document, return null (not an empty string, not "N/A").
-- item_level fields should be null when truly unknown — do not guess.
+- item_level_4 through item_level_8 may be null when information is genuinely absent — do not invent brand or model names.
 - Extract ALL items found in the document, even those not present in the requisition table (set purchase_dtl_id = null for those).
 - For matched items set purchase_dtl_id to the integer DTL_ID from the table.
 - Every item that you can reasonably match to a requisition line MUST have purchase_dtl_id set to the correct integer DTL_ID. Only return null for items that genuinely do not appear in the requisition (e.g. shipping charges, packing fees, taxes). When in doubt, assign the closest matching DTL_ID rather than returning null.
 - supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
-- commodity_tag should be a lowercase hyphenated slug that uniquely identifies the commodity family.
