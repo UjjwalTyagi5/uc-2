@@ -121,11 +121,11 @@ def _load_pdf(fp: pathlib.Path, max_pages: int, work_dir: pathlib.Path) -> Docum
             # Digital / text page — capture text; low-res image for layout
             text_pages.append(f"[Page {i + 1}]\n{page_text}")
             text_count += 1
-            pix = page.get_pixmap(dpi=100)
+            pix = page.get_pixmap(dpi=72)
         else:
             # Scanned page — high-res image is the only content source
             scanned_count += 1
-            pix = page.get_pixmap(dpi=200)
+            pix = page.get_pixmap(dpi=150)
 
         images.append(base64.b64encode(pix.tobytes("png")).decode())
 
@@ -133,8 +133,8 @@ def _load_pdf(fp: pathlib.Path, max_pages: int, work_dir: pathlib.Path) -> Docum
 
     text = "\n\n".join(text_pages) if text_pages else None
     logger.debug(
-        "PDF loaded: {}/{} page(s) — {} text page(s) @ 100 DPI, "
-        "{} scanned page(s) @ 200 DPI",
+        "PDF loaded: {}/{} page(s) — {} text page(s) @ 72 DPI, "
+        "{} scanned page(s) @ 150 DPI",
         total, page_count, text_count, scanned_count,
     )
     return DocumentContent(text=text, images=images, source_path=str(fp), page_count=total)
