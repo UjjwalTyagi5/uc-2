@@ -123,5 +123,6 @@ Return a **single JSON object** — no markdown fences, no extra text:
 - item_level fields should be null when truly unknown — do not guess.
 - Extract ALL items found in the document, even those not present in the requisition table (set purchase_dtl_id = null for those).
 - For matched items set purchase_dtl_id to the integer DTL_ID from the table.
+- Every item that you can reasonably match to a requisition line MUST have purchase_dtl_id set to the correct integer DTL_ID. Only return null for items that genuinely do not appear in the requisition (e.g. shipping charges, packing fees, taxes). When in doubt, assign the closest matching DTL_ID rather than returning null.
 - supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
 - commodity_tag should be a lowercase hyphenated slug that uniquely identifies the commodity family.

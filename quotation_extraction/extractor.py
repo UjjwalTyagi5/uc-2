@@ -349,15 +349,22 @@ def _align_to_ras_line_items(
     Result: exactly len(ras_context.line_items) rows per quotation source.
     """
     valid_dtl_ids = {li.purchase_dtl_id for li in ras_context.line_items}
+    logger.debug("Valid RAS DTL_IDs: {}", sorted(valid_dtl_ids))
 
     # Keep only items that map to a real RAS line item
-    matched = [i for i in items if i.purchase_dtl_id in valid_dtl_ids]
-    dropped = len(items) - len(matched)
-    if dropped:
-        logger.info(
-            "Dropped {} extracted item(s) not matching any RAS line item",
-            dropped,
-        )
+    matched: list[ExtractedItem] = []
+    for i in items:
+        if i.purchase_dtl_id in valid_dtl_ids:
+            matched.append(i)
+        else:
+            logger.warning(
+                "Dropped extracted item — dtl_id={} item_name={!r} desc={!r} "
+                "(not in RAS valid DTL_IDs: {})",
+                i.purchase_dtl_id,
+                i.item_name,
+                (i.item_description or "")[:120],
+                sorted(valid_dtl_ids),
+            )
 
     # Fill missing RAS line items with stub rows
     covered_dtl_ids = {i.purchase_dtl_id for i in matched}

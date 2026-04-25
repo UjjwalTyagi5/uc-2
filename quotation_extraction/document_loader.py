@@ -79,18 +79,43 @@ def load_document(
 # ── PDF ──
 
 
+_PDF_MIN_TEXT_CHARS = 100  # avg chars/page below which a PDF is treated as scanned
+
+
 def _load_pdf(fp: pathlib.Path, max_pages: int, work_dir: pathlib.Path) -> DocumentContent:
     import fitz  # PyMuPDF
 
     doc = fitz.open(str(fp))
     page_count = len(doc)
-    images: list[str] = []
     total = min(page_count, max_pages)
+
+    # Try text extraction first — reliable for digital PDFs; empty for scanned ones
+    text_pages: list[str] = []
+    for i in range(total):
+        page_text = doc[i].get_text("text").strip()
+        if page_text:
+            text_pages.append(page_text)
+
+    avg_chars = sum(len(p) for p in text_pages) / max(len(text_pages), 1) if text_pages else 0
+    if text_pages and avg_chars >= _PDF_MIN_TEXT_CHARS:
+        doc.close()
+        text = "\n\n".join(text_pages)
+        logger.debug(
+            "PDF text extracted: {}/{} pages, avg {:.0f} chars/page (work_dir={})",
+            len(text_pages), page_count, avg_chars, work_dir,
+        )
+        return DocumentContent(text=text, source_path=str(fp), page_count=total)
+
+    # Scanned / image-only PDF — render pages as images for vision-capable LLM
+    images: list[str] = []
     for i in range(total):
         pix = doc[i].get_pixmap(dpi=200)
         images.append(base64.b64encode(pix.tobytes("png")).decode())
     doc.close()
-    logger.debug("PDF rendered: {} pages → {} images (work_dir={})", page_count, total, work_dir)
+    logger.debug(
+        "PDF rendered as images: {} page(s) (avg {:.0f} chars/page, below threshold, work_dir={})",
+        total, avg_chars, work_dir,
+    )
     return DocumentContent(images=images, source_path=str(fp), page_count=total)
 
 
