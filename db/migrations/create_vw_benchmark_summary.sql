@@ -15,10 +15,11 @@ SELECT
     prm.[PURCHASE_REQ_NO],
 
     -- PR / line-item context
-    prd.[ITEMDESCRIPTION]        AS item_description,
+    prd.[ITEMDESCRIPTION]        AS item_description_user,
     prd.[Insourcing_flag]        AS insourcing_flag,
-    prm.[JUSTIFICATION]          AS justification,
-    prm.[LAST_APPROVED_COMMENTS] AS last_approved_comments,
+    prm.[JUSTIFICATION]          AS project_justification_user,
+    prm.[LAST_APPROVED_COMMENTS] AS last_approver_comments,
+    prt.[PURCHASE_REQ_TYPE]      AS item_category,
 
     br.[bp_unit_price]    AS recommended_unit_price,
     br.[bp_total_price]   AS recommended_total_price,
@@ -54,7 +55,7 @@ SELECT
     lst.[supplier_name]     AS last_hist_supplier_name,
     lst.[quotation_date]    AS last_hist_quotation_date,
 
-    -- L1 = lowest-priced proposal for this line item (is_selected_quote = 0 or NULL)
+    -- L1 = lowest-priced proposal for this line item (all quotes, including primary)
     proposals.l1_unit_price,
     proposals.l1_unit_price_eur,
     proposals.l1_total_price,
@@ -92,6 +93,9 @@ LEFT JOIN [ras_procurement].[purchase_req_detail] prd
 
 LEFT JOIN [ras_procurement].[purchase_req_mst] prm
   ON prm.[PURCHASE_REQ_ID] = prd.[PURCHASE_REQ_ID]
+
+LEFT JOIN [ras_procurement].[purchase_req_type] prt
+  ON prt.[PURCHASE_REQ_TYPE_ID] = prm.[PURCHASE_REQ_TYPE_ID]
 
 LEFT JOIN [ras_procurement].[quotation_extracted_items] low
   ON low.[extracted_item_uuid_pk] = br.[low_hist_item_fk]
@@ -131,8 +135,7 @@ OUTER APPLY (
                 ORDER BY COALESCE(p.[unit_price_eur], p.[unit_price]) ASC
             ) AS rn
         FROM [ras_procurement].[quotation_extracted_items] p
-        WHERE p.[purchase_dtl_id]   = br.[purchase_dtl_id]
-          AND (p.[is_selected_quote] = 0 OR p.[is_selected_quote] IS NULL)
+        WHERE p.[purchase_dtl_id] = br.[purchase_dtl_id]
           AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
     ) p
 ) proposals
