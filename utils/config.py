@@ -248,7 +248,7 @@ class AppConfig:
         # if these are missing.
         self.AOAI_ENDPOINT             = _optional("AZURE_OPENAI_ENDPOINT",             "")
         self.AOAI_API_KEY              = _optional("AZURE_OPENAI_API_KEY",              "")
-        self.AOAI_DEPLOYMENT           = _optional("AZURE_OPENAI_DEPLOYMENT",           "gpt-4o")
+        self.AOAI_DEPLOYMENT           = _optional("AZURE_OPENAI_DEPLOYMENT",           "gpt-4o")   # set this in .env to control the model for all pipeline stages
         self.AOAI_API_VERSION          = _optional("AZURE_OPENAI_API_VERSION",          "2025-04-01-preview")
         self.AOAI_EMBEDDING_DEPLOYMENT = _optional("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
         # Falls back to the chat model endpoint/key if not separately set
