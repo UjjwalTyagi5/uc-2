@@ -46,6 +46,7 @@ from pipeline.stages.blob_upload import BlobUploadStage
 from pipeline.stages.classification import ClassificationStage
 from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
 from pipeline.stages.ingestion import IngestionStage
+from pipeline.stages.complete import CompleteStage
 from pipeline.stages.embeddings import EmbeddingsStage
 from pipeline.stages.metadata_extraction import MetadataExtractionStage
 from pipeline.stages.price_benchmark import PriceBenchmarkStage
@@ -379,6 +380,7 @@ class PipelineOrchestrator:
         Stage 5 — METADATA_EXTRACTION  : extracts structured line items from quotations
         Stage 6 — EMBEDDINGS           : embeds selected items and upserts to Pinecone
         Stage 7 — PRICE_BENCHMARK      : benchmarks line item prices against historical data
+        Stage 8 — COMPLETE             : marks the PR as fully processed
         """
         return [
             IngestionStage(config),             # stage 1
@@ -388,4 +390,5 @@ class PipelineOrchestrator:
             MetadataExtractionStage(config),    # stage 5
             EmbeddingsStage(config),            # stage 6
             PriceBenchmarkStage(config),        # stage 7
+            CompleteStage(config),              # stage 8
         ]
