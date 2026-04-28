@@ -21,7 +21,6 @@ try:
     from azure.ai.documentintelligence.models import (
         AnalyzeDocumentRequest,
         AnalyzeResult,
-        ContentFormat,
     )
     from azure.core.credentials import AzureKeyCredential
     _SDK_OK = True
@@ -79,7 +78,7 @@ class AzureDocIntelClient:
             poller = self._client.begin_analyze_document(
                 model_id=self._model,
                 body=AnalyzeDocumentRequest(bytes_source=data),
-                output_content_format=ContentFormat.MARKDOWN,
+                output_content_format="markdown",
             )
             result: AnalyzeResult = poller.result()
         except Exception as exc:
