@@ -26,7 +26,6 @@ from utils.config import AppConfig
 from db.connection import connect_with_retry
 from pipeline.change_detector import SourceChangeDetector
 from pipeline.orchestrator import PipelineOrchestrator
-from price_benchmark.run import run_benchmark, run_all_pending
 
 # ── Log directory (created next to where the script is run from) ──────────
 _LOG_DIR = Path("logs")
@@ -164,12 +163,6 @@ def _build_parser() -> argparse.ArgumentParser:
             "Omit to process every pending PR.  Ignored when --pr-no is set."
         ),
     )
-    parser.add_argument(
-        "--skip-benchmark",
-        action="store_true",
-        default=False,
-        help="Run pipeline stages only — skip the price benchmarking step.",
-    )
     return parser
 
 
@@ -201,16 +194,6 @@ def main() -> None:
             )
             sys.exit(1)
 
-        if result.succeeded and not args.skip_benchmark:
-            logger.info(f"Pipeline complete for PR={args.pr_no!r} — running price benchmark")
-            try:
-                count = run_benchmark(args.pr_no, config)
-                logger.info(f"Price benchmark done — {count} row(s) written for PR={args.pr_no!r}")
-            except Exception as exc:
-                logger.opt(exception=True).warning(
-                    f"Price benchmark failed for PR={args.pr_no!r} (pipeline succeeded): {exc}"
-                )
-
         sys.exit(0 if result.succeeded else 1)
 
     # ── Normal batch run ──────────────────────────────────────────────────
@@ -228,24 +211,6 @@ def main() -> None:
     except Exception as exc:
         logger.opt(exception=True).critical(f"Unexpected pipeline error: {exc}")
         sys.exit(1)
-
-    if not args.skip_benchmark:
-        succeeded_prs = [r.purchase_req_no for r in results if r.succeeded]
-        if succeeded_prs:
-            logger.info(f"Pipeline done — running price benchmark for {len(succeeded_prs)} succeeded PR(s)")
-            benchmark_ok = 0
-            benchmark_fail = 0
-            for pr_no in succeeded_prs:
-                try:
-                    count = run_benchmark(pr_no, config)
-                    logger.info(f"Benchmark done: PR={pr_no!r} — {count} row(s)")
-                    benchmark_ok += 1
-                except Exception as exc:
-                    logger.opt(exception=True).warning(f"Benchmark failed for PR={pr_no!r}: {exc}")
-                    benchmark_fail += 1
-            logger.info(f"Price benchmark complete — {benchmark_ok} succeeded, {benchmark_fail} failed")
-        else:
-            logger.info("No PRs succeeded in this pipeline run — skipping benchmark")
 
     any_failed = any(not r.succeeded for r in results)
     sys.exit(1 if any_failed else 0)
