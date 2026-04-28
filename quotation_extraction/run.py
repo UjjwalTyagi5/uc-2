@@ -19,7 +19,7 @@ from loguru import logger
 
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
-from .extractor import QuotationExtractor, run_selection_llm_query
+from .extractor import QuotationExtractor, canonicalize_supplier_names, run_selection_llm_query
 from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
@@ -124,9 +124,6 @@ def run_extraction(
         logger.warning("No items extracted for {}", purchase_req_no)
         return []
 
-    # 4. Rank all items then select the winning source
-    run_selection_llm_query(all_items, ras_ctx, config)  # config unused but kept for signature compat
-
     logger.info(
         "Extraction complete for {}: {} items from {} quotation(s)",
         purchase_req_no,
@@ -134,9 +131,30 @@ def run_extraction(
         len(sources),
     )
 
-    # 5. Write to DB
     if write_to_db:
         writer = ExtractionWriter(config)
+
+        # 4. INSERT raw items to DB (is_selected_quote / quote_rank written as-is,
+        #    will be overwritten by update_selection_fields below)
         writer.write(all_items)
+
+        # 5. Canonicalize supplier names in DB using actual supplier_country values,
+        #    then sync the canonical names back to the in-memory items so ranking
+        #    uses the same names that are stored in the DB.
+        name_map = writer.canonicalize_supplier_names_in_db(all_items, ras_ctx)
+        for item in all_items:
+            if item.purchase_dtl_id is not None:
+                key = (item.purchase_dtl_id, (item.supplier_name or "").strip())
+                if key in name_map:
+                    item.supplier_name = name_map[key]
+
+        # 6. Rank and select using canonical names, then persist ranking to DB
+        run_selection_llm_query(all_items, ras_ctx, config)
+        writer.update_selection_fields(all_items)
+
+    else:
+        # write_to_db=False (testing / dry-run): canonicalize in-memory only
+        canonicalize_supplier_names(all_items, ras_ctx)
+        run_selection_llm_query(all_items, ras_ctx, config)
 
     return all_items

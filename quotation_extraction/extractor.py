@@ -261,6 +261,37 @@ _SELECTED_THRESHOLD = Decimal("0.70")   # min overall score to mark as selected 
 _PRICE_TOLERANCE    = Decimal("0.05")   # 5 % — prices within this band count as matching
 _PRICE_MAX_BOOST    = Decimal("0.10")   # max confidence boost from price alignment
 
+_CANONICALIZE_THRESHOLD = 0.82  # SequenceMatcher ratio to cluster two supplier names
+
+# Geographic tokens that differentiate country branches of the same company.
+# If both names contain geo tokens and those tokens differ, they are NOT merged.
+_GEO_TOKENS: frozenset[str] = frozenset({
+    "india", "china", "japan", "usa", "us", "uk", "germany", "france",
+    "italy", "korea", "taiwan", "singapore", "malaysia", "thailand",
+    "vietnam", "indonesia", "australia", "canada", "brazil", "mexico",
+    "uae", "dubai", "europe", "asia", "americas", "shanghai", "beijing",
+    "mumbai", "delhi",
+})
+
+
+def _strip_contact_suffix(name: str) -> str:
+    return re.sub(
+        r'\s*[-–]\s*(contact|email|ph|phone|tel|mob)[:\s].*$',
+        '', name, flags=re.IGNORECASE,
+    ).strip()
+
+
+def _name_geo_tokens(name: str) -> frozenset[str]:
+    words = re.findall(r'\b\w+\b', name.lower())
+    return frozenset(w for w in words if w in _GEO_TOKENS)
+
+
+def _is_acronym_of(short: str, long_name: str) -> bool:
+    """True if short is all-caps (≤ 6 chars) and matches the initials of long_name."""
+    if not short.isupper() or len(short) > 6:
+        return False
+    initials = ''.join(m[0].upper() for m in re.findall(r'\b[A-Za-z]', long_name))
+    return short == initials[:len(short)]
 
 
 def _compute_supplier_match(
@@ -884,6 +915,95 @@ def compute_quote_ranks(
         )
         for rank, item in enumerate(items, 1):
             item.quote_rank = rank
+
+
+def canonicalize_supplier_names(
+    items: list[ExtractedItem],
+    ras_context: RASContext,
+) -> None:
+    """Cluster variant supplier names and rewrite item.supplier_name to canonical.
+
+    Merge rules (evaluated after stripping contact suffixes):
+      1. Cleaned names are identical (case-insensitive)
+      2. One cleaned name is a substring of the other
+      3. SequenceMatcher ratio >= _CANONICALIZE_THRESHOLD
+      4. One name is the initials/acronym of the other (e.g. TCS → Tata Consultancy Services)
+
+    Guard: if both names contain geo tokens that differ (e.g. "India" vs "China"),
+    they are NOT merged — different country branches are separate suppliers.
+
+    Canonical preference: RAS-known name first, then shortest name in cluster.
+    Mutates items in-place.
+    """
+    from collections import defaultdict
+
+    raw_names: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        n = (item.supplier_name or "").strip()
+        if n and n not in seen:
+            raw_names.append(n)
+            seen.add(n)
+
+    if len(raw_names) < 2:
+        return
+
+    ras_known: set[str] = set()
+    if ras_context.supplier_name:
+        ras_known.add(ras_context.supplier_name.strip().lower())
+    if ras_context.parent_supplier:
+        ras_known.add(ras_context.parent_supplier.strip().lower())
+    for li in ras_context.line_items:
+        if li.supplier_name:
+            ras_known.add(li.supplier_name.strip().lower())
+
+    parent: dict[str, str] = {n: n for n in raw_names}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        parent[find(a)] = find(b)
+
+    for i, a in enumerate(raw_names):
+        a_clean = _strip_contact_suffix(a).lower()
+        a_geo   = _name_geo_tokens(a_clean)
+        for b in raw_names[i + 1:]:
+            b_clean = _strip_contact_suffix(b).lower()
+            b_geo   = _name_geo_tokens(b_clean)
+
+            if a_geo and b_geo and a_geo != b_geo:
+                continue  # different country branches — keep separate
+
+            if a_clean == b_clean:
+                union(a, b)
+            elif a_clean in b_clean or b_clean in a_clean:
+                union(a, b)
+            elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _CANONICALIZE_THRESHOLD:
+                union(a, b)
+            elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
+                union(a, b)
+
+    clusters: dict[str, list[str]] = defaultdict(list)
+    for n in raw_names:
+        clusters[find(n)].append(n)
+
+    canonical_map: dict[str, str] = {}
+    for members in clusters.values():
+        ras_match = next((m for m in members if m.lower() in ras_known), None)
+        canonical = ras_match if ras_match else min(members, key=len)
+        for m in members:
+            canonical_map[m] = canonical
+            if m != canonical:
+                logger.debug("Supplier canonicalized: {!r} → {!r}", m, canonical)
+
+    for item in items:
+        n = (item.supplier_name or "").strip()
+        if n in canonical_map:
+            item.supplier_name = canonical_map[n]
 
 
 # ── Public API ──
