@@ -160,7 +160,8 @@ def _build_user_prompt(
     def _f(val: object) -> str:
         return str(val) if val is not None else "N/A"
 
-    raw_ras_context = _build_raw_context_block(ctx)
+    include_prices  = getattr(config, "EXTRACTION_INCLUDE_PRICE_COLS", True)
+    raw_ras_context = _build_raw_context_block(ctx, include_prices=include_prices)
 
     return tpl.format(
         purchase_req_no=ctx.purchase_req_no,
@@ -193,10 +194,7 @@ def _build_user_prompt(
         payment_days=_f(ctx.payment_days),
         po_date=_f(ctx.po_date),
         category_buyer=_f(ctx.category_buyer),
-        line_items_table=_build_line_items_table(
-            ctx.line_items,
-            include_prices=getattr(config, "EXTRACTION_INCLUDE_PRICE_COLS", True),
-        ),
+        line_items_table=_build_line_items_table(ctx.line_items, include_prices=include_prices),
         item_taxonomy=taxonomy,
         document_content=doc_content_str,
         raw_ras_context=raw_ras_context,
@@ -206,7 +204,21 @@ def _build_user_prompt(
 # ── Raw RAS context block ──
 
 
-def _build_raw_context_block(ctx: RASContext) -> str:
+# Column names (case-insensitive) stripped from raw context blocks when
+# include_prices=False, to prevent the LLM anchoring on DB price data.
+_PRICE_COL_NAMES: frozenset[str] = frozenset({
+    "price", "unit_price", "original_value", "initial_offer",
+    "negotiation", "req_value", "purchase_value",
+})
+
+
+def _filter_price_cols(row: dict, include_prices: bool) -> dict:
+    if include_prices:
+        return row
+    return {k: v for k, v in row.items() if k.lower() not in _PRICE_COL_NAMES}
+
+
+def _build_raw_context_block(ctx: RASContext, include_prices: bool = True) -> str:
     """Format raw DB rows as a compact reference block for the LLM prompt.
 
     Returns an empty string when all raw data is absent (non-fatal path).
@@ -214,26 +226,29 @@ def _build_raw_context_block(ctx: RASContext) -> str:
     parts: list[str] = []
 
     if ctx.raw_mst:
-        lines = [f"  {k}: {v}" for k, v in ctx.raw_mst.items()]
+        filtered_mst = _filter_price_cols(ctx.raw_mst, include_prices)
+        lines = [f"  {k}: {v}" for k, v in filtered_mst.items()]
         parts.append("#### purchase_req_mst (header)\n" + "\n".join(lines))
 
     if ctx.raw_dtl_rows:
-        cols = list(ctx.raw_dtl_rows[0].keys())
+        filtered_dtl = [_filter_price_cols(r, include_prices) for r in ctx.raw_dtl_rows]
+        cols   = list(filtered_dtl[0].keys())
         header = "| " + " | ".join(cols) + " |"
         sep    = "|" + "|".join("---" for _ in cols) + "|"
         rows   = [
             "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
-            for r in ctx.raw_dtl_rows
+            for r in filtered_dtl
         ]
         parts.append("#### purchase_req_detail (all line items)\n" + "\n".join([header, sep] + rows))
 
     if ctx.raw_vw_rows:
-        cols = list(ctx.raw_vw_rows[0].keys())
+        filtered_vw = [_filter_price_cols(r, include_prices) for r in ctx.raw_vw_rows]
+        cols   = list(filtered_vw[0].keys())
         header = "| " + " | ".join(cols) + " |"
         sep    = "|" + "|".join("---" for _ in cols) + "|"
         rows   = [
             "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
-            for r in ctx.raw_vw_rows
+            for r in filtered_vw
         ]
         parts.append("#### vw_get_ras_data_for_bidashboard (BI context)\n" + "\n".join([header, sep] + rows))
 
