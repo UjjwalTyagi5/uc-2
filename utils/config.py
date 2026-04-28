@@ -289,6 +289,13 @@ class AppConfig:
         # OCR model: prebuilt-layout (markdown + tables) or prebuilt-read (plain text, cheaper)
         self.AZURE_DOC_INTEL_MODEL    = _optional("AZURE_DOC_INTEL_MODEL", "prebuilt-layout")
 
+        # ── Extraction price-column visibility ────────────────────────────────
+        # When True (default), unit_price / original_value / initial_offer /
+        # negotiated / req_value columns from purchase_req_detail are included
+        # in the line-items table sent to the LLM.
+        # Set to 0/false to hide them and avoid LLM anchoring on DB prices.
+        self.EXTRACTION_INCLUDE_PRICE_COLS = _optional("EXTRACTION_INCLUDE_PRICE_COLS", "1").lower() not in ("0", "false", "no")
+
         # ── Excel pipeline approval-status filter ──────────────────────────
         # Comma-separated PURCHASEFINALAPPROVALSTATUS values accepted by
         # run_pipeline_from_excel.py.  PRs with any other status are skipped.

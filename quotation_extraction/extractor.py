@@ -53,42 +53,72 @@ def _na(val: object) -> str:
     return str(val)
 
 
-def _build_line_items_table(items: list[LineItemContext]) -> str:
-    header = (
-        "| DTL_ID | Item No | Item Code | Description | Qty | UOM | Type "
-        "| Unit Price | Original Value | Initial Offer | Negotiated "
-        "| Req Value | Discount | Currency | Supplier "
-        "| Delivery Date | Prepayment | Payment Terms | Comments |"
-    )
-    sep = (
-        "|--------|---------|-----------|-------------|-----|-----|------"
-        "|------------|----------------|---------------|----------"
-        "|-----------|----------|----------|----------"
-        "|---------------|------------|---------------|----------|"
-    )
+def _build_line_items_table(items: list[LineItemContext], include_prices: bool = True) -> str:
+    if include_prices:
+        header = (
+            "| DTL_ID | Item No | Item Code | Description | Qty | UOM | Type "
+            "| Unit Price | Original Value | Initial Offer | Negotiated "
+            "| Req Value | Discount | Currency | Supplier "
+            "| Delivery Date | Prepayment | Payment Terms | Comments |"
+        )
+        sep = (
+            "|--------|---------|-----------|-------------|-----|-----|------"
+            "|------------|----------------|---------------|----------"
+            "|-----------|----------|----------|----------"
+            "|---------------|------------|---------------|----------|"
+        )
+    else:
+        header = (
+            "| DTL_ID | Item No | Item Code | Description | Qty | UOM | Type "
+            "| Currency | Supplier "
+            "| Delivery Date | Prepayment | Payment Terms | Comments |"
+        )
+        sep = (
+            "|--------|---------|-----------|-------------|-----|-----|------"
+            "|----------|----------"
+            "|---------------|------------|---------------|----------|"
+        )
+
     rows = [header, sep]
     for li in items:
-        rows.append(
-            f"| {_na(li.purchase_dtl_id)} "
-            f"| {_na(li.item_no)} "
-            f"| {_na(li.item_code)} "
-            f"| {_na(li.item_description)} "
-            f"| {_na(li.quantity)} "
-            f"| {_na(li.uom)} "
-            f"| {_na(li.item_type)} "
-            f"| {_na(li.unit_price)} "
-            f"| {_na(li.original_value)} "
-            f"| {_na(li.initial_offer)} "
-            f"| {_na(li.negotiation)} "
-            f"| {_na(li.req_value)} "
-            f"| {_na(li.discount)} "
-            f"| {_na(li.currency)} "
-            f"| {_na(li.supplier_name)} "
-            f"| {_na(li.delivery_date)} "
-            f"| {_na(li.prepayment)} "
-            f"| {_na(li.payment_details)} "
-            f"| {_na(li.comments)} |"
-        )
+        if include_prices:
+            rows.append(
+                f"| {_na(li.purchase_dtl_id)} "
+                f"| {_na(li.item_no)} "
+                f"| {_na(li.item_code)} "
+                f"| {_na(li.item_description)} "
+                f"| {_na(li.quantity)} "
+                f"| {_na(li.uom)} "
+                f"| {_na(li.item_type)} "
+                f"| {_na(li.unit_price)} "
+                f"| {_na(li.original_value)} "
+                f"| {_na(li.initial_offer)} "
+                f"| {_na(li.negotiation)} "
+                f"| {_na(li.req_value)} "
+                f"| {_na(li.discount)} "
+                f"| {_na(li.currency)} "
+                f"| {_na(li.supplier_name)} "
+                f"| {_na(li.delivery_date)} "
+                f"| {_na(li.prepayment)} "
+                f"| {_na(li.payment_details)} "
+                f"| {_na(li.comments)} |"
+            )
+        else:
+            rows.append(
+                f"| {_na(li.purchase_dtl_id)} "
+                f"| {_na(li.item_no)} "
+                f"| {_na(li.item_code)} "
+                f"| {_na(li.item_description)} "
+                f"| {_na(li.quantity)} "
+                f"| {_na(li.uom)} "
+                f"| {_na(li.item_type)} "
+                f"| {_na(li.currency)} "
+                f"| {_na(li.supplier_name)} "
+                f"| {_na(li.delivery_date)} "
+                f"| {_na(li.prepayment)} "
+                f"| {_na(li.payment_details)} "
+                f"| {_na(li.comments)} |"
+            )
     return "\n".join(rows)
 
 
@@ -163,7 +193,10 @@ def _build_user_prompt(
         payment_days=_f(ctx.payment_days),
         po_date=_f(ctx.po_date),
         category_buyer=_f(ctx.category_buyer),
-        line_items_table=_build_line_items_table(ctx.line_items),
+        line_items_table=_build_line_items_table(
+            ctx.line_items,
+            include_prices=getattr(config, "EXTRACTION_INCLUDE_PRICE_COLS", True),
+        ),
         item_taxonomy=taxonomy,
         document_content=doc_content_str,
         raw_ras_context=raw_ras_context,
