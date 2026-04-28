@@ -32,14 +32,18 @@ class ExtractionLLMClient:
     """Thin wrapper around AzureChatOpenAI that builds multimodal messages."""
 
     def __init__(self, config: ExtractionConfig) -> None:
-        self._llm = AzureChatOpenAI(
+        llm_kwargs: dict = dict(
             azure_deployment=config.AOAI_DEPLOYMENT,
             azure_endpoint=config.AOAI_ENDPOINT,
             api_key=config.AOAI_API_KEY,
             api_version=config.AOAI_API_VERSION,
-            temperature=config.LLM_TEMPERATURE,
             max_tokens=config.LLM_MAX_TOKENS,
         )
+        # Some newer models (e.g. gpt-5.2) reject temperature=0 explicitly.
+        # Only pass temperature when the user set a non-zero value.
+        if config.LLM_TEMPERATURE != 0:
+            llm_kwargs["temperature"] = config.LLM_TEMPERATURE
+        self._llm = AzureChatOpenAI(**llm_kwargs)
         self._config = config
 
     # ── public ──
