@@ -30,24 +30,10 @@ def classify_file(file_bytes: bytes, filename: str) -> dict:
         metadata=extraction.metadata,
     )
 
-    # Step 3: Classify with mini model first
-    result = _classify_with_llm(extraction, filename, file_type, use_mini=True)
+    # Step 3: Classify
+    result = _classify_with_llm(extraction, filename, file_type)
 
-    # Step 4: Escalate to full model if confidence is low OR if mini predicted "Other" with weak signal
-    needs_escalation = (
-        result.get("confidence", 0) < settings.confidence_threshold
-        or result.get("classification") == "Other" and result.get("confidence", 0) < 0.85
-    )
-    if needs_escalation:
-        logger.info(
-            "Escalating to stronger model",
-            confidence=result.get("confidence"),
-            classification=result.get("classification"),
-            filename=filename,
-        )
-        result = _classify_with_llm(extraction, filename, file_type, use_mini=False)
-
-    # Step 5: Validate and return
+    # Step 4: Validate and return
     result = _validate_result(result)
     elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -68,7 +54,6 @@ def _classify_with_llm(
     extraction: ExtractionResult,
     filename: str,
     file_type: str,
-    use_mini: bool,
 ) -> dict:
     extra_meta = ""
     for key, value in extraction.metadata.items():
@@ -80,7 +65,7 @@ def _classify_with_llm(
             file_type=file_type,
             extra_metadata=extra_meta,
         )
-        return call_llm_vision(SYSTEM_PROMPT, user_prompt, extraction.image_base64, use_mini=use_mini)
+        return call_llm_vision(SYSTEM_PROMPT, user_prompt, extraction.image_base64)
     else:
         truncated_content = truncate_to_token_limit(
             extraction.text_content,
@@ -92,7 +77,7 @@ def _classify_with_llm(
             extra_metadata=extra_meta,
             extracted_content=truncated_content,
         )
-        return call_llm_text(SYSTEM_PROMPT, user_prompt, use_mini=use_mini)
+        return call_llm_text(SYSTEM_PROMPT, user_prompt)
 
 
 def _validate_result(result: dict) -> dict:

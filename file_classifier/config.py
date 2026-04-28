@@ -14,12 +14,10 @@ class Settings(BaseSettings):
     azure_openai_api_version: str = Field(default="2024-10-21")
     # Falls back to AZURE_OPENAI_DEPLOYMENT (shared pipeline var) if not set explicitly
     azure_openai_deployment_name: str = Field(default="")
-    azure_openai_mini_deployment_name: str = Field(default="gpt-4o-mini")
 
     # OpenAI
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-4o")
-    openai_mini_model: str = Field(default="gpt-4o-mini")
 
     # Classification
     confidence_threshold: float = Field(default=0.75)
