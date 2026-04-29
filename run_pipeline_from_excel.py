@@ -1,7 +1,7 @@
 """
 run_pipeline_from_excel.py
 --------------------------
-Run the full attachment pipeline (stages 1–6: INGESTION → EMBEDDINGS) for a
+Run the full attachment pipeline (stages 1–8: INGESTION → COMPLETE) for a
 list of purchase requisition numbers read from an Excel file.
 
 Each PR is processed from scratch — any existing pipeline data is wiped and
@@ -258,8 +258,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python run_pipeline_from_excel.py",
         description=(
-            "Run the full pipeline (INGESTION → EMBEDDINGS) for PRs listed in "
-            "an Excel file.  Each PR is reprocessed from scratch."
+            "Run the full pipeline (INGESTION → COMPLETE, all 8 stages) for PRs "
+            "listed in an Excel file.  Each PR is reprocessed from scratch."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
