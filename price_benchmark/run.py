@@ -132,8 +132,28 @@ def run_benchmark(
         llm_out = llm.analyze(row, historical, curr_unit_eur=curr_unit_eur)
 
         bp_unit = _to_decimal(llm_out.get("bp_unit_price"))
-        infl    = _to_decimal(llm_out.get("inflation_pct"))
         summary = llm_out.get("summary") or ""
+
+        # Separate focused inflation query: "I'm buying this item from country X —
+        # what is the inflation rate from ref_year to current_year?"
+        supplier_country = (low_item.supplier_country if low_item else None) or row.get("supplier_country")
+        current_pr_dt    = row.get("pr_c_datetime")
+        ref_year         = low_item.pr_c_datetime.year if (low_item and low_item.pr_c_datetime) else None
+        current_year_val = current_pr_dt.year if hasattr(current_pr_dt, "year") else None
+        item_category    = " > ".join(filter(None, [row.get(f"item_level_{i}") for i in range(1, 4)]))
+
+        raw_infl = llm.estimate_inflation(
+            item_name        = row.get("item_name"),
+            item_category    = item_category or None,
+            supplier_country = supplier_country,
+            ref_year         = ref_year,
+            current_year     = current_year_val,
+            historical_items = historical or None,
+        )
+        infl = _to_decimal(raw_infl)
+        if infl is not None:
+            logger.info("dtl_id={}: LLM inflation estimate = {}% (country={!r} {}-{})",
+                        dtl_id, infl, supplier_country, ref_year, current_year_val)
 
         quantity = _to_decimal(row.get("quantity")) or Decimal("1")
         bp_total = _round2(bp_unit * quantity) if bp_unit is not None else None
