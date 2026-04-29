@@ -21,8 +21,8 @@ SELECT
     prm.[LAST_APPROVED_COMMENTS] AS last_approver_comments,
     prt.[PURCHASE_REQ_TYPE]      AS item_category,
 
-    br.[bp_unit_price]    AS recommended_unit_price,
-    br.[bp_total_price]   AS recommended_total_price,
+    br.[bp_unit_price]    AS recommended_unit_price_eur,
+    br.[bp_total_price]   AS recommended_total_price_eur,
     br.[inflation_pct]    AS recommended_inflation_pct,
     br.[cpi_inflation_pct],
     br.[summary]          AS recommendation_summary,
