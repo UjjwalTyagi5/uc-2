@@ -15,9 +15,6 @@ from file_classifier.config import settings
 
 logger = structlog.get_logger()
 
-# Cache: once we learn a model doesn't support temperature=0, remember it
-_models_without_temperature: set[str] = set()
-
 _client_cache: tuple | None = None
 
 # ── Retry configuration ──────────────────────────────────────────────────
@@ -108,23 +105,16 @@ def _create_completion(client, model: str, **kwargs) -> str:
     Does NOT retry on: BadRequestError (400), AuthenticationError (401),
     PermissionDeniedError (403), NotFoundError (404) — these are permanent.
     """
-    extra = {}
-    if model not in _models_without_temperature:
-        extra["temperature"] = 0.0
-
+    # Never send temperature=0 — newer models (e.g. gpt-5.2) reject it explicitly.
+    # Omitting temperature lets the model use its default (deterministic where supported).
     last_error: Exception | None = None
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            response = client.chat.completions.create(model=model, **extra, **kwargs)
+            response = client.chat.completions.create(model=model, **kwargs)
             return response.choices[0].message.content
 
         except BadRequestError as e:
-            if "temperature" in str(e):
-                logger.info("Model does not support temperature=0, caching for future calls", model=model)
-                _models_without_temperature.add(model)
-                extra.pop("temperature", None)
-                continue  # retry immediately without counting as a failure
             if "content_filter" in str(e):
                 logger.warning(
                     "Azure content filter triggered — document will be classified as Others",
