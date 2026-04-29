@@ -301,6 +301,14 @@ class PipelineOrchestrator:
             self._log.opt(exception=failed.error).error(
                 f"PR={pr_no!r} stopped at stage={failed.stage_name!r}: {failed.error}"
             )
+            if work_folder.exists():
+                try:
+                    shutil.rmtree(work_folder)
+                    self._log.info(f"Removed local work folder after EXCEPTION: {work_folder}")
+                except Exception as exc:
+                    self._log.warning(
+                        f"Could not remove work folder {work_folder}: {exc}"
+                    )
         return pr_result
 
     def _handle_stage_failure(self, pr_no: str, result: StageResult) -> None:
