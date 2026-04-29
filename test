@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -64,6 +65,12 @@ class AgentCoreETLSync(Node):
             value=4,
             info="How many tables to sync at the same time. Set to 1 for sequential.",
         ),
+        IntInput(
+            name="max_retries",
+            display_name="Max Retries (transient errors)",
+            value=3,
+            info="How many times to retry a segment or table on network/timeout errors.",
+        ),
         MultilineInput(
             name="table_filters_json",
             display_name="Table Filters JSON",
@@ -121,11 +128,29 @@ class AgentCoreETLSync(Node):
             f"PWD={cfg['password']};"
             f"Encrypt={encrypt};"
             "TrustServerCertificate=yes;"
-            "Connection Timeout=10;"
+            "Connection Timeout=30;"
         )
 
     def _connect(self, conn_str: str) -> pyodbc.Connection:
-        return pyodbc.connect(conn_str, timeout=10)
+        return pyodbc.connect(conn_str, timeout=30)
+
+    def _is_transient(self, exc: Exception) -> bool:
+        transient_states = {"08S01", "08001", "HYT00", "HYT01", "40001", "40613"}
+        transient_words  = [
+            "communication link failure", "tcp provider",
+            "connection timeout", "connection reset",
+            "timed out", "broken pipe", "10060", "10054",
+        ]
+        for arg in getattr(exc, "args", []):
+            if isinstance(arg, str):
+                arg_lower = arg.lower()
+                if any(s in arg for s in transient_states):
+                    return True
+                if any(w in arg_lower for w in transient_words):
+                    return True
+            if hasattr(arg, "SQLSTATE") and arg.SQLSTATE in transient_states:
+                return True
+        return any(w in str(exc).lower() for w in transient_words)
 
     def _quote(self, name: str) -> str:
         parts = [p.strip().strip("[]") for p in str(name).split(".")]
@@ -155,7 +180,7 @@ class AgentCoreETLSync(Node):
             etl_id, datetime.now(), status, row_count, error,
         )
 
-    # ── inner segment loader ──────────────────────────────────────────────────
+    # ── segment loader with retry ─────────────────────────────────────────────
 
     def _load_segment(
         self,
@@ -170,42 +195,71 @@ class AgentCoreETLSync(Node):
         counter: list,
         lock: threading.Lock,
     ):
-        src = self._connect(src_cs)
-        tgt = self._connect(tgt_cs)
-        try:
-            seg_sql = (
-                f"{select_base} "
-                f"ORDER BY (SELECT NULL) "
-                f"OFFSET {offset} ROWS FETCH NEXT {fetch_n} ROWS ONLY"
-            )
-            ins_sql = (
-                f"INSERT INTO {self._quote(staging)} "
-                f"({column_sql}) VALUES ({placeholders})"
-            )
-            sc = src.cursor()
-            sc.execute(seg_sql)
-            tc = tgt.cursor()
-            tc.fast_executemany = True
-            batch = []
-            chunk = max(1, int(self.batch_size or 5000))
-            for row in sc:
-                batch.append(row)
-                if len(batch) >= chunk:
+        retries = max(1, int(self.max_retries or 3))
+        ins_sql = (
+            f"INSERT INTO {self._quote(staging)} "
+            f"({column_sql}) VALUES ({placeholders})"
+        )
+        seg_sql = (
+            f"{select_base} "
+            f"ORDER BY (SELECT NULL) "
+            f"OFFSET {offset} ROWS FETCH NEXT {fetch_n} ROWS ONLY"
+        )
+        chunk = max(1, int(self.batch_size or 5000))
+
+        for attempt in range(retries + 1):
+            src = None
+            tgt = None
+            rows_this_attempt = 0
+            try:
+                src = self._connect(src_cs)
+                tgt = self._connect(tgt_cs)
+
+                sc = src.cursor()
+                sc.execute(seg_sql)
+                tc = tgt.cursor()
+                tc.fast_executemany = True
+
+                batch = []
+                for row in sc:
+                    batch.append(row)
+                    if len(batch) >= chunk:
+                        tc.executemany(ins_sql, batch)
+                        rows_this_attempt += len(batch)
+                        batch = []
+                if batch:
                     tc.executemany(ins_sql, batch)
-                    tgt.commit()
-                    with lock:
-                        counter[0] += len(batch)
-                    batch = []
-            if batch:
-                tc.executemany(ins_sql, batch)
+                    rows_this_attempt += len(batch)
+
+                # commit only after entire segment loaded — clean rollback on retry
                 tgt.commit()
                 with lock:
-                    counter[0] += len(batch)
-        finally:
-            src.close()
-            tgt.close()
+                    counter[0] += rows_this_attempt
+                return  # success
 
-    # ── per-table sync ────────────────────────────────────────────────────────
+            except Exception as exc:
+                if tgt:
+                    try:
+                        tgt.rollback()
+                    except Exception:
+                        pass
+                if attempt >= retries or not self._is_transient(exc):
+                    raise
+                delay = 2 ** attempt
+                self.log(
+                    f"Segment offset={offset} attempt {attempt+1}/{retries} "
+                    f"failed ({exc!s:.80}), retrying in {delay}s…"
+                )
+                time.sleep(delay)
+            finally:
+                for conn in (src, tgt):
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+    # ── per-table sync with retry ─────────────────────────────────────────────
 
     def _sync_table(
         self,
@@ -217,109 +271,129 @@ class AgentCoreETLSync(Node):
         filters: dict,
         exclusions: dict,
     ) -> dict:
-        staging = self._staging_table(target_table)
-        workers = max(1, int(self.parallel_workers or 4))
-        result = {
-            "etl_id": etl_id,
-            "source": source_table,
-            "target": target_table,
-            "status": "failed",
-            "rows": 0,
-            "error": "",
+        staging  = self._staging_table(target_table)
+        workers  = max(1, int(self.parallel_workers or 4))
+        retries  = max(1, int(self.max_retries or 3))
+        result   = {
+            "etl_id": etl_id, "source": source_table,
+            "target": target_table, "status": "failed",
+            "rows": 0, "error": "",
         }
 
-        tgt = self._connect(tgt_cs)
-        try:
-            filter_key = source_table.split(".")[-1].lower()
-            where = filters.get(filter_key, "")
-
-            # ── row count + columns from source ───────────────────────
-            src = self._connect(src_cs)
-            sc = src.cursor()
-            count_sql = (
-                f"SELECT COUNT(*) FROM {self._quote(source_table)}"
-                + (f" WHERE {where}" if where else "")
-            )
-            sc.execute(count_sql)
-            total = sc.fetchone()[0]
-
-            sc.execute(f"SELECT TOP 0 * FROM {self._quote(source_table)}")
-            excluded = {c.lower() for c in exclusions.get(filter_key, [])}
-            cols = [col[0] for col in sc.description if col[0].lower() not in excluded]
-            src.close()
-
-            if not cols:
-                raise ValueError(f"No columns found for {source_table}")
-
-            column_sql   = ", ".join(self._quote(c) for c in cols)
-            placeholders = ", ".join("?" for _ in cols)
-            select_base  = (
-                f"SELECT {column_sql} FROM {self._quote(source_table)}"
-                + (f" WHERE {where}" if where else "")
-            )
-
-            # ── create staging ────────────────────────────────────────
-            tc = tgt.cursor()
-            self._drop_staging(tc, staging)
-            tc.execute(
-                f"SELECT TOP 0 {column_sql} INTO {self._quote(staging)} "
-                f"FROM {self._quote(target_table)}"
-            )
-            tgt.commit()
-
-            # ── parallel segment load ─────────────────────────────────
-            counter = [0]
-            lock = threading.Lock()
-            segment = max(1, total // workers)
-
-            self.log(f"[{target_table}] {total:,} rows | {workers} workers | segment={segment:,}")
-
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = []
-                for i in range(workers):
-                    off = i * segment
-                    n   = segment if i < workers - 1 else total - off
-                    if n > 0:
-                        futures.append(pool.submit(
-                            self._load_segment,
-                            src_cs, tgt_cs, staging,
-                            column_sql, placeholders, select_base,
-                            off, n, counter, lock,
-                        ))
-                for f in as_completed(futures):
-                    f.result()
-
-            # ── atomic swap ───────────────────────────────────────────
-            tc.execute(f"TRUNCATE TABLE {self._quote(target_table)}")
-            tc.execute(
-                f"INSERT INTO {self._quote(target_table)} ({column_sql}) "
-                f"SELECT {column_sql} FROM {self._quote(staging)}"
-            )
-            self._drop_staging(tc, staging)
-            self._write_status(tc, etl_id, "Success", counter[0])
-            tgt.commit()
-
-            result.update(status="success", rows=counter[0])
-            self.log(f"[{target_table}] done — {counter[0]:,} rows")
-            return result
-
-        except Exception as exc:
-            tgt.rollback()
+        for attempt in range(retries + 1):
+            tgt = None
             try:
-                tc2 = tgt.cursor()
-                self._drop_staging(tc2, staging)
-                self._write_status(tc2, etl_id, "Failed", result["rows"], str(exc))
+                filter_key = source_table.split(".")[-1].lower()
+                where      = filters.get(filter_key, "")
+
+                # ── row count + columns ───────────────────────────────
+                src = self._connect(src_cs)
+                sc  = src.cursor()
+                count_sql = (
+                    f"SELECT COUNT(*) FROM {self._quote(source_table)}"
+                    + (f" WHERE {where}" if where else "")
+                )
+                sc.execute(count_sql)
+                total = sc.fetchone()[0]
+
+                sc.execute(f"SELECT TOP 0 * FROM {self._quote(source_table)}")
+                excluded = {c.lower() for c in exclusions.get(filter_key, [])}
+                cols     = [col[0] for col in sc.description if col[0].lower() not in excluded]
+                src.close()
+
+                if not cols:
+                    raise ValueError(f"No columns found for {source_table}")
+
+                column_sql   = ", ".join(self._quote(c) for c in cols)
+                placeholders = ", ".join("?" for _ in cols)
+                select_base  = (
+                    f"SELECT {column_sql} FROM {self._quote(source_table)}"
+                    + (f" WHERE {where}" if where else "")
+                )
+
+                # ── create fresh staging ──────────────────────────────
+                tgt = self._connect(tgt_cs)
+                tc  = tgt.cursor()
+                self._drop_staging(tc, staging)
+                tc.execute(
+                    f"SELECT TOP 0 {column_sql} INTO {self._quote(staging)} "
+                    f"FROM {self._quote(target_table)}"
+                )
                 tgt.commit()
-            except Exception:
-                pass
-            result["error"] = str(exc)
-            self.log(f"[{target_table}] FAILED: {exc}")
-            return result
-        finally:
-            try:
-                tgt.close()
-            except Exception:
-                pass
+
+                # ── parallel segment load ─────────────────────────────
+                counter = [0]
+                lock    = threading.Lock()
+                segment = max(1, total // workers)
+
+                self.log(
+                    f"[{target_table}] {total:,} rows | "
+                    f"{workers} workers | segment={segment:,} | attempt {attempt+1}"
+                )
+
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = []
+                    for i in range(workers):
+                        off = i * segment
+                        n   = segment if i < workers - 1 else total - off
+                        if n > 0:
+                            futures.append(pool.submit(
+                                self._load_segment,
+                                src_cs, tgt_cs, staging,
+                                column_sql, placeholders, select_base,
+                                off, n, counter, lock,
+                            ))
+                    for f in as_completed(futures):
+                        f.result()
+
+                # ── atomic swap ───────────────────────────────────────
+                tc.execute(f"TRUNCATE TABLE {self._quote(target_table)}")
+                tc.execute(
+                    f"INSERT INTO {self._quote(target_table)} ({column_sql}) "
+                    f"SELECT {column_sql} FROM {self._quote(staging)}"
+                )
+                self._drop_staging(tc, staging)
+                self._write_status(tc, etl_id, "Success", counter[0])
+                tgt.commit()
+
+                result.update(status="success", rows=counter[0])
+                self.log(f"[{target_table}] done — {counter[0]:,} rows")
+                return result
+
+            except Exception as exc:
+                if tgt:
+                    try:
+                        tgt.rollback()
+                        self._drop_staging(tgt.cursor(), staging)
+                        tgt.commit()
+                    except Exception:
+                        pass
+                if attempt >= retries or not self._is_transient(exc):
+                    try:
+                        conn2 = self._connect(tgt_cs)
+                        cur2  = conn2.cursor()
+                        self._write_status(cur2, etl_id, "Failed", result["rows"], str(exc))
+                        conn2.commit()
+                        conn2.close()
+                    except Exception:
+                        pass
+                    result["error"] = str(exc)
+                    self.log(f"[{target_table}] FAILED: {exc}")
+                    return result
+                delay = 2 ** attempt
+                self.log(
+                    f"[{target_table}] attempt {attempt+1}/{retries} failed "
+                    f"({exc!s:.80}), retrying in {delay}s…"
+                )
+                time.sleep(delay)
+            finally:
+                if tgt:
+                    try:
+                        tgt.close()
+                    except Exception:
+                        pass
+
+        return result
 
     # ── main entry ────────────────────────────────────────────────────────────
 
@@ -354,9 +428,12 @@ class AgentCoreETLSync(Node):
 
         table_workers = max(1, int(self.max_table_workers or 4))
         per_table     = max(1, int(self.parallel_workers   or 4))
+        retries       = max(1, int(self.max_retries        or 3))
         self.log(
             f"Syncing {len(configs)} table(s) | "
-            f"{table_workers} parallel tables | {per_table} workers/table"
+            f"{table_workers} parallel tables | "
+            f"{per_table} workers/table | "
+            f"{retries} retries on transient errors"
         )
 
         # ── disable FK constraints ─────────────────────────────────────
