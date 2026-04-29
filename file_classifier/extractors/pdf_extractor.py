@@ -7,7 +7,7 @@ from file_classifier.extractors.base import BaseExtractor, ExtractionResult
 
 logger = structlog.get_logger()
 
-MAX_PAGES = 5
+MAX_PAGES = 10
 MIN_TEXT_LENGTH = 50
 
 
@@ -26,12 +26,19 @@ class PdfExtractor(BaseExtractor):
                     metadata={"total_pages": 0, "extraction_method": "failed"},
                 )
 
-            pages_to_process = min(total_pages, MAX_PAGES)
+            # Smart page selection: first N-2 pages + last 2 pages
+            # Ensures pricing/commercial summaries at the end are always captured
+            if total_pages <= MAX_PAGES:
+                page_indices = list(range(total_pages))
+            else:
+                first_pages = list(range(MAX_PAGES - 2))
+                last_pages = list(range(total_pages - 2, total_pages))
+                page_indices = sorted(set(first_pages + last_pages))
 
             text_parts = []
             tables_parts = []
 
-            for i in range(pages_to_process):
+            for i in page_indices:
                 page = pdf.pages[i]
 
                 page_text = page.extract_text() or ""
@@ -59,10 +66,11 @@ class PdfExtractor(BaseExtractor):
 
         return ExtractionResult(
             text_content=combined_text,
-            metadata={"total_pages": total_pages, "pages_processed": pages_to_process},
+            metadata={"total_pages": total_pages, "pages_processed": len(page_indices)},
         )
 
     def _extract_as_image(self, file_bytes: bytes, filename: str, total_pages: int) -> ExtractionResult:
+        logger.info("Rendering first page as image (scanned PDF)", filename=filename)
         buf = io.BytesIO(file_bytes)
 
         with pdfplumber.open(buf) as pdf:

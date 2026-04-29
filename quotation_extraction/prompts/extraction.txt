@@ -47,7 +47,29 @@ Column legend:
 - **Req Value** — total requisition value for the line (Qty × Unit Price)
 - **Prepayment / Payment Terms** — buyer-side payment conditions
 
+> **Matching tip:** Suppliers often use their own product codes (e.g. LP100, PT050SPEC, QMC122) that differ from the RAS description.
+> Use secondary signals to match when names differ:
+> - Machine tonnage / capacity (e.g. "650T", "350 tons") appearing in both the PDF and RAS description
+> - Quantity, UOM, or price proximity to a RAS line
+> - Machine model or site location if mentioned in both
+
 {line_items_table}
+
+---
+
+### Additional RAS Reference Data
+
+> **Important — treat as reference only.** The fields below come directly from
+> the procurement system database. Users sometimes enter incomplete or incorrect
+> data, so these values are hints, not ground truth.
+> - **Always extract actual prices, quantities, dates, and descriptions from the
+>   quotation document itself.**
+> - Use this data only to help identify which `DTL_ID` corresponds to which item
+>   in the quotation — look for matching machine specs, item codes, quantities,
+>   tonnage, site, or any other common signal between the DB row and the PDF item.
+> - If a DB field contradicts what the quotation clearly states, trust the quotation.
+
+{raw_ras_context}
 
 ---
 
@@ -66,8 +88,8 @@ Column legend:
 ## Required Output
 
 Analyse the quotation document above against the requisition context.
-Extract **every item** found in the document.
-For each item try to match it to the closest line item in the requisition table
+Extract **exactly one item per DTL_ID** from the RAS line items table — the quotation row that best represents the supplier's quoted price and specs for that line.
+For each item match it to the closest line item in the requisition table
 (use Description, Item Code, Quantity, and UOM as primary matching signals).
 
 > **Important:** A purchase requisition can cover any type of procurement —
@@ -115,13 +137,54 @@ Return a **single JSON object** — no markdown fences, no extra text:
 }}
 
 ### Rules
+
+**Required fields — never null:**
+- `item_name` — always present; use the supplier's exact product/service name from the document.
+- `item_description` — always present; include all specs, model numbers, and technical details visible in the document.
+- `item_level_1`, `item_level_2`, `item_level_3` — always fill; you can always infer broad category, sub-category, and product type from the item name alone.
+- `commodity_tag` — always present; derive from the item type.
+
+**Pricing rules:**
+- Extract `unit_price` and `total_price` separately whenever both are shown.
+- If only a total price is shown and quantity > 1: `unit_price = total_price / quantity`.
+- If only one price is shown and quantity is 1 or absent: treat it as both unit_price and total_price.
+- Never leave both unit_price and total_price null if any price figure appears in the document for that item.
+
+**General rules:**
+- The quotation document is the primary source of truth. Extract all values (prices, quantities, dates, descriptions) from it — not from the RAS reference data.
 - All text fields MUST be in English — translate from any source language.
 - Dates must be ISO 8601 (YYYY-MM-DD).  Convert formats like "15-Apr-2026" or "15/04/26" accordingly.
 - Prices as plain numbers — strip currency symbols, commas, and thousand separators.
-- Distinguish unit price from total price.  If only one price is shown assume it is the unit price unless quantity = 1.
 - If a field genuinely cannot be determined from the document, return null (not an empty string, not "N/A").
-- item_level fields should be null when truly unknown — do not guess.
-- Extract ALL items found in the document, even those not present in the requisition table (set purchase_dtl_id = null for those).
-- For matched items set purchase_dtl_id to the integer DTL_ID from the table.
+- item_level_4 through item_level_8 may be null when information is genuinely absent — do not invent brand or model names.
 - supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
-- commodity_tag should be a lowercase hyphenated slug that uniquely identifies the commodity family.
+
+**DTL_ID matching — CRITICAL:**
+
+You MUST attempt to map every quotation item row to a `purchase_dtl_id` from the RAS line items table. Do not return `null` for `purchase_dtl_id` unless the item is clearly a non-line charge (shipping, packing, GST, freight, insurance, surcharge, taxes).
+
+Use these signals to pick the right DTL_ID for each item — pick whichever signals are strongest in the documents you actually see. Do not invent signals that aren't there:
+
+1. **Distinguishing identifiers shared between the item and the RAS line** — model numbers, part codes, sizes, capacities, dimensions, ratings, or any alphanumeric identifier that uniquely names the product/service variant. Match these exactly. If the RAS line says "650T machine" and the quotation item says "650T machine", that's a match. If the supplier uses their own internal code (e.g. their model "X1000-A") that maps to the same physical/logical thing as the RAS line, use that mapping.
+2. **Site / location** — when both the RAS line and the quotation item name a site, region, or location, that's a strong signal.
+3. **Quantity and UOM** — when only one RAS line matches the quantity / unit, use that DTL_ID.
+4. **Item description overlap** — significant word overlap in the descriptive text.
+5. **Position in the table** — if the quotation lists items in the same order as the RAS table and other signals are absent, use position as a last-resort signal.
+
+For supporting items in the quotation (installation, packing, commissioning, training, freight when itemised, etc.), map each to the DTL_ID of the **product/service they support**, unless the RAS has a separate DTL_ID specifically for that supporting item — in which case prefer that one.
+
+If the same quotation item legitimately covers multiple DTL_IDs (e.g. one quote line for "Installation for both Machine A and Machine B"), emit one row per DTL_ID with the same item details.
+
+**One row per DTL_ID — STRICT:**
+Return **at most one item per `purchase_dtl_id`**. If the supplier quoted multiple options, configurations, or variants for the same line (e.g. standard vs premium, different lead times, revised prices), pick the single row that best represents the primary quoted offer — the one with the clearest pricing and the closest match to the RAS description. Do not emit duplicate rows for the same DTL_ID.
+
+**Set `supplier_match_conf` honestly:**
+- `1.0` — exact match on a distinguishing identifier (model number, code, size).
+- `0.7-0.9` — strong but not perfect match (one signal matches clearly).
+- `0.3-0.6` — weak match (only position or partial description overlap).
+- `< 0.3` — guessing — prefer to leave `purchase_dtl_id = null`.
+
+**Coverage check before responding:**
+After listing all items, verify:
+1. For every DTL_ID in the RAS table that the supplier has clearly quoted on, you have emitted **exactly one** item with that `purchase_dtl_id`. If you forgot a DTL_ID, add it now. If you emitted more than one row for the same DTL_ID, remove the duplicates and keep only the best one.
+2. No `purchase_dtl_id` appears more than once in your `items` array.

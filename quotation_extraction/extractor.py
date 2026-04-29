@@ -19,6 +19,8 @@ from typing import Optional
 from loguru import logger
 from pydantic import ValidationError
 
+from utils.azure_doc_intel import build_client_from_config
+
 from .config import ExtractionConfig
 from .document_loader import load_document
 from .llm_client import ExtractionLLMClient
@@ -51,42 +53,72 @@ def _na(val: object) -> str:
     return str(val)
 
 
-def _build_line_items_table(items: list[LineItemContext]) -> str:
-    header = (
-        "| DTL_ID | Item No | Item Code | Description | Qty | UOM | Type "
-        "| Unit Price | Original Value | Initial Offer | Negotiated "
-        "| Req Value | Discount | Currency | Supplier "
-        "| Delivery Date | Prepayment | Payment Terms | Comments |"
-    )
-    sep = (
-        "|--------|---------|-----------|-------------|-----|-----|------"
-        "|------------|----------------|---------------|----------"
-        "|-----------|----------|----------|----------"
-        "|---------------|------------|---------------|----------|"
-    )
+def _build_line_items_table(items: list[LineItemContext], include_prices: bool = True) -> str:
+    if include_prices:
+        header = (
+            "| DTL_ID | Item No | Item Code | Description | Qty | UOM | Type "
+            "| Unit Price | Original Value | Initial Offer | Negotiated "
+            "| Req Value | Discount | Currency | Supplier "
+            "| Delivery Date | Prepayment | Payment Terms | Comments |"
+        )
+        sep = (
+            "|--------|---------|-----------|-------------|-----|-----|------"
+            "|------------|----------------|---------------|----------"
+            "|-----------|----------|----------|----------"
+            "|---------------|------------|---------------|----------|"
+        )
+    else:
+        header = (
+            "| DTL_ID | Item No | Item Code | Description | Qty | UOM | Type "
+            "| Currency | Supplier "
+            "| Delivery Date | Prepayment | Payment Terms | Comments |"
+        )
+        sep = (
+            "|--------|---------|-----------|-------------|-----|-----|------"
+            "|----------|----------"
+            "|---------------|------------|---------------|----------|"
+        )
+
     rows = [header, sep]
     for li in items:
-        rows.append(
-            f"| {_na(li.purchase_dtl_id)} "
-            f"| {_na(li.item_no)} "
-            f"| {_na(li.item_code)} "
-            f"| {_na(li.item_description)} "
-            f"| {_na(li.quantity)} "
-            f"| {_na(li.uom)} "
-            f"| {_na(li.item_type)} "
-            f"| {_na(li.unit_price)} "
-            f"| {_na(li.original_value)} "
-            f"| {_na(li.initial_offer)} "
-            f"| {_na(li.negotiation)} "
-            f"| {_na(li.req_value)} "
-            f"| {_na(li.discount)} "
-            f"| {_na(li.currency)} "
-            f"| {_na(li.supplier_name)} "
-            f"| {_na(li.delivery_date)} "
-            f"| {_na(li.prepayment)} "
-            f"| {_na(li.payment_details)} "
-            f"| {_na(li.comments)} |"
-        )
+        if include_prices:
+            rows.append(
+                f"| {_na(li.purchase_dtl_id)} "
+                f"| {_na(li.item_no)} "
+                f"| {_na(li.item_code)} "
+                f"| {_na(li.item_description)} "
+                f"| {_na(li.quantity)} "
+                f"| {_na(li.uom)} "
+                f"| {_na(li.item_type)} "
+                f"| {_na(li.unit_price)} "
+                f"| {_na(li.original_value)} "
+                f"| {_na(li.initial_offer)} "
+                f"| {_na(li.negotiation)} "
+                f"| {_na(li.req_value)} "
+                f"| {_na(li.discount)} "
+                f"| {_na(li.currency)} "
+                f"| {_na(li.supplier_name)} "
+                f"| {_na(li.delivery_date)} "
+                f"| {_na(li.prepayment)} "
+                f"| {_na(li.payment_details)} "
+                f"| {_na(li.comments)} |"
+            )
+        else:
+            rows.append(
+                f"| {_na(li.purchase_dtl_id)} "
+                f"| {_na(li.item_no)} "
+                f"| {_na(li.item_code)} "
+                f"| {_na(li.item_description)} "
+                f"| {_na(li.quantity)} "
+                f"| {_na(li.uom)} "
+                f"| {_na(li.item_type)} "
+                f"| {_na(li.currency)} "
+                f"| {_na(li.supplier_name)} "
+                f"| {_na(li.delivery_date)} "
+                f"| {_na(li.prepayment)} "
+                f"| {_na(li.payment_details)} "
+                f"| {_na(li.comments)} |"
+            )
     return "\n".join(rows)
 
 
@@ -98,16 +130,38 @@ def _build_user_prompt(
     tpl = _read_prompt("extraction.txt")
     taxonomy = _read_prompt("item_taxonomy.txt")
 
+    # Build document content string.
+    # When OCR (Azure Document Intelligence) succeeds, only markdown text is
+    # provided — tables and structure are preserved, no images needed.
+    # Otherwise the LLM receives extracted text + page images (digital PDFs)
+    # or images alone (scanned PDFs / image attachments).
     doc_content_str: str
-    if doc.is_image_based:
+    if doc.ocr_source and doc.text:
         doc_content_str = (
-            f"[{doc.page_count} page(s) attached as images below]"
+            f"[OCR markdown extracted via Azure Document Intelligence "
+            f"from {doc.page_count} page(s) — tables and structure preserved]\n\n"
+            f"{doc.text}"
         )
+    elif doc.images:
+        if doc.text:
+            doc_content_str = (
+                f"[Extracted text from {doc.page_count} page(s) — "
+                f"page images are also attached below for visual reference]\n\n"
+                f"{doc.text}"
+            )
+        else:
+            doc_content_str = (
+                f"[Scanned document — {doc.page_count} page image(s) attached below, "
+                f"no extractable text]"
+            )
     else:
         doc_content_str = doc.text or "[No content extracted]"
 
     def _f(val: object) -> str:
         return str(val) if val is not None else "N/A"
+
+    include_prices  = getattr(config, "EXTRACTION_INCLUDE_PRICE_COLS", True)
+    raw_ras_context = _build_raw_context_block(ctx, include_prices=include_prices)
 
     return tpl.format(
         purchase_req_no=ctx.purchase_req_no,
@@ -140,10 +194,65 @@ def _build_user_prompt(
         payment_days=_f(ctx.payment_days),
         po_date=_f(ctx.po_date),
         category_buyer=_f(ctx.category_buyer),
-        line_items_table=_build_line_items_table(ctx.line_items),
+        line_items_table=_build_line_items_table(ctx.line_items, include_prices=include_prices),
         item_taxonomy=taxonomy,
         document_content=doc_content_str,
+        raw_ras_context=raw_ras_context,
     )
+
+
+# ── Raw RAS context block ──
+
+
+# Column names (case-insensitive) stripped from raw context blocks when
+# include_prices=False, to prevent the LLM anchoring on DB price data.
+_PRICE_COL_NAMES: frozenset[str] = frozenset({
+    "price", "unit_price", "original_value", "initial_offer",
+    "negotiation", "req_value", "purchase_value",
+})
+
+
+def _filter_price_cols(row: dict, include_prices: bool) -> dict:
+    if include_prices:
+        return row
+    return {k: v for k, v in row.items() if k.lower() not in _PRICE_COL_NAMES}
+
+
+def _build_raw_context_block(ctx: RASContext, include_prices: bool = True) -> str:
+    """Format raw DB rows as a compact reference block for the LLM prompt.
+
+    Returns an empty string when all raw data is absent (non-fatal path).
+    """
+    parts: list[str] = []
+
+    if ctx.raw_mst:
+        filtered_mst = _filter_price_cols(ctx.raw_mst, include_prices)
+        lines = [f"  {k}: {v}" for k, v in filtered_mst.items()]
+        parts.append("#### purchase_req_mst (header)\n" + "\n".join(lines))
+
+    if ctx.raw_dtl_rows:
+        filtered_dtl = [_filter_price_cols(r, include_prices) for r in ctx.raw_dtl_rows]
+        cols   = list(filtered_dtl[0].keys())
+        header = "| " + " | ".join(cols) + " |"
+        sep    = "|" + "|".join("---" for _ in cols) + "|"
+        rows   = [
+            "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
+            for r in filtered_dtl
+        ]
+        parts.append("#### purchase_req_detail (all line items)\n" + "\n".join([header, sep] + rows))
+
+    if ctx.raw_vw_rows:
+        filtered_vw = [_filter_price_cols(r, include_prices) for r in ctx.raw_vw_rows]
+        cols   = list(filtered_vw[0].keys())
+        header = "| " + " | ".join(cols) + " |"
+        sep    = "|" + "|".join("---" for _ in cols) + "|"
+        rows   = [
+            "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |"
+            for r in filtered_vw
+        ]
+        parts.append("#### vw_get_ras_data_for_bidashboard (BI context)\n" + "\n".join([header, sep] + rows))
+
+    return "\n\n".join(parts)
 
 
 # ── Supplier matching ──
@@ -152,6 +261,37 @@ _SELECTED_THRESHOLD = Decimal("0.70")   # min overall score to mark as selected 
 _PRICE_TOLERANCE    = Decimal("0.05")   # 5 % — prices within this band count as matching
 _PRICE_MAX_BOOST    = Decimal("0.10")   # max confidence boost from price alignment
 
+_CANONICALIZE_THRESHOLD = 0.82  # SequenceMatcher ratio to cluster two supplier names
+
+# Geographic tokens that differentiate country branches of the same company.
+# If both names contain geo tokens and those tokens differ, they are NOT merged.
+_GEO_TOKENS: frozenset[str] = frozenset({
+    "india", "china", "japan", "usa", "us", "uk", "germany", "france",
+    "italy", "korea", "taiwan", "singapore", "malaysia", "thailand",
+    "vietnam", "indonesia", "australia", "canada", "brazil", "mexico",
+    "uae", "dubai", "europe", "asia", "americas", "shanghai", "beijing",
+    "mumbai", "delhi",
+})
+
+
+def _strip_contact_suffix(name: str) -> str:
+    return re.sub(
+        r'\s*[-–]\s*(contact|email|ph|phone|tel|mob)[:\s].*$',
+        '', name, flags=re.IGNORECASE,
+    ).strip()
+
+
+def _name_geo_tokens(name: str) -> frozenset[str]:
+    words = re.findall(r'\b\w+\b', name.lower())
+    return frozenset(w for w in words if w in _GEO_TOKENS)
+
+
+def _is_acronym_of(short: str, long_name: str) -> bool:
+    """True if short is all-caps (≤ 6 chars) and matches the initials of long_name."""
+    if not short.isupper() or len(short) > 6:
+        return False
+    initials = ''.join(m[0].upper() for m in re.findall(r'\b[A-Za-z]', long_name))
+    return short == initials[:len(short)]
 
 
 def _compute_supplier_match(
@@ -334,6 +474,100 @@ def _parse_llm_response(
     return results
 
 
+def _item_has_data(item: ExtractedItem) -> bool:
+    return bool(item.item_name or item.unit_price or item.total_price)
+
+
+# Generic identifier token: alphanumeric tokens of length >=2 that contain
+# at least one digit (model numbers, part codes, dimensions, capacities).
+# Works for any procurement type — IT (Dell-7480, RAM-32GB), industrial
+# (650T, QMC122), services (Plan-A1), pharma (50mg, 100ml), etc.
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z0-9]*\d+[A-Za-z0-9]*")
+
+
+def _identifier_tokens(text: Optional[str]) -> set[str]:
+    """Pull alphanumeric tokens that contain at least one digit, lowercased.
+
+    Generic across product domains — captures model numbers, part codes,
+    sizes, capacities, version numbers, dimensions, etc.
+    """
+    if not text:
+        return set()
+    return {m.group(0).lower() for m in _IDENT_TOKEN_RE.finditer(text) if len(m.group(0)) >= 2}
+
+
+def _assign_orphans_to_uncovered(
+    orphans: list[ExtractedItem],
+    uncovered_lines: list[LineItemContext],
+) -> list[tuple[ExtractedItem, int]]:
+    """Assign orphaned items (dtl_id=None) to uncovered RAS DTL_IDs.
+
+    Scoring (best signal wins, all generic across product types):
+      - Shared identifier token (model #, part code, size, etc.)  → 0.90
+      - Item code substring overlap                                → 0.85
+      - Quantity exact match                                       → +0.10 boost
+      - Text similarity (SequenceMatcher) as fallback              → 0.0–1.0
+
+    A one-to-one greedy assignment is performed — best pair first, then next.
+    No global threshold — any positive score wins over a blank stub row.
+    """
+    if not orphans or not uncovered_lines:
+        return []
+
+    def sim(item: ExtractedItem, li: LineItemContext) -> float:
+        item_text = f"{item.item_name or ''} {item.item_description or ''}".strip().lower()
+        ras_text  = f"{li.item_description or ''} {li.item_code or ''}".strip().lower()
+
+        # 1. Shared identifier token (any alphanumeric with digits — generic)
+        shared_idents = _identifier_tokens(item_text) & _identifier_tokens(ras_text)
+        if shared_idents:
+            score = 0.90
+        # 2. Item-code substring overlap (RAS code appears verbatim in item text)
+        elif li.item_code and li.item_code.lower() in item_text:
+            score = 0.85
+        else:
+            # 3. Plain text similarity
+            score = SequenceMatcher(None, item_text, ras_text).ratio()
+
+        # 4. Quantity exact-match boost
+        if (
+            item.quantity is not None
+            and li.quantity is not None
+            and Decimal(str(item.quantity)) == Decimal(str(li.quantity))
+        ):
+            score = min(1.0, score + 0.10)
+
+        return score
+
+    # Score all pairs, sort best-first
+    scored: list[tuple[float, int, int]] = []  # (score, orphan_idx, line_idx)
+    for oi, item in enumerate(orphans):
+        for li_idx, li in enumerate(uncovered_lines):
+            scored.append((sim(item, li), oi, li_idx))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    used_orphans: set[int] = set()
+    used_lines:   set[int] = set()
+    assignments:  list[tuple[ExtractedItem, int]] = []
+
+    for score, oi, li_idx in scored:
+        if oi in used_orphans or li_idx in used_lines:
+            continue
+        dtl_id = uncovered_lines[li_idx].purchase_dtl_id
+        logger.info(
+            "Assigned orphan {!r} → dtl_id={} (text-sim={:.2f})",
+            orphans[oi].item_name, dtl_id, score,
+        )
+        assignments.append((orphans[oi], dtl_id))
+        used_orphans.add(oi)
+        used_lines.add(li_idx)
+        if len(assignments) == min(len(orphans), len(uncovered_lines)):
+            break
+
+    return assignments
+
+
 def _align_to_ras_line_items(
     items: list[ExtractedItem],
     ras_context: RASContext,
@@ -341,27 +575,79 @@ def _align_to_ras_line_items(
 ) -> list[ExtractedItem]:
     """Align extracted items to exactly the RAS line items.
 
-    1. Drop any extracted item whose purchase_dtl_id is not in the RAS
-       (e.g. shipping charges, extras the LLM invented).
-    2. For any RAS line item (DTL_ID) not covered by the extraction,
-       create a stub row with DTL_ID populated but item fields as None.
+    1. Keep extracted items whose purchase_dtl_id is a valid RAS DTL_ID.
+    2. For items the LLM returned with dtl_id=None, attempt fuzzy matching
+       against uncovered RAS DTL_IDs (tonnage + text similarity).
+    3. Anything still unmatched is dropped (genuine ancillaries / extras).
+    4. For any RAS DTL_ID still uncovered, create a stub row.
 
     Result: exactly len(ras_context.line_items) rows per quotation source.
     """
     valid_dtl_ids = {li.purchase_dtl_id for li in ras_context.line_items}
+    logger.debug("Valid RAS DTL_IDs: {}", sorted(valid_dtl_ids))
 
-    # Keep only items that map to a real RAS line item
-    matched = [i for i in items if i.purchase_dtl_id in valid_dtl_ids]
-    dropped = len(items) - len(matched)
-    if dropped:
-        logger.info(
-            "Dropped {} extracted item(s) not matching any RAS line item",
-            dropped,
+    # ── Step 1: strict match ──
+    # Collect all LLM items with valid DTL_IDs, then deduplicate to one per DTL_ID.
+    matched_by_dtl: dict[int, ExtractedItem] = {}
+    orphans:  list[ExtractedItem] = []
+
+    def _data_score(it: ExtractedItem) -> tuple:
+        return (
+            int(it.unit_price is not None),
+            int(it.total_price is not None),
+            int(it.item_name is not None),
+            int(it.item_description is not None),
         )
 
-    # Fill missing RAS line items with stub rows
-    covered_dtl_ids = {i.purchase_dtl_id for i in matched}
-    missing = valid_dtl_ids - covered_dtl_ids
+    for i in items:
+        if i.purchase_dtl_id in valid_dtl_ids:
+            dtl_id = i.purchase_dtl_id
+            if dtl_id not in matched_by_dtl:
+                matched_by_dtl[dtl_id] = i
+            else:
+                existing = matched_by_dtl[dtl_id]
+                if _data_score(i) > _data_score(existing):
+                    logger.debug(
+                        "DTL {}: replacing duplicate item {!r} with richer item {!r}",
+                        dtl_id, existing.item_name, i.item_name,
+                    )
+                    matched_by_dtl[dtl_id] = i
+                else:
+                    logger.debug(
+                        "DTL {}: dropping duplicate item {!r} (keeping {!r})",
+                        dtl_id, i.item_name, existing.item_name,
+                    )
+        elif _item_has_data(i):
+            orphans.append(i)
+        else:
+            logger.debug("Discarding empty item (no name/price, dtl_id=None)")
+
+    matched: list[ExtractedItem] = list(matched_by_dtl.values())
+
+    # ── Step 2: fuzzy fallback for orphans ──
+    covered_dtl_ids  = {i.purchase_dtl_id for i in matched}
+    uncovered_lines  = [li for li in ras_context.line_items if li.purchase_dtl_id not in covered_dtl_ids]
+
+    if orphans and uncovered_lines:
+        for item, dtl_id in _assign_orphans_to_uncovered(orphans, uncovered_lines):
+            item.purchase_dtl_id = dtl_id
+            matched.append(item)
+            covered_dtl_ids.add(dtl_id)
+            uncovered_lines = [li for li in uncovered_lines if li.purchase_dtl_id != dtl_id]
+
+    # Items still with dtl_id=None after assignment are genuine extras
+    # (more orphans than uncovered lines — e.g. packing charges when all lines are filled)
+    for item in orphans:
+        if item.purchase_dtl_id is None:
+            logger.warning(
+                "Dropped extra item — no uncovered RAS line remaining "
+                "for item_name={!r} desc={!r}",
+                item.item_name,
+                (item.item_description or "")[:120],
+            )
+
+    # ── Step 3: stubs for still-uncovered RAS lines ──
+    missing = {li.purchase_dtl_id for li in uncovered_lines}
 
     if missing:
         header_donor = matched[0] if matched else None
@@ -493,53 +779,112 @@ def _apply_llm_rankings(
         item.quote_rank = rank
 
 
+def _price_proximity_score(
+    item_value: Optional[Decimal],
+    ras_value: Optional[Decimal],
+) -> float:
+    """Return 0.0–1.0 — how close item_value is to ras_value (1.0 == within 5%).
+
+    Linear decay from 1.0 (within 5%) down to 0.0 (>=25% off).
+    Returns 0.0 when either value is missing or non-positive.
+    """
+    if item_value is None or ras_value is None:
+        return 0.0
+    if ras_value <= 0:
+        return 0.0
+    diff = abs(Decimal(str(item_value)) - ras_value) / ras_value
+    if diff <= Decimal("0.05"):
+        return 1.0
+    if diff >= Decimal("0.25"):
+        return 0.0
+    # Linear: 0.05 → 1.0, 0.25 → 0.0
+    return float(1.0 - (float(diff) - 0.05) / 0.20)
+
+
+def _price_match_score(
+    item: ExtractedItem,
+    ras_line: Optional[LineItemContext],
+) -> float:
+    """Best of unit-price-vs-RAS-PRICE and total-price-vs-RAS-REQ_VALUE proximity."""
+    if ras_line is None:
+        return 0.0
+    return max(
+        _price_proximity_score(item.unit_price,  ras_line.unit_price),
+        _price_proximity_score(item.total_price, ras_line.req_value),
+    )
+
+
 def run_selection_llm_query(
     all_items: list[ExtractedItem],
     ras_context: RASContext,
     config: ExtractionConfig,
 ) -> None:
-    """Determine is_selected_quote and quote_rank for all extracted items.
+    """Assign quote_rank and is_selected_quote for all extracted items.
 
-    Algorithm (fully deterministic — no LLM needed):
+    Step 1 — compute_quote_ranks()
+        Assigns each supplier a sequential item number (1, 2, 3 …) within
+        their own quotation.  Every supplier starts from 1 independently.
 
-    Step 1 — Rank
-        compute_quote_ranks() assigns quote_rank per DTL_ID across all sources.
-        Rank 1 = lowest unit_price; no-price stubs rank last.
-
-    Step 2 — Select
-        Only sources with ≥1 non-stub item are candidates.
-        Each candidate is scored:
-            supplier_match_conf   (60 %) — how well supplier name matches RAS
-            rank-1 fraction       (40 %) — fraction of non-stub items ranked 1
-
-        The candidate with the highest score wins.  Its non-stub items get
-        is_selected_quote = True; all other items get False.
+    Step 2 — Pick ONE winning item per DTL_ID.
+        For each DTL_ID, score every competing supplier's item by:
+          1. supplier_match_conf            — fuzzy match on supplier name
+          2. price_match_score              — proximity of item.unit_price to
+                                              RAS line PRICE OR item.total_price
+                                              to RAS REQ_VALUE (whichever fits)
+          3. has unit_price (tiebreak)
+        Highest tuple wins.  Exactly one item per DTL_ID gets
+        is_selected_quote=True; all others get False.  Items with
+        purchase_dtl_id=None (orphans/taxes) are never selected.
 
     Mutates items in-place.
     """
     from collections import defaultdict
 
-    def _has_data(item: ExtractedItem) -> bool:
-        return (
-            item.unit_price      is not None
-            or item.item_name        is not None
-            or item.item_description is not None
-        )
-
-    # ── Step 1: rank across all sources ─────────────────────────────────
+    # ── Step 1: number each supplier's items starting from 1 ─────────────
     compute_quote_ranks(all_items)
 
-    # ── Step 2: mark rank-1 data items as selected ───────────────────────
-    selected = 0
+    # ── Step 2: for each DTL_ID pick the best supplier item ──────────────
+    # First mark everything False
     for item in all_items:
-        if item.quote_rank == 1 and _has_data(item):
-            item.is_selected_quote = True
-            selected += 1
-        else:
-            item.is_selected_quote = False
+        item.is_selected_quote = False
+
+    # Build dtl_id → RAS line lookup for price-proximity scoring
+    ras_by_dtl: dict[int, LineItemContext] = {
+        li.purchase_dtl_id: li for li in ras_context.line_items
+    }
+
+    by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
+    for item in all_items:
+        if item.purchase_dtl_id is not None:
+            by_dtl[item.purchase_dtl_id].append(item)
+
+    selected = 0
+    for dtl_id, candidates in by_dtl.items():
+        ras_line = ras_by_dtl.get(dtl_id)
+
+        def _item_score(it: ExtractedItem) -> tuple:
+            conf       = float(it.supplier_match_conf or 0)
+            price_fit  = _price_match_score(it, ras_line)
+            has_price  = int(it.unit_price is not None)
+            return (conf, price_fit, has_price)
+
+        winner = max(candidates, key=_item_score)
+        winner.is_selected_quote = True
+        selected += 1
+        logger.info(
+            "DTL {}: selected supplier={!r} (conf={}, price_fit={:.2f}, "
+            "unit_price={}, ras_unit={}, ras_req_value={})",
+            dtl_id,
+            winner.supplier_name,
+            winner.supplier_match_conf,
+            _price_match_score(winner, ras_line),
+            winner.unit_price,
+            ras_line.unit_price if ras_line else None,
+            ras_line.req_value  if ras_line else None,
+        )
 
     logger.info(
-        "Selection: {} item(s) marked is_selected_quote=True (rank=1 with data)",
+        "Selection complete — {} DTL_ID(s) have is_selected_quote=True",
         selected,
     )
 
@@ -550,44 +895,134 @@ def run_selection_llm_query(
 def compute_quote_ranks(
     all_items: list[ExtractedItem],
 ) -> None:
-    """Assign *quote_rank* per purchase_dtl_id across all quotation sources.
+    """Assign quote_rank within each (supplier, DTL_ID) group.
 
-    Sorting rules (applied in order):
-      1. unit_price ascending  — lower price = better rank; items with no
-         unit_price are placed after all priced items.
-      2. quotation_date descending (tie-breaker) — when two quotes have the
-         same unit_price, the more recent quotation wins rank 1.
-         Quotes with no date sort after those with a date.
+    Each supplier ranks their own quotations independently within each
+    DTL_ID, starting from 1.  Items are ordered by total_price ascending
+    (cheapest = rank 1; items with no price come last).
+    Items with purchase_dtl_id=None are left with quote_rank=None.
 
-    Every item for a DTL_ID gets a rank as long as at least one source for
-    that DTL_ID has a unit_price.  DTL_IDs where every source has no price
-    are left with quote_rank = None.
-    Items with no purchase_dtl_id are always left with quote_rank = None.
-    Mutates the items in-place.
+    Example — DTL 369952 with 4 suppliers:
+      Stäubli    has 5 quotations → ranks 1, 2, 3, 4, 5
+      Selplast   has 4 quotations → ranks 1, 2, 3, 4
+      Tecnomag   has 2 quotations → ranks 1, 2
+      Pradman    has 2 quotations → ranks 1, 2
+    Every supplier has its own independent rank-1 item per DTL_ID.
+
+    Mutates items in-place.
     """
-
     from collections import defaultdict
 
-    _MAX_PRICE = Decimal("999999999999")
+    def _supplier_key(item: ExtractedItem) -> str:
+        return (item.supplier_name or "").strip().lower() or "_unknown_"
 
-    def _sort_key(item: ExtractedItem):
-        d = item.quotation_date
-        date_key = (-d.toordinal()) if d is not None else 1  # 1 > any negative
-        price    = item.unit_price if item.unit_price is not None else _MAX_PRICE
-        return (price, date_key)
-
-    by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
+    # Reset all ranks first so re-runs are deterministic
     for item in all_items:
-        if item.purchase_dtl_id is not None:
-            by_dtl[item.purchase_dtl_id].append(item)
+        item.quote_rank = None
 
-    for dtl_id, group in by_dtl.items():
-        # Skip DTL_IDs where no source extracted a price — nothing meaningful to rank
-        if not any(item.unit_price is not None for item in group):
-            continue
-        sorted_group = sorted(group, key=_sort_key)
-        for rank, item in enumerate(sorted_group, 1):
+    by_group: dict[tuple[str, int], list[ExtractedItem]] = defaultdict(list)
+    for item in all_items:
+        if item.purchase_dtl_id is None:
+            continue  # orphans / non-line items keep quote_rank=None
+        key = (_supplier_key(item), item.purchase_dtl_id)
+        by_group[key].append(item)
+
+    for items in by_group.values():
+        # Sort by total_price ASC; nulls (stubs) go last but still get ranks.
+        items.sort(
+            key=lambda i: (i.total_price is None, float(i.total_price or 0))
+        )
+        for rank, item in enumerate(items, 1):
             item.quote_rank = rank
+
+
+def canonicalize_supplier_names(
+    items: list[ExtractedItem],
+    ras_context: RASContext,
+) -> None:
+    """Cluster variant supplier names and rewrite item.supplier_name to canonical.
+
+    Merge rules (evaluated after stripping contact suffixes):
+      1. Cleaned names are identical (case-insensitive)
+      2. One cleaned name is a substring of the other
+      3. SequenceMatcher ratio >= _CANONICALIZE_THRESHOLD
+      4. One name is the initials/acronym of the other (e.g. TCS → Tata Consultancy Services)
+
+    Guard: if both names contain geo tokens that differ (e.g. "India" vs "China"),
+    they are NOT merged — different country branches are separate suppliers.
+
+    Canonical preference: RAS-known name first, then shortest name in cluster.
+    Mutates items in-place.
+    """
+    from collections import defaultdict
+
+    raw_names: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        n = (item.supplier_name or "").strip()
+        if n and n not in seen:
+            raw_names.append(n)
+            seen.add(n)
+
+    if len(raw_names) < 2:
+        return
+
+    ras_known: set[str] = set()
+    if ras_context.supplier_name:
+        ras_known.add(ras_context.supplier_name.strip().lower())
+    if ras_context.parent_supplier:
+        ras_known.add(ras_context.parent_supplier.strip().lower())
+    for li in ras_context.line_items:
+        if li.supplier_name:
+            ras_known.add(li.supplier_name.strip().lower())
+
+    parent: dict[str, str] = {n: n for n in raw_names}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        parent[find(a)] = find(b)
+
+    for i, a in enumerate(raw_names):
+        a_clean = _strip_contact_suffix(a).lower()
+        a_geo   = _name_geo_tokens(a_clean)
+        for b in raw_names[i + 1:]:
+            b_clean = _strip_contact_suffix(b).lower()
+            b_geo   = _name_geo_tokens(b_clean)
+
+            if a_geo and b_geo and a_geo != b_geo:
+                continue  # different country branches — keep separate
+
+            if a_clean == b_clean:
+                union(a, b)
+            elif a_clean in b_clean or b_clean in a_clean:
+                union(a, b)
+            elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _CANONICALIZE_THRESHOLD:
+                union(a, b)
+            elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
+                union(a, b)
+
+    clusters: dict[str, list[str]] = defaultdict(list)
+    for n in raw_names:
+        clusters[find(n)].append(n)
+
+    canonical_map: dict[str, str] = {}
+    for members in clusters.values():
+        ras_match = next((m for m in members if m.lower() in ras_known), None)
+        canonical = ras_match if ras_match else min(members, key=len)
+        for m in members:
+            canonical_map[m] = canonical
+            if m != canonical:
+                logger.debug("Supplier canonicalized: {!r} → {!r}", m, canonical)
+
+    for item in items:
+        n = (item.supplier_name or "").strip()
+        if n in canonical_map:
+            item.supplier_name = canonical_map[n]
 
 
 # ── Public API ──
@@ -599,6 +1034,11 @@ class QuotationExtractor:
     def __init__(self, config: ExtractionConfig) -> None:
         self._config = config
         self._llm = ExtractionLLMClient(config)
+        self._ocr = build_client_from_config(config)
+        if self._ocr is not None:
+            logger.info("Quotation extraction: Azure Document Intelligence OCR enabled")
+        else:
+            logger.info("Quotation extraction: OCR disabled — using image-based extraction")
 
     def extract(
         self,
@@ -614,6 +1054,7 @@ class QuotationExtractor:
             file_path,
             max_pages=self._config.MAX_PAGES,
             work_dir=pathlib.Path(file_path).parent,
+            ocr_client=self._ocr,
         )
 
         system_prompt = _read_prompt("system.txt")
@@ -622,6 +1063,18 @@ class QuotationExtractor:
         raw_response = self._llm.extract(system_prompt, user_prompt, doc)
 
         items = _parse_llm_response(raw_response, source, ras_context)
+
+        # Diagnostic — log what the LLM actually returned per item before alignment.
+        # Helps pinpoint whether missing items are LLM misses, wrong-DTL maps, or
+        # alignment drops.
+        for it in items:
+            logger.debug(
+                "LLM item: dtl_id={} name={!r} price={} qty={}",
+                it.purchase_dtl_id,
+                (it.item_name or "")[:60],
+                it.unit_price,
+                it.quantity,
+            )
 
         items = _align_to_ras_line_items(items, ras_context, source)
 

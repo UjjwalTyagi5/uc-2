@@ -51,19 +51,18 @@ class PipelineRepository:
 
     # Picks up:
     #   1. Brand-new PRs  (no tracker row)
-    #   2. PRs stuck mid-pipeline  (tracker row exists but not at completed_stage_id
+    #   2. PRs reset for reprocess (current_stage_fk IS NULL — retry_count was incremented)
+    #   3. PRs stuck mid-pipeline  (tracker row exists but not at completed_stage_id
     #                               and not at a terminal state)
     #
     # Only process PRs that have been fully approved.
-    # Un-approved / in-progress PRs are skipped until their status advances.
-    # Allowlist approach: only fully-approved PRs enter the pipeline.
-    # PRs with REJECTED / REJECT status are naturally excluded — no extra NOT IN needed.
     _PENDING_SQL = """
         SELECT prm.[PURCHASE_REQ_NO]
         FROM   [ras_procurement].[purchase_req_mst] prm
         LEFT JOIN [ras_procurement].[ras_tracker]   rt
           ON prm.[PURCHASE_REQ_NO] = rt.[purchase_req_no]
         WHERE (rt.[purchase_req_no] IS NULL
+               OR rt.[current_stage_fk] IS NULL
                OR rt.[current_stage_fk] NOT IN (?, 90, 91, 99))
           AND UPPER(prm.[PURCHASEFINALAPPROVALSTATUS])
                   IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
@@ -76,10 +75,17 @@ class PipelineRepository:
         LEFT JOIN [ras_procurement].[ras_tracker]   rt
           ON prm.[PURCHASE_REQ_NO] = rt.[purchase_req_no]
         WHERE (rt.[purchase_req_no] IS NULL
+               OR rt.[current_stage_fk] IS NULL
                OR rt.[current_stage_fk] NOT IN (?, 90, 91, 99))
           AND UPPER(prm.[PURCHASEFINALAPPROVALSTATUS])
                   IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
         ORDER BY prm.[C_DATETIME] ASC
+    """
+
+    _COUNT_COMPLETE_SQL = """
+        SELECT COUNT(*)
+        FROM   [ras_procurement].[ras_tracker]
+        WHERE  [current_stage_fk] = ?
     """
 
     _AT_STAGE_SQL = """
@@ -128,6 +134,16 @@ class PipelineRepository:
         conn = self._connect()
         try:
             cursor = conn.cursor()
+
+            # Log how many PRs are already complete (skipped)
+            cursor.execute(self._COUNT_COMPLETE_SQL, completed_stage_id)
+            complete_count = cursor.fetchone()[0]
+            if complete_count:
+                self._log.info(
+                    f"Skipping {complete_count} PR(s) already at COMPLETE "
+                    f"(stage_id={completed_stage_id})"
+                )
+
             if self._limit is not None:
                 cursor.execute(self._PENDING_SQL_LIMITED, self._limit, completed_stage_id)
             else:

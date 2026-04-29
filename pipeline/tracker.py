@@ -112,8 +112,13 @@ class PipelineTracker:
         )
     """
 
-    _DELETE_TRACKER_SQL = f"""
-        DELETE FROM {AzureTables.RAS_TRACKER}
+    # Resets a tracker row for reprocess: keeps ras_uuid_pk + purchase_req_no,
+    # nulls the stage so fetch_pending_prs picks it up, increments retry_count.
+    _RESET_TRACKER_SQL = f"""
+        UPDATE {AzureTables.RAS_TRACKER}
+        SET    [current_stage_fk] = NULL,
+               [retry_count]      = COALESCE([retry_count], 0) + 1,
+               [updated_at]       = SYSUTCDATETIME()
         WHERE  [purchase_req_no] = ?
     """
 
@@ -269,19 +274,15 @@ class PipelineTracker:
 
     def reset_for_reprocess(self, purchase_req_no: str) -> None:
         """
-        Wipe all pipeline state for a PR so it re-enters the pipeline as if
-        brand new.  Called before a forced single-PR reprocess.
+        Reset a PR for reprocessing while preserving its tracker identity.
+
+        Keeps ras_uuid_pk and purchase_req_no unchanged so the row's history
+        is retained.  Sets current_stage_fk = NULL (picked up by
+        fetch_pending_prs via the IS NULL branch) and increments retry_count.
 
         Steps (single transaction):
           1. DELETE ras_pipeline_exceptions for this PR
-          2. DELETE ras_tracker row for this PR
-
-        After this, fetch_pending_prs() picks up the PR via the LEFT JOIN
-        (no tracker row → IS NULL branch).  The child tables
-        (attachment_classification, quotation_extracted_items, etc.) are
-        cleaned by _process_pr → cleanup_for_pr at the start of the run,
-        but since the tracker row is gone that SP is a no-op — the
-        EmbedDocExtractionStage re-inserts fresh rows via upsert_parent.
+          2. UPDATE ras_tracker: current_stage_fk = NULL, retry_count += 1
         """
         self._log.debug(f"reset_for_reprocess PR={purchase_req_no!r}")
         conn = self._connect()
@@ -289,12 +290,13 @@ class PipelineTracker:
             cursor = conn.cursor()
             cursor.execute(self._DELETE_EXCEPTIONS_SQL, purchase_req_no)
             deleted_exc = cursor.rowcount
-            cursor.execute(self._DELETE_TRACKER_SQL, purchase_req_no)
-            deleted_trk = cursor.rowcount
+            cursor.execute(self._RESET_TRACKER_SQL, purchase_req_no)
+            updated_trk = cursor.rowcount
             conn.commit()
             self._log.info(
                 f"reset_for_reprocess PR={purchase_req_no!r}: "
-                f"deleted {deleted_exc} exception(s), {deleted_trk} tracker row(s)"
+                f"deleted {deleted_exc} exception(s), "
+                f"reset {updated_trk} tracker row(s) (retry_count incremented)"
             )
         except pyodbc.Error as exc:
             conn.rollback()

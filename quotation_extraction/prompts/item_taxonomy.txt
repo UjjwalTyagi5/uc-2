@@ -1,6 +1,8 @@
 Guidelines for item_level_1 through item_level_8 hierarchical taxonomy:
 
-The eight levels represent a progressively narrower classification of each item.  Fill as many levels as the quotation document supports; leave deeper levels as empty strings ("") when information is not available.
+The eight levels represent a progressively narrower classification of each item.  Fill as many levels as the quotation document supports; leave deeper levels as null when information is not available.
+
+IMPORTANT: item_level_1, item_level_2, and item_level_3 MUST always be filled — you can always infer the broad category, sub-category, and product/service type from the item name and description.  Only item_level_4 through item_level_8 may be null when the information is genuinely absent.
 
 Level 1 — Broad industry / domain category
   Examples: "Electronics", "Mechanical", "Civil", "IT Hardware", "Services",

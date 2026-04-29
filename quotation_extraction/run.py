@@ -19,10 +19,24 @@ from loguru import logger
 
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
-from .extractor import QuotationExtractor, run_selection_llm_query
+from .extractor import (
+    QuotationExtractor,
+    _compute_supplier_match,
+    canonicalize_supplier_names,
+    run_selection_llm_query,
+)
 from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
+
+class NoQuotationFoundError(RuntimeError):
+    """Raised when a PR has no attachments classified as 'Quotation'.
+
+    Treated as an expected pipeline outcome (not a bug), so base.py logs
+    it as a plain warning rather than a full traceback.
+    """
+    _suppress_traceback = True
+
 
 def run_extraction(
     purchase_req_no: str,
@@ -76,10 +90,9 @@ def run_extraction(
         config, purchase_req_no, include_all=include_all_attachments
     )
     if not sources:
-        raise RuntimeError(
+        raise NoQuotationFoundError(
             f"No quotation documents found for PR={purchase_req_no!r}. "
-            f"None of the attachments are classified as 'Quotation' — "
-            f"this RAS cannot proceed to benchmarking."
+            f"None of the attachments are classified as 'Quotation'."
         )
 
     # 3. Extract from each quotation file (read from local work/ folder)
@@ -116,9 +129,6 @@ def run_extraction(
         logger.warning("No items extracted for {}", purchase_req_no)
         return []
 
-    # 4. Rank all items then select the winning source
-    run_selection_llm_query(all_items, ras_ctx, config)  # config unused but kept for signature compat
-
     logger.info(
         "Extraction complete for {}: {} items from {} quotation(s)",
         purchase_req_no,
@@ -126,9 +136,41 @@ def run_extraction(
         len(sources),
     )
 
-    # 5. Write to DB
     if write_to_db:
         writer = ExtractionWriter(config)
+
+        # 4. INSERT all extracted items to DB with raw LLM supplier names.
         writer.write(all_items)
+
+        # 5. Canonicalize supplier names in DB (uses actual supplier_country column
+        #    as the country-branch guard).  Returns a map of
+        #    (purchase_dtl_id, original_name) → canonical_name for changed rows.
+        name_map = writer.canonicalize_supplier_names_in_db(all_items, ras_ctx)
+
+        # 6. Sync canonical names back to in-memory items, then recompute
+        #    supplier_match_conf so the ranking uses fresh scores.
+        for item in all_items:
+            if item.purchase_dtl_id is not None:
+                key = (item.purchase_dtl_id, (item.supplier_name or "").strip())
+                if key in name_map:
+                    item.supplier_name = name_map[key]
+            _, conf = _compute_supplier_match(item.supplier_name, ras_ctx)
+            item.supplier_match_conf = conf
+
+        # 7. Rank items within each (canonical_supplier, DTL_ID) group (rank 1→N
+        #    by price ASC) and pick is_selected_quote=True for the best supplier
+        #    per DTL_ID based on conf + price fit.
+        run_selection_llm_query(all_items, ras_ctx, config)
+
+        # 8. Persist supplier_match_conf + quote_rank + is_selected_quote to DB.
+        writer.update_selection_fields(all_items)
+
+    else:
+        # write_to_db=False (testing / dry-run): canonicalize in-memory only
+        canonicalize_supplier_names(all_items, ras_ctx)
+        for item in all_items:
+            _, conf = _compute_supplier_match(item.supplier_name, ras_ctx)
+            item.supplier_match_conf = conf
+        run_selection_llm_query(all_items, ras_ctx, config)
 
     return all_items

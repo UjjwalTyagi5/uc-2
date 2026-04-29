@@ -193,6 +193,7 @@ def main() -> None:
                 f"Unexpected error during single-PR reprocess: {exc}"
             )
             sys.exit(1)
+
         sys.exit(0 if result.succeeded else 1)
 
     # ── Normal batch run ──────────────────────────────────────────────────

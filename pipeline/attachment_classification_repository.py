@@ -43,7 +43,7 @@ import pyodbc
 from loguru import logger
 
 _DEADLOCK_STATE  = "40001"
-_DEADLOCK_RETRIES = 4
+_DEADLOCK_RETRIES = 8
 _DEADLOCK_BASE_DELAY = 0.5   # seconds
 
 from db.tables import AzureTables
@@ -137,6 +137,50 @@ class AttachmentClassificationRepository:
 
     _CLEANUP_SP_SQL = "EXEC [ras_procurement].[usp_cleanup_pr_data] ?"
 
+    # NULL out low_hist_item_fk on OTHER PRs' benchmark rows that reference
+    # this PR's quotation items — must run before deleting those items.
+    _NULL_LOW_HIST_FK_SQL = f"""
+        UPDATE br
+           SET br.[low_hist_item_fk] = NULL
+          FROM {AzureTables.BENCHMARK_RESULT} br
+          JOIN {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+            ON br.[low_hist_item_fk] = qi.[extracted_item_uuid_pk]
+          JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN {AzureTables.RAS_TRACKER} rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE rt.[purchase_req_no] = ?
+    """
+
+    # NULL out last_hist_item_fk on OTHER PRs' benchmark rows that reference
+    # this PR's quotation items — must run before deleting those items.
+    _NULL_LAST_HIST_FK_SQL = f"""
+        UPDATE br
+           SET br.[last_hist_item_fk] = NULL
+          FROM {AzureTables.BENCHMARK_RESULT} br
+          JOIN {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+            ON br.[last_hist_item_fk] = qi.[extracted_item_uuid_pk]
+          JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN {AzureTables.RAS_TRACKER} rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE rt.[purchase_req_no] = ?
+    """
+
+    # Must run before _DELETE_QUOTATION_ITEMS_SQL — benchmark_result has a FK
+    # to quotation_extracted_items, so child rows must be removed first.
+    _DELETE_BENCHMARK_RESULTS_SQL = f"""
+        DELETE br
+          FROM {AzureTables.BENCHMARK_RESULT} br
+          JOIN {AzureTables.QUOTATION_EXTRACTED_ITEMS} qi
+            ON br.[extracted_item_uuid_fk] = qi.[extracted_item_uuid_pk]
+          JOIN {AzureTables.ATTACHMENT_CLASSIFICATION} ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN {AzureTables.RAS_TRACKER} rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE rt.[purchase_req_no] = ?
+    """
+
     # Explicit delete for quotation_extracted_items — ensures rows are removed
     # even if usp_cleanup_pr_data does not cover this table.
     _DELETE_QUOTATION_ITEMS_SQL = f"""
@@ -171,7 +215,11 @@ class AttachmentClassificationRepository:
         finally:
             conn.close()
 
-    def cleanup_for_pr(self, purchase_req_no: str) -> None:
+    def cleanup_for_pr(
+        self,
+        purchase_req_no: str,
+        pinecone_writer=None,
+    ) -> None:
         """
         Deletes all pipeline output rows for this PR before (re-)processing.
 
@@ -182,27 +230,43 @@ class AttachmentClassificationRepository:
           2. embedded_attachment_classification
           3. attachment_classification
           4. vw_get_ras_data_for_bidashboard
+
+        If pinecone_writer is supplied its delete_for_pr() is called immediately
+        after the DB cleanup so both stores are wiped in the same cleanup step.
         """
         if self.get_tracker_uuid(purchase_req_no) is None:
-            self._log.debug(
-                f"cleanup_for_pr skipped — no ras_tracker row for PR={purchase_req_no!r}"
+            self._log.info(
+                f"PR={purchase_req_no!r} is new — no existing DB rows to clean up"
             )
             return
 
-        self._log.debug(f"cleanup_for_pr PR={purchase_req_no!r}")
+        self._log.info(
+            f"PR={purchase_req_no!r} already exists in tracker — "
+            f"this is a retry; DB cleanup started"
+        )
 
         for attempt in range(_DEADLOCK_RETRIES + 1):
             conn = self._connect()
             try:
                 cursor = conn.cursor()
+                cursor.execute(self._NULL_LOW_HIST_FK_SQL, purchase_req_no)
+                cursor.execute(self._NULL_LAST_HIST_FK_SQL, purchase_req_no)
+                cursor.execute(self._DELETE_BENCHMARK_RESULTS_SQL, purchase_req_no)
+                deleted_br = cursor.rowcount
                 cursor.execute(self._DELETE_QUOTATION_ITEMS_SQL, purchase_req_no)
                 deleted_qi = cursor.rowcount
                 cursor.execute(self._CLEANUP_SP_SQL, purchase_req_no)
                 conn.commit()
                 self._log.info(
-                    f"Pre-run cleanup done for PR={purchase_req_no!r} "
-                    f"(deleted {deleted_qi} quotation_extracted_items row(s))"
+                    f"DB cleanup done for PR={purchase_req_no!r} "
+                    f"(deleted {deleted_br} benchmark_result row(s), "
+                    f"{deleted_qi} quotation_extracted_items row(s))"
                 )
+
+                # Wipe Pinecone vectors for this PR at the same time as DB cleanup
+                if pinecone_writer is not None:
+                    pinecone_writer.delete_for_pr(purchase_req_no)
+
                 return  # success
             except pyodbc.Error as exc:
                 conn.rollback()

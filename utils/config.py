@@ -65,6 +65,12 @@ Optional — Quotation extraction tuning:
     EXTRACTION_LLM_MAX_TOKENS   max tokens in LLM response        (default: 16000)
     LLM_MAX_RETRIES             extra LLM attempts after failure  (default: 3)
     LLM_RETRY_BASE_DELAY        starting back-off in seconds      (default: 5.0)
+
+Optional — Azure Document Intelligence (OCR for quotation extraction):
+    AZURE_DOC_INTEL_ENDPOINT    e.g. https://myocr.cognitiveservices.azure.com/
+    AZURE_DOC_INTEL_KEY
+    AZURE_DOC_INTEL_MODEL       prebuilt-layout (default) or prebuilt-read
+    EXTRACTION_USE_OCR          set to 0/false to disable        (default: 1)
                         Set to 2–8 to process multiple PRs at the same time.
                         Each worker opens its own DB connections and work folder.
                         Keep at 1 if the DB connection limit is tight.
@@ -221,6 +227,11 @@ class AppConfig:
         # 1 = sequential (safe default); raise to 2-8 to speed up large batches.
         self.PIPELINE_WORKERS  = int(_optional("PIPELINE_WORKERS",  "1"))
 
+        # Workers for run_pipeline_from_excel.py specifically.
+        # Defaults to 3 — the Excel path is always a deliberate batch run so
+        # parallelism is safe and expected.  Set to 1 to force sequential.
+        self.EXCEL_PIPELINE_WORKERS = int(_optional("EXCEL_PIPELINE_WORKERS", "3"))
+
         # Number of files within a single PR to classify in parallel.
         # Combined with PIPELINE_WORKERS this gives PIPELINE_WORKERS *
         # CLASSIFICATION_WORKERS concurrent LLM calls — size it against the
@@ -237,7 +248,7 @@ class AppConfig:
         # if these are missing.
         self.AOAI_ENDPOINT             = _optional("AZURE_OPENAI_ENDPOINT",             "")
         self.AOAI_API_KEY              = _optional("AZURE_OPENAI_API_KEY",              "")
-        self.AOAI_DEPLOYMENT           = _optional("AZURE_OPENAI_DEPLOYMENT",           "gpt-4o")
+        self.AOAI_DEPLOYMENT           = _optional("AZURE_OPENAI_DEPLOYMENT",           "gpt-4o")   # set this in .env to control the model for all pipeline stages
         self.AOAI_API_VERSION          = _optional("AZURE_OPENAI_API_VERSION",          "2025-04-01-preview")
         self.AOAI_EMBEDDING_DEPLOYMENT = _optional("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
         # Falls back to the chat model endpoint/key if not separately set
@@ -268,6 +279,32 @@ class AppConfig:
         self.LLM_MAX_TOKENS       = int(_optional("EXTRACTION_LLM_MAX_TOKENS",     "16000"))
         self.LLM_MAX_RETRIES      = int(_optional("LLM_MAX_RETRIES",               "3"))
         self.LLM_RETRY_BASE_DELAY = float(_optional("LLM_RETRY_BASE_DELAY",        "5.0"))
+
+        # ── Azure Document Intelligence (OCR for extraction) ───────────────
+        # Optional — falls back to image-based extraction if not configured.
+        self.AZURE_DOC_INTEL_ENDPOINT = _optional("AZURE_DOC_INTEL_ENDPOINT", "")
+        self.AZURE_DOC_INTEL_KEY      = _optional("AZURE_DOC_INTEL_KEY",      "")
+        # Set to "0" / "false" to disable OCR even if endpoint/key are set.
+        self.EXTRACTION_USE_OCR       = _optional("EXTRACTION_USE_OCR", "1").lower() not in ("0", "false", "no")
+        # OCR model: prebuilt-layout (markdown + tables) or prebuilt-read (plain text, cheaper)
+        self.AZURE_DOC_INTEL_MODEL    = _optional("AZURE_DOC_INTEL_MODEL", "prebuilt-layout")
+
+        # ── Extraction price-column visibility ────────────────────────────────
+        # When True (default), unit_price / original_value / initial_offer /
+        # negotiated / req_value columns from purchase_req_detail are included
+        # in the line-items table sent to the LLM.
+        # Set to 0/false to hide them and avoid LLM anchoring on DB prices.
+        self.EXTRACTION_INCLUDE_PRICE_COLS = _optional("EXTRACTION_INCLUDE_PRICE_COLS", "1").lower() not in ("0", "false", "no")
+
+        # ── Excel pipeline approval-status filter ──────────────────────────
+        # Comma-separated PURCHASEFINALAPPROVALSTATUS values accepted by
+        # run_pipeline_from_excel.py.  PRs with any other status are skipped.
+        # Empty list = no filter (all statuses accepted).
+        self.EXCEL_ALLOWED_APPROVAL_STATUSES: list[str] = [
+            s.strip().upper()
+            for s in _optional("EXCEL_ALLOWED_APPROVAL_STATUSES", "").split(",")
+            if s.strip()
+        ]
 
     # ── Connection string builders ─────────────────────────────────────────
 

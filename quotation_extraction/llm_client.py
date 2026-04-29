@@ -32,14 +32,18 @@ class ExtractionLLMClient:
     """Thin wrapper around AzureChatOpenAI that builds multimodal messages."""
 
     def __init__(self, config: ExtractionConfig) -> None:
-        self._llm = AzureChatOpenAI(
+        llm_kwargs: dict = dict(
             azure_deployment=config.AOAI_DEPLOYMENT,
             azure_endpoint=config.AOAI_ENDPOINT,
             api_key=config.AOAI_API_KEY,
             api_version=config.AOAI_API_VERSION,
-            temperature=config.LLM_TEMPERATURE,
             max_tokens=config.LLM_MAX_TOKENS,
         )
+        # Some newer models (e.g. gpt-5.2) reject temperature=0 explicitly.
+        # Only pass temperature when the user set a non-zero value.
+        if config.LLM_TEMPERATURE != 0:
+            llm_kwargs["temperature"] = config.LLM_TEMPERATURE
+        self._llm = AzureChatOpenAI(**llm_kwargs)
         self._config = config
 
     # ── public ──
@@ -58,10 +62,13 @@ class ExtractionLLMClient:
         """
         messages = self._build_messages(system_prompt, user_prompt, document)
 
+        img_count  = len(document.images) if document.images else 0
+        img_detail = ("low" if document.text else "high") if img_count else "n/a"
         logger.info(
-            "Calling Azure OpenAI ({}) — {} image(s), ~{:.0f} kB prompt",
+            "Calling Azure OpenAI ({}) — {} image(s) detail={}, ~{:.0f} kB prompt",
             self._config.AOAI_DEPLOYMENT,
-            len(document.images) if document.images else 0,
+            img_count,
+            img_detail,
             len(user_prompt) / 1024,
         )
 
@@ -140,6 +147,13 @@ class ExtractionLLMClient:
         messages: list = [SystemMessage(content=system_prompt)]
 
         if document.is_image_based:
+            # If the document has extracted text, images serve as layout/table
+            # context only — "low" detail (~85 tokens each) is sufficient and
+            # keeps the payload small for large multi-page documents.
+            # If the document is fully scanned, images are the only content
+            # source — use "high" detail so the model can read fine print.
+            img_detail = "low" if document.text else "high"
+
             content_parts: list[dict] = [{"type": "text", "text": user_prompt}]
             for b64_img in document.images:  # type: ignore[union-attr]
                 content_parts.append(
@@ -147,7 +161,7 @@ class ExtractionLLMClient:
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:image/png;base64,{b64_img}",
-                            "detail": "high",
+                            "detail": img_detail,
                         },
                     }
                 )

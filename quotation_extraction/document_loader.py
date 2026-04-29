@@ -1,7 +1,8 @@
 """Convert quotation files into LLM-consumable content.
 
 Strategy (hybrid):
-  PDF / images  → render pages as PNG, return base-64 list
+  PDF / images  → Azure Doc Intelligence OCR (markdown w/ tables) when
+                  configured; falls back to PNG image rendering on failure
   XLSX / XLS    → parse with openpyxl / xlrd, return markdown text
   DOCX          → python-docx text extraction
   DOC           → OLE text extraction fallback, else render via fitz
@@ -18,11 +19,14 @@ import html as html_mod
 import io
 import pathlib
 import re
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from loguru import logger
 
 from .models import DocumentContent
+
+if TYPE_CHECKING:
+    from utils.azure_doc_intel import AzureDocIntelClient
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 _TEXT_EXTS = {".txt", ".csv"}
@@ -33,6 +37,7 @@ def load_document(
     file_path: str | pathlib.Path,
     max_pages: int = 20,
     work_dir: Optional[pathlib.Path] = None,
+    ocr_client: Optional["AzureDocIntelClient"] = None,
 ) -> DocumentContent:
     """Load a file and return an LLM-ready :class:`DocumentContent`.
 
@@ -54,7 +59,7 @@ def load_document(
     logger.debug("Loading document: {} (ext={}, work_dir={})", fp.name, ext, wdir)
 
     if ext == ".pdf":
-        return _load_pdf(fp, max_pages, wdir)
+        return _load_pdf(fp, max_pages, wdir, ocr_client)
     if ext in (".xlsx", ".xls"):
         return _load_spreadsheet(fp, wdir)
     if ext == ".docx":
@@ -64,7 +69,7 @@ def load_document(
     if ext in (".pptx", ".ppt"):
         return _load_presentation(fp, max_pages, wdir)
     if ext in _IMAGE_EXTS:
-        return _load_image(fp)
+        return _load_image(fp, ocr_client)
     if ext in _TEXT_EXTS:
         return _load_text(fp)
     if ext in _HTML_EXTS:
@@ -79,19 +84,81 @@ def load_document(
 # ── PDF ──
 
 
-def _load_pdf(fp: pathlib.Path, max_pages: int, work_dir: pathlib.Path) -> DocumentContent:
+_SCANNED_PAGE_THRESHOLD = 50  # fewer chars than this → treat page as scanned
+
+
+def _load_pdf(
+    fp: pathlib.Path,
+    max_pages: int,
+    work_dir: pathlib.Path,
+    ocr_client: Optional["AzureDocIntelClient"] = None,
+) -> DocumentContent:
+    """Load a PDF, preferring Azure Doc Intelligence OCR when available.
+
+    Order of attempts:
+      1. If `ocr_client` is provided, run OCR (markdown w/ tables preserved).
+         When OCR returns usable content, return it as text-only — no images
+         (cheaper, more accurate for digital and scanned PDFs alike).
+      2. Otherwise, fall back to the per-page hybrid (text + low-res image
+         for digital pages, high-res image for scanned pages).
+    """
+    if ocr_client is not None:
+        ocr_text = ocr_client.extract_markdown(fp)
+        if ocr_text:
+            page_count = _count_pdf_pages(fp)
+            logger.debug(
+                "PDF loaded via OCR: {} ({} char(s), {} page(s))",
+                fp.name, len(ocr_text), page_count,
+            )
+            return DocumentContent(
+                text=ocr_text,
+                source_path=str(fp),
+                page_count=min(page_count, max_pages),
+                ocr_source=True,
+            )
+        logger.info("OCR returned no usable content for {} — falling back to image render", fp.name)
+
     import fitz  # PyMuPDF
 
     doc = fitz.open(str(fp))
     page_count = len(doc)
-    images: list[str] = []
+    if page_count > max_pages:
+        logger.warning(
+            "PDF has {} page(s) but max_pages={} — only first {} page(s) will be processed",
+            page_count, max_pages, max_pages,
+        )
     total = min(page_count, max_pages)
+
+    text_pages:   list[str] = []
+    images:       list[str] = []
+    scanned_count = 0
+    text_count    = 0
+
     for i in range(total):
-        pix = doc[i].get_pixmap(dpi=200)
+        page = doc[i]
+        page_text = page.get_text("text").strip()
+
+        if len(page_text) >= _SCANNED_PAGE_THRESHOLD:
+            # Digital / text page — capture text; low-res image for layout
+            text_pages.append(f"[Page {i + 1}]\n{page_text}")
+            text_count += 1
+            pix = page.get_pixmap(dpi=72)
+        else:
+            # Scanned page — high-res image is the only content source
+            scanned_count += 1
+            pix = page.get_pixmap(dpi=150)
+
         images.append(base64.b64encode(pix.tobytes("png")).decode())
+
     doc.close()
-    logger.debug("PDF rendered: {} pages → {} images (work_dir={})", page_count, total, work_dir)
-    return DocumentContent(images=images, source_path=str(fp), page_count=total)
+
+    text = "\n\n".join(text_pages) if text_pages else None
+    logger.debug(
+        "PDF loaded: {}/{} page(s) — {} text page(s) @ 72 DPI, "
+        "{} scanned page(s) @ 150 DPI",
+        total, page_count, text_count, scanned_count,
+    )
+    return DocumentContent(text=text, images=images, source_path=str(fp), page_count=total)
 
 
 # ── Spreadsheets ──
@@ -254,7 +321,22 @@ def _parse_pptx_text(fp: pathlib.Path) -> Optional[str]:
 # ── Images (JPG, PNG, TIF, …) ──
 
 
-def _load_image(fp: pathlib.Path) -> DocumentContent:
+def _load_image(
+    fp: pathlib.Path,
+    ocr_client: Optional["AzureDocIntelClient"] = None,
+) -> DocumentContent:
+    if ocr_client is not None:
+        ocr_text = ocr_client.extract_markdown(fp)
+        if ocr_text:
+            logger.debug("Image loaded via OCR: {} ({} char(s))", fp.name, len(ocr_text))
+            return DocumentContent(
+                text=ocr_text,
+                source_path=str(fp),
+                page_count=1,
+                ocr_source=True,
+            )
+        logger.info("OCR returned no usable content for {} — falling back to raw image", fp.name)
+
     raw = fp.read_bytes()
 
     ext = fp.suffix.lower()
@@ -268,6 +350,18 @@ def _load_image(fp: pathlib.Path) -> DocumentContent:
 
     b64 = base64.b64encode(raw).decode()
     return DocumentContent(images=[b64], source_path=str(fp), page_count=1)
+
+
+def _count_pdf_pages(fp: pathlib.Path) -> int:
+    """Return the page count of a PDF, or 0 on error."""
+    try:
+        import fitz
+        doc = fitz.open(str(fp))
+        n = len(doc)
+        doc.close()
+        return n
+    except Exception:
+        return 0
 
 
 # ── Plain text ──

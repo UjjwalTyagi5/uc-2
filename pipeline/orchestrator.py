@@ -46,8 +46,10 @@ from pipeline.stages.blob_upload import BlobUploadStage
 from pipeline.stages.classification import ClassificationStage
 from pipeline.stages.embed_doc_extraction import EmbedDocExtractionStage
 from pipeline.stages.ingestion import IngestionStage
+from pipeline.stages.complete import CompleteStage
 from pipeline.stages.embeddings import EmbeddingsStage
 from pipeline.stages.metadata_extraction import MetadataExtractionStage
+from pipeline.stages.price_benchmark import PriceBenchmarkStage
 from pipeline.tracker import PipelineTracker
 
 
@@ -86,6 +88,10 @@ class PipelineOrchestrator:
         self._repository = PipelineRepository(config.get_azure_conn_str(), limit=limit)
         self._tracker    = PipelineTracker(config.get_azure_conn_str())
         self._att_repo   = AttachmentClassificationRepository(config.get_azure_conn_str())
+
+        # Build Pinecone writer once (None if not configured) so cleanup_for_pr
+        # can delete vectors at the same time as the DB cleanup SP.
+        self._pinecone_writer = self._build_pinecone_writer(config)
 
         # Load stage definitions from DB — single source of truth
         self._registry = StageRegistry(config.get_azure_conn_str())
@@ -161,8 +167,8 @@ class PipelineOrchestrator:
         """
         self._log.info(f"Forced single-PR reprocess: PR={purchase_req_no!r}")
 
-        # Step 1 — clean child tables (SP needs tracker row for FK lookup)
-        self._att_repo.cleanup_for_pr(purchase_req_no)
+        # Step 1 — clean child tables + Pinecone vectors
+        self._att_repo.cleanup_for_pr(purchase_req_no, self._pinecone_writer)
 
         # Step 2 — delete exceptions + tracker row (PR now looks brand new)
         self._tracker.reset_for_reprocess(purchase_req_no)
@@ -244,7 +250,7 @@ class PipelineOrchestrator:
         # then wipe the local work folder so we download fresh from source.
         # Safe for new PRs — the SP and rmtree are both no-ops when nothing exists.
         try:
-            self._att_repo.cleanup_for_pr(pr_no)
+            self._att_repo.cleanup_for_pr(pr_no, self._pinecone_writer)
         except Exception as exc:
             self._log.opt(exception=True).error(
                 f"Pre-run DB cleanup failed for PR={pr_no!r} — aborting PR: {exc}"
@@ -281,11 +287,28 @@ class PipelineOrchestrator:
         pr_result = PRResult(purchase_req_no=pr_no, stage_results=stage_results)
         if pr_result.succeeded:
             self._log.success(f"PR={pr_no!r} completed all stages successfully")
+            # All data is now in Azure Blob + DB — local work folder no longer needed.
+            if work_folder.exists():
+                try:
+                    shutil.rmtree(work_folder)
+                    self._log.info(f"Removed local work folder: {work_folder}")
+                except Exception as exc:
+                    self._log.warning(
+                        f"Could not remove work folder {work_folder}: {exc}"
+                    )
         else:
             failed = pr_result.failed_stage
             self._log.opt(exception=failed.error).error(
                 f"PR={pr_no!r} stopped at stage={failed.stage_name!r}: {failed.error}"
             )
+            if work_folder.exists():
+                try:
+                    shutil.rmtree(work_folder)
+                    self._log.info(f"Removed local work folder after EXCEPTION: {work_folder}")
+                except Exception as exc:
+                    self._log.warning(
+                        f"Could not remove work folder {work_folder}: {exc}"
+                    )
         return pr_result
 
     def _handle_stage_failure(self, pr_no: str, result: StageResult) -> None:
@@ -344,6 +367,14 @@ class PipelineOrchestrator:
         self._log.info("=" * 60)
 
     @staticmethod
+    def _build_pinecone_writer(config: AppConfig):
+        """Returns a PineconeWriter if Pinecone is configured, else None."""
+        if not config.PINECONE_API_KEY or not config.PINECONE_INDEX_NAME:
+            return None
+        from quotation_embedding.pinecone_writer import PineconeWriter
+        return PineconeWriter(config)
+
+    @staticmethod
     def _build_default_stages(config: AppConfig) -> List[BaseStage]:
         """
         Ordered stage list for the ATTACHMENT domain pipeline.
@@ -356,6 +387,8 @@ class PipelineOrchestrator:
         Stage 4 — CLASSIFICATION       : classifies each attachment by doc_type via LLM
         Stage 5 — METADATA_EXTRACTION  : extracts structured line items from quotations
         Stage 6 — EMBEDDINGS           : embeds selected items and upserts to Pinecone
+        Stage 7 — PRICE_BENCHMARK      : benchmarks line item prices against historical data
+        Stage 8 — COMPLETE             : marks the PR as fully processed
         """
         return [
             IngestionStage(config),             # stage 1
@@ -364,4 +397,6 @@ class PipelineOrchestrator:
             ClassificationStage(config),        # stage 4
             MetadataExtractionStage(config),    # stage 5
             EmbeddingsStage(config),            # stage 6
+            PriceBenchmarkStage(config),        # stage 7
+            CompleteStage(config),              # stage 8
         ]

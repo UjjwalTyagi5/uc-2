@@ -88,6 +88,10 @@ class ExtractedItem(BaseModel):
     commodity_tag: Optional[str] = None
     item_summary:  Optional[str] = None
 
+    # ── EUR-normalised prices (populated by ExtractionWriter, not the LLM) ──
+    unit_price_eur:  Optional[Decimal] = None
+    total_price_eur: Optional[Decimal] = None
+
 
 class QuotationSource(BaseModel):
     """Identifies one quotation file to be processed.
@@ -171,22 +175,32 @@ class RASContext:
     l8:               Optional[str]     = None
     purchase_category: Optional[str]   = None
     ras_title:         Optional[str]   = None
-    line_items: list[LineItemContext]   = field(default_factory=list)
+    line_items:   list[LineItemContext] = field(default_factory=list)
+
+    # Raw rows from DB — all columns, used as reference context in the LLM prompt.
+    # Users sometimes enter incorrect data so these are hints, not ground truth.
+    raw_mst:      dict            = field(default_factory=dict)
+    raw_dtl_rows: list[dict]      = field(default_factory=list)
+    raw_vw_rows:  list[dict]      = field(default_factory=list)
 
 
 @dataclass
 class DocumentContent:
     """LLM-consumable representation of a single quotation file.
 
-    Exactly one of *text* or *images* is populated:
-    * text   – plain/markdown string  (XLSX, DOCX, TXT, …)
+    Either *text* or *images* (or both) may be populated:
+    * text   – plain/markdown string  (XLSX, DOCX, TXT, OCR output, …)
     * images – list of base-64 PNG strings  (PDF pages, scanned images, …)
+
+    *ocr_source* is True when *text* was produced by Azure Document Intelligence
+    rather than native parsing — useful for prompt phrasing and logging.
     """
 
     text:        Optional[str]       = None
     images:      Optional[list[str]] = None
     source_path: str                 = ""
     page_count:  int                 = 0
+    ocr_source:  bool                = False
 
     @property
     def is_image_based(self) -> bool:
