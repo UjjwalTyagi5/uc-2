@@ -27,6 +27,8 @@ _RETRYABLE = (
     openai.InternalServerError,
 )
 
+_MAX_IMAGES = 50  # Azure OpenAI hard limit per request
+
 
 class ExtractionLLMClient:
     """Thin wrapper around AzureChatOpenAI that builds multimodal messages."""
@@ -154,8 +156,16 @@ class ExtractionLLMClient:
             # source — use "high" detail so the model can read fine print.
             img_detail = "low" if document.text else "high"
 
+            images = document.images  # type: ignore[union-attr]
+            if len(images) > _MAX_IMAGES:
+                logger.warning(
+                    "Document has {} images — capping at {} (API limit)",
+                    len(images), _MAX_IMAGES,
+                )
+                images = images[:_MAX_IMAGES]
+
             content_parts: list[dict] = [{"type": "text", "text": user_prompt}]
-            for b64_img in document.images:  # type: ignore[union-attr]
+            for b64_img in images:
                 content_parts.append(
                     {
                         "type": "image_url",

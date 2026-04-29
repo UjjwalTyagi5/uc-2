@@ -117,12 +117,29 @@ _UPDATE_SELECTION_ATTACHMENT_SQL = f"""
 """
 
 
-def _p(val: object) -> object:
+_COL_MAX_LEN: dict[str, int] = {
+    "item_description": 2000,
+    "item_summary":     2000,
+    "taxation_details": 500,
+    "payment_terms":    500,
+    "supplier_address": 500,
+    "item_name":        500,
+    "quotation_ref_no": 200,
+    "supplier_name":    200,
+    "commodity_tag":    200,
+}
+
+
+def _p(val: object, col: str = "") -> object:
     """Convert Python types to pyodbc-safe values.
 
     Decimal → float: pyodbc fast_executemany fails when Decimal objects have
     varying scale across rows (e.g. Decimal("1.00000") vs Decimal("1.5")).
     SQL Server accepts float for all DECIMAL columns and rounds to column scale.
+
+    Strings longer than the mapped column limit are silently truncated so that
+    LLM-generated text that exceeds the DB column width does not fail the whole
+    INSERT batch.
     """
     if val is None:
         return None
@@ -130,6 +147,11 @@ def _p(val: object) -> object:
         return 1 if val else 0
     if isinstance(val, Decimal):
         return float(val)
+    if isinstance(val, str) and col in _COL_MAX_LEN:
+        limit = _COL_MAX_LEN[col]
+        if len(val) > limit:
+            logger.warning("Truncating column '{}': {} → {} chars", col, len(val), limit)
+            return val[:limit]
     return val
 
 
@@ -142,23 +164,23 @@ def _item_to_row(item: ExtractedItem) -> list:
         _p(item.is_selected_quote),
         _p(item.supplier_match_conf),
         _p(item.quote_rank),
-        _p(item.supplier_name),
-        _p(item.supplier_address),
+        _p(item.supplier_name,     "supplier_name"),
+        _p(item.supplier_address,  "supplier_address"),
         _p(item.supplier_country),
-        _p(item.quotation_ref_no),
+        _p(item.quotation_ref_no,  "quotation_ref_no"),
         _p(item.quotation_date),
         _p(item.currency),
         _p(item.validity_date),
         _p(item.validity_days),
-        _p(item.payment_terms),
-        _p(item.item_name),
-        _p(item.item_description),
+        _p(item.payment_terms,     "payment_terms"),
+        _p(item.item_name,         "item_name"),
+        _p(item.item_description,  "item_description"),
         _p(item.quantity),
         _p(item.unit),
         _p(item.unit_price),
         _p(item.total_price),
         _p(item.discount),
-        _p(item.taxation_details),
+        _p(item.taxation_details,  "taxation_details"),
         _p(item.delivery_date),
         _p(item.delivery_time_days),
         _p(item.item_level_1),
@@ -169,8 +191,8 @@ def _item_to_row(item: ExtractedItem) -> list:
         _p(item.item_level_6),
         _p(item.item_level_7),
         _p(item.item_level_8),
-        _p(item.commodity_tag),
-        _p(item.item_summary),
+        _p(item.commodity_tag,     "commodity_tag"),
+        _p(item.item_summary,      "item_summary"),
         _p(item.unit_price_eur),
         _p(item.total_price_eur),
     ]
