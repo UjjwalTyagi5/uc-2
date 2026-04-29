@@ -19,7 +19,12 @@ from loguru import logger
 
 from .config import ExtractionConfig
 from .context_builder import build_ras_context
-from .extractor import QuotationExtractor, canonicalize_supplier_names, run_selection_llm_query
+from .extractor import (
+    QuotationExtractor,
+    _compute_supplier_match,
+    canonicalize_supplier_names,
+    run_selection_llm_query,
+)
 from .models import ExtractedItem, QuotationSource, RASContext
 from .source_resolver import resolve_quotation_sources
 from .writer import ExtractionWriter
@@ -134,27 +139,38 @@ def run_extraction(
     if write_to_db:
         writer = ExtractionWriter(config)
 
-        # 4. INSERT raw items to DB (is_selected_quote / quote_rank written as-is,
-        #    will be overwritten by update_selection_fields below)
+        # 4. INSERT all extracted items to DB with raw LLM supplier names.
         writer.write(all_items)
 
-        # 5. Canonicalize supplier names in DB using actual supplier_country values,
-        #    then sync the canonical names back to the in-memory items so ranking
-        #    uses the same names that are stored in the DB.
+        # 5. Canonicalize supplier names in DB (uses actual supplier_country column
+        #    as the country-branch guard).  Returns a map of
+        #    (purchase_dtl_id, original_name) → canonical_name for changed rows.
         name_map = writer.canonicalize_supplier_names_in_db(all_items, ras_ctx)
+
+        # 6. Sync canonical names back to in-memory items, then recompute
+        #    supplier_match_conf so the ranking uses fresh scores.
         for item in all_items:
             if item.purchase_dtl_id is not None:
                 key = (item.purchase_dtl_id, (item.supplier_name or "").strip())
                 if key in name_map:
                     item.supplier_name = name_map[key]
+            _, conf = _compute_supplier_match(item.supplier_name, ras_ctx)
+            item.supplier_match_conf = conf
 
-        # 6. Rank and select using canonical names, then persist ranking to DB
+        # 7. Rank items within each (canonical_supplier, DTL_ID) group (rank 1→N
+        #    by price ASC) and pick is_selected_quote=True for the best supplier
+        #    per DTL_ID based on conf + price fit.
         run_selection_llm_query(all_items, ras_ctx, config)
+
+        # 8. Persist supplier_match_conf + quote_rank + is_selected_quote to DB.
         writer.update_selection_fields(all_items)
 
     else:
         # write_to_db=False (testing / dry-run): canonicalize in-memory only
         canonicalize_supplier_names(all_items, ras_ctx)
+        for item in all_items:
+            _, conf = _compute_supplier_match(item.supplier_name, ras_ctx)
+            item.supplier_match_conf = conf
         run_selection_llm_query(all_items, ras_ctx, config)
 
     return all_items

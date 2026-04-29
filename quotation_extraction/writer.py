@@ -96,18 +96,21 @@ _UPDATE_SUPPLIER_NAME_SQL = f"""
 """
 
 # Two variants — embedded items matched by embedded FK, others by attachment FK.
+# Updates supplier_match_conf + is_selected_quote + quote_rank in one pass.
 _UPDATE_SELECTION_EMBEDDED_SQL = f"""
     UPDATE {AzureTables.QUOTATION_EXTRACTED_ITEMS}
-    SET    [is_selected_quote] = ?,
-           [quote_rank]        = ?
+    SET    [supplier_match_conf] = ?,
+           [is_selected_quote]  = ?,
+           [quote_rank]         = ?
     WHERE  [embedded_classify_fk] = ?
       AND  [purchase_dtl_id]      = ?
 """
 
 _UPDATE_SELECTION_ATTACHMENT_SQL = f"""
     UPDATE {AzureTables.QUOTATION_EXTRACTED_ITEMS}
-    SET    [is_selected_quote] = ?,
-           [quote_rank]        = ?
+    SET    [supplier_match_conf] = ?,
+           [is_selected_quote]  = ?,
+           [quote_rank]         = ?
     WHERE  [attachment_classify_fk] = ?
       AND  [embedded_classify_fk]   IS NULL
       AND  [purchase_dtl_id]        = ?
@@ -259,7 +262,7 @@ class ExtractionWriter(BaseRepository):
 
         dtl_ids = list({item.purchase_dtl_id for item in items if item.purchase_dtl_id is not None})
         if not dtl_ids:
-            return
+            return {}
 
         ras_known: set[str] = set()
         if ras_context.supplier_name:
@@ -362,10 +365,11 @@ class ExtractionWriter(BaseRepository):
         return name_to_canonical
 
     def update_selection_fields(self, items: list[ExtractedItem]) -> None:
-        """UPDATE is_selected_quote and quote_rank for all items after ranking.
+        """UPDATE supplier_match_conf, is_selected_quote, and quote_rank for all items.
 
-        Called after canonicalize_supplier_names_in_db + run_selection_llm_query
-        so the DB reflects rankings computed on canonical supplier names.
+        Called after canonicalize_supplier_names_in_db + recompute conf +
+        run_selection_llm_query so the DB reflects rankings computed on
+        canonical supplier names with fresh confidence scores.
         """
         emb_rows: list[tuple] = []
         att_rows: list[tuple] = []
@@ -373,14 +377,15 @@ class ExtractionWriter(BaseRepository):
         for item in items:
             if item.purchase_dtl_id is None:
                 continue
+            conf     = _p(item.supplier_match_conf)
             selected = 1 if item.is_selected_quote else 0
             rank     = item.quote_rank
             dtl_id   = item.purchase_dtl_id
 
             if item.embedded_classify_fk:
-                emb_rows.append((selected, rank, str(item.embedded_classify_fk), dtl_id))
+                emb_rows.append((conf, selected, rank, str(item.embedded_classify_fk), dtl_id))
             elif item.attachment_classify_fk:
-                att_rows.append((selected, rank, str(item.attachment_classify_fk), dtl_id))
+                att_rows.append((conf, selected, rank, str(item.attachment_classify_fk), dtl_id))
 
         if emb_rows:
             self._execute_many(_UPDATE_SELECTION_EMBEDDED_SQL, emb_rows)
