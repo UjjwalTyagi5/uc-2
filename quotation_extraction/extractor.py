@@ -840,13 +840,6 @@ def run_selection_llm_query(
     """
     from collections import defaultdict
 
-    def _has_data(item: ExtractedItem) -> bool:
-        return (
-            item.unit_price      is not None
-            or item.item_name        is not None
-            or item.item_description is not None
-        )
-
     # ── Step 1: number each supplier's items starting from 1 ─────────────
     compute_quote_ranks(all_items)
 
@@ -862,7 +855,7 @@ def run_selection_llm_query(
 
     by_dtl: dict[int, list[ExtractedItem]] = defaultdict(list)
     for item in all_items:
-        if item.purchase_dtl_id is not None and _has_data(item):
+        if item.purchase_dtl_id is not None:
             by_dtl[item.purchase_dtl_id].append(item)
 
     selected = 0
