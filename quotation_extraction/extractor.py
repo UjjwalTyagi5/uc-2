@@ -587,16 +587,42 @@ def _align_to_ras_line_items(
     logger.debug("Valid RAS DTL_IDs: {}", sorted(valid_dtl_ids))
 
     # ── Step 1: strict match ──
-    matched:  list[ExtractedItem] = []
+    # Collect all LLM items with valid DTL_IDs, then deduplicate to one per DTL_ID.
+    matched_by_dtl: dict[int, ExtractedItem] = {}
     orphans:  list[ExtractedItem] = []
+
+    def _data_score(it: ExtractedItem) -> tuple:
+        return (
+            int(it.unit_price is not None),
+            int(it.total_price is not None),
+            int(it.item_name is not None),
+            int(it.item_description is not None),
+        )
 
     for i in items:
         if i.purchase_dtl_id in valid_dtl_ids:
-            matched.append(i)
+            dtl_id = i.purchase_dtl_id
+            if dtl_id not in matched_by_dtl:
+                matched_by_dtl[dtl_id] = i
+            else:
+                existing = matched_by_dtl[dtl_id]
+                if _data_score(i) > _data_score(existing):
+                    logger.debug(
+                        "DTL {}: replacing duplicate item {!r} with richer item {!r}",
+                        dtl_id, existing.item_name, i.item_name,
+                    )
+                    matched_by_dtl[dtl_id] = i
+                else:
+                    logger.debug(
+                        "DTL {}: dropping duplicate item {!r} (keeping {!r})",
+                        dtl_id, i.item_name, existing.item_name,
+                    )
         elif _item_has_data(i):
             orphans.append(i)
         else:
             logger.debug("Discarding empty item (no name/price, dtl_id=None)")
+
+    matched: list[ExtractedItem] = list(matched_by_dtl.values())
 
     # ── Step 2: fuzzy fallback for orphans ──
     covered_dtl_ids  = {i.purchase_dtl_id for i in matched}

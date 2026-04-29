@@ -88,8 +88,8 @@ Column legend:
 ## Required Output
 
 Analyse the quotation document above against the requisition context.
-Extract **every item** found in the document.
-For each item try to match it to the closest line item in the requisition table
+Extract **exactly one item per DTL_ID** from the RAS line items table — the quotation row that best represents the supplier's quoted price and specs for that line.
+For each item match it to the closest line item in the requisition table
 (use Description, Item Code, Quantity, and UOM as primary matching signals).
 
 > **Important:** A purchase requisition can cover any type of procurement —
@@ -175,6 +175,9 @@ For supporting items in the quotation (installation, packing, commissioning, tra
 
 If the same quotation item legitimately covers multiple DTL_IDs (e.g. one quote line for "Installation for both Machine A and Machine B"), emit one row per DTL_ID with the same item details.
 
+**One row per DTL_ID — STRICT:**
+Return **at most one item per `purchase_dtl_id`**. If the supplier quoted multiple options, configurations, or variants for the same line (e.g. standard vs premium, different lead times, revised prices), pick the single row that best represents the primary quoted offer — the one with the clearest pricing and the closest match to the RAS description. Do not emit duplicate rows for the same DTL_ID.
+
 **Set `supplier_match_conf` honestly:**
 - `1.0` — exact match on a distinguishing identifier (model number, code, size).
 - `0.7-0.9` — strong but not perfect match (one signal matches clearly).
@@ -182,4 +185,6 @@ If the same quotation item legitimately covers multiple DTL_IDs (e.g. one quote 
 - `< 0.3` — guessing — prefer to leave `purchase_dtl_id = null`.
 
 **Coverage check before responding:**
-After listing all items, verify: for every DTL_ID in the RAS table that the supplier has clearly quoted on, you have emitted at least one item with that `purchase_dtl_id`. If you find a quoted item you forgot to emit, add it now.
+After listing all items, verify:
+1. For every DTL_ID in the RAS table that the supplier has clearly quoted on, you have emitted **exactly one** item with that `purchase_dtl_id`. If you forgot a DTL_ID, add it now. If you emitted more than one row for the same DTL_ID, remove the duplicates and keep only the best one.
+2. No `purchase_dtl_id` appears more than once in your `items` array.
