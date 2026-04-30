@@ -30,61 +30,25 @@ import pyodbc
 from loguru import logger
 
 from agentcore.custom import Node
-from agentcore.io import DropdownInput, HandleInput, IntInput, MessageTextInput, Output
+from agentcore.io import HandleInput, IntInput, MessageTextInput, Output
 from agentcore.schema.data import Data
 from agentcore.schema.message import Message
 
 
-# ── blob connector catalogue helpers ──────────────────────────────────────────
+# ── blob connector catalogue helper ───────────────────────────────────────────
 
-def _fetch_blob_connectors() -> list[str]:
-    """Return all azure_blob connectors from the Connectors Catalogue."""
+def _get_blob_config_by_name(connector_name: str) -> dict:
+    """Look up an azure_blob connector by name and return account_url + container_name."""
+    name = (connector_name or "").strip()
+    if not name:
+        raise ValueError(
+            "blob_connector_name is empty. "
+            "Enter the connector name from Settings → Connectors."
+        )
     try:
         import asyncio
         import concurrent.futures as _cf
-
-        async def _query():
-            from agentcore.services.deps import get_db_service
-            from sqlalchemy import select
-            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
-
-            db_service = get_db_service()
-            async with db_service.with_session() as session:
-                stmt = (
-                    select(ConnectorCatalogue)
-                    .where(ConnectorCatalogue.provider == "azure_blob")
-                    .where(ConnectorCatalogue.status == "connected")
-                    .order_by(ConnectorCatalogue.name)
-                )
-                result = await session.execute(stmt)
-                rows = result.scalars().all()
-                return [f"{r.name} | azure_blob | {r.id}" for r in rows]
-
-        try:
-            asyncio.get_running_loop()
-            with _cf.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, _query()).result(timeout=10)
-        except RuntimeError:
-            return asyncio.run(_query())
-
-    except Exception as exc:
-        logger.warning(f"Could not fetch blob connectors from catalogue: {exc}")
-        return ["(no blob connectors found — add one in Settings → Connectors)"]
-
-
-def _get_blob_config(connector_value: str) -> dict:
-    """Resolve account_url + container_name from a catalogue blob connector."""
-    # connector_value format: "name | azure_blob | <uuid>"
-    parts = connector_value.split(" | ")
-    if len(parts) < 3:
-        raise ValueError(f"Unexpected connector value format: {connector_value!r}")
-
-    connector_id = parts[-1].strip()
-
-    try:
-        import asyncio
-        import concurrent.futures as _cf
-        from uuid import UUID
+        from sqlalchemy import select
 
         async def _fetch():
             from agentcore.services.deps import get_db_service
@@ -92,17 +56,22 @@ def _get_blob_config(connector_value: str) -> dict:
 
             db_service = get_db_service()
             async with db_service.with_session() as session:
-                row = await session.get(ConnectorCatalogue, UUID(connector_id))
+                stmt = (
+                    select(ConnectorCatalogue)
+                    .where(ConnectorCatalogue.name == name)
+                    .where(ConnectorCatalogue.provider == "azure_blob")
+                )
+                result = await session.execute(stmt)
+                row = result.scalars().first()
                 if row is None:
-                    raise ValueError(f"Blob connector {connector_id} not found in catalogue")
-                # Resolve encrypted fields if needed
-                account_url    = row.host or ""
-                container_name = row.database_name or ""
-                blob_prefix    = row.schema_name or ""
+                    raise ValueError(
+                        f"No azure_blob connector named {name!r} found in catalogue. "
+                        "Check Settings → Connectors."
+                    )
                 return {
-                    "account_url":    account_url,
-                    "container_name": container_name,
-                    "blob_prefix":    blob_prefix,
+                    "account_url":    row.host or "",
+                    "container_name": row.database_name or "",
+                    "blob_prefix":    row.schema_name or "",
                 }
 
         try:
@@ -113,7 +82,7 @@ def _get_blob_config(connector_value: str) -> dict:
             return asyncio.run(_fetch())
 
     except Exception as exc:
-        raise RuntimeError(f"Failed to resolve blob connector config: {exc}") from exc
+        raise RuntimeError(f"Blob connector lookup failed: {exc}") from exc
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -157,17 +126,13 @@ class PipelineStage123Node(Node):
             input_types=["Data"],
             info="Connection Config output from the Azure SQL Database Connector node.",
         ),
-        DropdownInput(
-            name="blob_connector",
-            display_name="Azure Blob Connector",
-            info="Select the Azure Blob connector configured in Settings → Connectors. "
-                 "Click the refresh button (↻) to load available connectors. "
-                 "account_url and container_name are resolved automatically.",
-            options=[],
+        MessageTextInput(
+            name="blob_connector_name",
+            display_name="Azure Blob Connector Name",
             value="",
-            refresh_button=True,
-            real_time_refresh=True,
-            combobox=True,
+            info="Enter the exact name of your Azure Blob connector as it appears in "
+                 "Settings → Connectors (e.g. 'agentcore-blob'). "
+                 "account_url and container_name are resolved from the catalogue automatically.",
         ),
         MessageTextInput(
             name="pr_no_filter",
@@ -207,22 +172,6 @@ class PipelineStage123Node(Node):
             types=["Message"],
         ),
     ]
-
-    # ── dropdown refresh ──────────────────────────────────────────────────────
-
-    def update_build_config(self, build_config: dict, field_value: str, field_name: str | None = None):
-        """Populate the blob_connector dropdown when the user clicks refresh (↻)."""
-        if field_name == "blob_connector":
-            try:
-                options = _fetch_blob_connectors()
-                build_config["blob_connector"]["options"] = options if options else []
-                current = build_config["blob_connector"].get("value", "")
-                if current not in options:
-                    build_config["blob_connector"]["value"] = options[0] if options else ""
-            except Exception as exc:
-                logger.warning(f"Error fetching blob connectors: {exc}")
-                build_config["blob_connector"]["options"] = []
-        return build_config
 
     # ── pyodbc helpers ────────────────────────────────────────────────────────
 
@@ -328,7 +277,7 @@ class PipelineStage123Node(Node):
     def _blob_cfg(self) -> dict:
         """Resolve blob config from the Connectors Catalogue once per run."""
         if not hasattr(self, "_blob_config_cache"):
-            self._blob_config_cache = _get_blob_config(self.blob_connector)
+            self._blob_config_cache = _get_blob_config_by_name(self.blob_connector_name)
         return self._blob_config_cache
 
     def _upload_blob(self, filename: str, raw: bytes, pr_no: str) -> str:
