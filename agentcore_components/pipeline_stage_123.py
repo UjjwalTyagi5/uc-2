@@ -45,18 +45,26 @@ def _get_blob_config_by_name(connector_name: str) -> dict:
                 row = result.scalars().first()
                 if row is None:
                     raise ValueError(f"No azure_blob connector named {name!r} found. Check Settings → Connectors.")
+                # provider_config holds account_url + container_name for azure_blob connectors
                 cfg = row.provider_config or {}
-                account_url    = cfg.get("account_url", "").strip()
-                container_name = cfg.get("container_name", "").strip()
-                if not account_url:
+                account_url    = (cfg.get("account_url") or row.host or "").strip()
+                container_name = (cfg.get("container_name") or row.database_name or "").strip()
+                # Validate the URL is complete (not just "https://")
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(account_url)
+                    if not parsed.netloc:
+                        raise ValueError("no netloc")
+                except Exception:
                     raise ValueError(
-                        f"Azure Blob connector {name!r} has no account_url in provider_config. "
-                        f"Edit the connector in Settings → Connectors and set the Storage Account URL."
+                        f"Azure Blob connector {name!r} has an invalid or incomplete Storage Account URL: {account_url!r}. "
+                        f"Go to Settings → Connectors → edit {name!r} and set the full URL, "
+                        f"e.g. https://youraccount.blob.core.windows.net"
                     )
                 if not container_name:
                     raise ValueError(
-                        f"Azure Blob connector {name!r} has no container_name in provider_config. "
-                        f"Edit the connector in Settings → Connectors and set the Container Name."
+                        f"Azure Blob connector {name!r} has no container_name. "
+                        f"Go to Settings → Connectors → edit {name!r} and set the Container Name."
                     )
                 return {
                     "account_url":    account_url,
