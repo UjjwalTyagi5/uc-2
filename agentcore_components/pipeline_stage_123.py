@@ -45,9 +45,22 @@ def _get_blob_config_by_name(connector_name: str) -> dict:
                 row = result.scalars().first()
                 if row is None:
                     raise ValueError(f"No azure_blob connector named {name!r} found. Check Settings → Connectors.")
+                cfg = row.provider_config or {}
+                account_url    = cfg.get("account_url", "").strip()
+                container_name = cfg.get("container_name", "").strip()
+                if not account_url:
+                    raise ValueError(
+                        f"Azure Blob connector {name!r} has no account_url in provider_config. "
+                        f"Edit the connector in Settings → Connectors and set the Storage Account URL."
+                    )
+                if not container_name:
+                    raise ValueError(
+                        f"Azure Blob connector {name!r} has no container_name in provider_config. "
+                        f"Edit the connector in Settings → Connectors and set the Container Name."
+                    )
                 return {
-                    "account_url":    row.host or "",
-                    "container_name": row.database_name or "",
+                    "account_url":    account_url,
+                    "container_name": container_name,
                 }
 
         try:
