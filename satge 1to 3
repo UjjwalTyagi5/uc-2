@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import shutil
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+import pyodbc
+
+from agentcore.custom import Node
+from agentcore.io import DataInput, DropdownInput, IntInput, MessageInput, MessageTextInput, Output
+from agentcore.schema.data import Data
+from agentcore.schema.message import Message
+
+
+def _run_async(coro):
+    import concurrent.futures as _cf
+    try:
+        asyncio.get_running_loop()
+        with _cf.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, coro).result(timeout=60)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+def _fetch_blob_connectors() -> list[str]:
+    try:
+        from agentcore.services.deps import get_db_service
+        db_service = get_db_service()
+        async def _q():
+            from sqlalchemy import select
+            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
+            async with db_service.with_session() as session:
+                result = await session.execute(
+                    select(ConnectorCatalogue)
+                    .where(ConnectorCatalogue.provider == "azure_blob")
+                    .order_by(ConnectorCatalogue.name)
+                )
+                rows = result.scalars().all()
+                return [
+                    f"{r.name} | azure_blob | {(r.provider_config or {}).get('container_name', '—')} | {r.id}"
+                    for r in rows
+                ]
+        return _run_async(_q())
+    except Exception:
+        return []
+
+
+def _get_blob_config(connector_value: str) -> dict | None:
+    parts = connector_value.split("|")
+    connector_id = parts[-1].strip() if len(parts) >= 4 else connector_value.strip()
+    if not connector_id:
+        return None
+    try:
+        from agentcore.services.deps import get_db_service
+        from uuid import UUID
+        db_service = get_db_service()
+        async def _q():
+            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
+            async with db_service.with_session() as session:
+                row = await session.get(ConnectorCatalogue, UUID(connector_id))
+                if not row:
+                    return None
+                raw = row.provider_config or {}
+                try:
+                    from agentcore.api.connector_catalogue import _decrypt_provider_config
+                    return _decrypt_provider_config(row.provider, raw)
+                except Exception:
+                    return raw
+        return _run_async(_q())
+    except Exception:
+        return None
+
+
+class PipelineStage123Node(Node):
+    display_name = "Pipeline Stage 1-3"
+    description = (
+        "Stage 1: Ingestion (ras_tracker). "
+        "Stage 2: Downloads attachments from on-prem SQL Server. "
+        "Stage 3: Uploads to Azure Blob via Connectors Catalogue. "
+        "Outputs file batch text for Prompt Template + context Data for Stage 4-8."
+    )
+    icon = "Download"
+    name = "PipelineStage123Node"
+
+    inputs = [
+        MessageInput(name="trigger", display_name="Trigger", advanced=True),
+        DataInput(name="source_connection", display_name="Source DB (On-Prem)"),
+        DataInput(name="target_connection", display_name="Target DB (Azure SQL)"),
+        DropdownInput(
+            name="blob_connector",
+            display_name="Azure Blob Connector",
+            info="Select Azure Blob Storage connector from the Connectors Catalogue.",
+            options=[],
+            value="",
+            refresh_button=True,
+            real_time_refresh=True,
+        ),
+        MessageTextInput(name="pr_no_filter", display_name="PR No (blank = all pending)", value=""),
+        IntInput(name="limit", display_name="Max PRs", value=10),
+        MessageTextInput(name="az_schema", display_name="Azure SQL Schema", value="ras_procurement", advanced=True),
+        MessageTextInput(name="src_schema", display_name="On-Prem Schema", value="ras_attachments", advanced=True),
+        IntInput(name="max_chars", display_name="Max Content Chars per File", value=6000, advanced=True),
+    ]
+
+    outputs = [
+        Output(display_name="File Batch", name="file_batch", method="build_file_batch"),
+        Output(display_name="Pipeline Context", name="pipeline_context", method="build_context", output_types=["Data"]),
+    ]
+
+    def update_build_config(self, build_config, field_value, field_name=None):
+        if field_name in ("blob_connector", None):
+            build_config["blob_connector"]["options"] = _fetch_blob_connectors()
+        return build_config
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _conn_str(self, d: dict) -> str:
+        driver = d.get("driver", "ODBC Driver 18 for SQL Server")
+        return (
+            f"DRIVER={{{driver}}};SERVER={d.get('host', '')},{d.get('port', 1433)};"
+            f"DATABASE={d.get('database_name', '')};UID={d.get('username', '')};"
+            f"PWD={d.get('password', '')};TrustServerCertificate=yes;Connection Timeout=30;"
+        )
+
+    def _db(self, cs: str) -> pyodbc.Connection:
+        for i in range(4):
+            try:
+                return pyodbc.connect(cs, timeout=30)
+            except Exception:
+                if i == 3: raise
+                time.sleep(2 ** i)
+
+    def _pending_prs(self, tgt_cs: str) -> list[str]:
+        conn = self._db(tgt_cs)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT TOP (?) m.PURCHASE_REQ_NO "
+                f"FROM [{self.az_schema}].[purchase_req_mst] m "
+                f"LEFT JOIN [{self.az_schema}].[ras_tracker] t "
+                f"  ON t.purchase_req_no = m.PURCHASE_REQ_NO "
+                f"WHERE t.purchase_req_no IS NULL OR t.current_stage_fk < 8 "
+                f"ORDER BY m.C_DATETIME",
+                self.limit,
+            )
+            return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def _stage1(self, conn: pyodbc.Connection, pr_no: str) -> None:
+        conn.cursor().execute(
+            f"MERGE [{self.az_schema}].[ras_tracker] AS tgt "
+            f"USING (SELECT ? AS p) AS src ON tgt.purchase_req_no = src.p "
+            f"WHEN MATCHED THEN UPDATE SET current_stage_fk=1,updated_at=SYSUTCDATETIME() "
+            f"WHEN NOT MATCHED THEN INSERT (purchase_req_no,current_stage_fk,created_at,updated_at) "
+            f"VALUES(?,1,SYSUTCDATETIME(),SYSUTCDATETIME());",
+            pr_no, pr_no,
+        )
+        conn.commit()
+
+    def _stage2(self, src_cs: str, pr_no: str, work_pr_dir: Path) -> int:
+        conn = self._db(src_cs)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT d.ATTACHMENT_ID, d.ATTACHMENT_NAME, d.ATTACHMENT_DATA "
+                f"FROM [{self.src_schema}].[RAS_ATTACHMENT_DOCUMENTS] d "
+                f"JOIN [{self.src_schema}].[RAS_ATTACHMENTS] a ON a.RAS_ID = d.ATTACHMENT_ID "
+                f"WHERE a.PURCHASE_REQ_NO = ?",
+                pr_no,
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        count = 0
+        for att_id, att_name, att_data in rows:
+            if att_data is None: continue
+            att_dir = work_pr_dir / str(att_id)
+            att_dir.mkdir(parents=True, exist_ok=True)
+            fname = Path(att_name).name if att_name else f"{att_id}.bin"
+            (att_dir / fname).write_bytes(att_data)
+            count += 1
+        return count
+
+    def _stage3(self, work_pr_dir: Path) -> int:
+        cfg = _get_blob_config(self.blob_connector)
+        if not cfg:
+            self.log("No blob connector — skipping upload")
+            return 0
+        account_url = cfg.get("account_url", "")
+        container = cfg.get("container_name", "")
+        if not account_url or not container:
+            return 0
+        try:
+            from azure.identity import DefaultAzureCredential
+            from azure.storage.blob import BlobServiceClient
+            cred = DefaultAzureCredential(
+                exclude_environment_credential=True,
+                exclude_interactive_browser_credential=True,
+            )
+            svc = BlobServiceClient(account_url=account_url, credential=cred)
+            ctr = svc.get_container_client(container)
+            base = work_pr_dir.parent.parent
+            count = 0
+            for f in work_pr_dir.rglob("*"):
+                if f.is_file():
+                    blob_name = str(f.relative_to(base)).replace("\\", "/")
+                    with open(f, "rb") as fh:
+                        ctr.upload_blob(blob_name, fh, overwrite=True)
+                    count += 1
+            return count
+        except Exception as exc:
+            self.log(f"Blob upload error: {exc}")
+            return 0
+
+    def _extract(self, file_path: Path) -> str:
+        ext = file_path.suffix.lower()
+        try:
+            fb = file_path.read_bytes()
+        except Exception:
+            return ""
+        if ext == ".pdf":
+            try:
+                import fitz
+                doc = fitz.open(stream=fb, filetype="pdf")
+                return "\n".join(page.get_text() for page in doc)[:self.max_chars]
+            except Exception:
+                return ""
+        if ext in (".docx", ".doc"):
+            try:
+                import docx
+                return "\n".join(p.text for p in docx.Document(io.BytesIO(fb)).paragraphs)[:self.max_chars]
+            except Exception:
+                return ""
+        if ext in (".xlsx", ".xls"):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(io.BytesIO(fb), read_only=True, data_only=True)
+                rows = []
+                for sh in wb.worksheets:
+                    rows.append(f"=== {sh.title} ===")
+                    for row in sh.iter_rows(max_row=400):
+                        v = [str(c.value) for c in row if c.value is not None]
+                        if v: rows.append("\t".join(v))
+                return "\n".join(rows)[:self.max_chars]
+            except Exception:
+                return ""
+        if ext == ".csv":
+            return fb.decode("utf-8", errors="replace")[:self.max_chars]
+        if ext in (".txt", ".html", ".htm"):
+            return fb.decode("utf-8", errors="replace")[:self.max_chars]
+        if ext in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
+            return "[image file — classify by filename and context]"
+        return ""
+
+    # ── core run (cached on instance) ─────────────────────────────────────────
+
+    def _execute(self) -> dict:
+        if hasattr(self, "_result"):
+            return self._result
+
+        src_cs = self._conn_str(self.source_connection.data or {})
+        tgt_cs = self._conn_str(self.target_connection.data or {})
+        work_dir = Path(tempfile.gettempdir()) / "pipeline_work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        pr_nos = [self.pr_no_filter.strip()] if self.pr_no_filter.strip() else self._pending_prs(tgt_cs)
+        self.log(f"PRs to process: {pr_nos}")
+
+        all_files: list[dict] = []
+        for pr_no in pr_nos:
+            safe = pr_no.replace("/", "_")
+            work_pr_dir = work_dir / "procurement" / safe
+            if work_pr_dir.exists():
+                shutil.rmtree(work_pr_dir)
+            work_pr_dir.mkdir(parents=True, exist_ok=True)
+
+            tgt_conn = self._db(tgt_cs)
+            try:
+                self._stage1(tgt_conn, pr_no)
+                n = self._stage2(src_cs, pr_no, work_pr_dir)
+                self.log(f"[{pr_no}] Stage 2: {n} file(s) downloaded")
+                u = self._stage3(work_pr_dir)
+                self.log(f"[{pr_no}] Stage 3: {u} file(s) uploaded to blob")
+                tgt_conn.cursor().execute(
+                    f"UPDATE [{self.az_schema}].[ras_tracker] "
+                    f"SET current_stage_fk=3,updated_at=SYSUTCDATETIME() WHERE purchase_req_no=?",
+                    pr_no,
+                )
+                tgt_conn.commit()
+            finally:
+                tgt_conn.close()
+
+            for att_dir in sorted(work_pr_dir.iterdir()):
+                if not att_dir.is_dir(): continue
+                for f in sorted(att_dir.iterdir()):
+                    if not f.is_file(): continue
+                    text = self._extract(f)
+                    all_files.append({
+                        "pr_no": pr_no,
+                        "att_id": att_dir.name,
+                        "filename": f.name,
+                        "blob_path": f"procurement/{safe}/{att_dir.name}/{f.name}",
+                        "ext": f.suffix.lower(),
+                        "text": text,
+                    })
+
+        self._result = {
+            "pr_nos": pr_nos,
+            "az_schema": self.az_schema,
+            "files": all_files,
+        }
+        return self._result
+
+    async def build_file_batch(self) -> Message:
+        r = self._execute()
+        sections = []
+        for rec in r["files"]:
+            content = rec["text"] or "[no extractable text]"
+            sections.append(
+                f"---FILE---\n"
+                f"PR: {rec['pr_no']} | AttID: {rec['att_id']} | "
+                f"File: {rec['filename']} | BlobPath: {rec['blob_path']}\n"
+                f"CONTENT:\n{content}"
+            )
+        batch = "\n\n".join(sections) if sections else "No files to process."
+        return Message(text=batch)
+
+    async def build_context(self) -> Data:
+        r = self._execute()
+        return Data(data={"pr_nos": r["pr_nos"], "az_schema": r["az_schema"], "files": r["files"]})
