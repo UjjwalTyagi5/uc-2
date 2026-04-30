@@ -5,7 +5,6 @@ import io
 import os
 import random
 import time
-from typing import Optional
 
 import pyodbc
 from loguru import logger
@@ -18,9 +17,10 @@ from agentcore.schema.message import Message
 _MAX_RETRIES = 3
 _BASE_DELAY  = 2.0
 
-_STAGE_INGESTION = 1
-_STAGE_EMBED_DOC = 2
+_STAGE_INGESTION  = 1
+_STAGE_EMBED_DOC  = 2
 _STAGE_BLOB_UPLOAD = 3
+_STAGE_EXCEPTION  = 99
 
 _TEXT_EXT  = {".txt", ".csv", ".xml", ".json", ".html", ".htm", ".msg", ".eml"}
 _PDF_EXT   = {".pdf"}
@@ -97,7 +97,11 @@ class PipelineStage123Node(Node):
             display_name="PR Number Filter (optional)",
             value="",
             advanced=True,
-            info="Leave blank to process all pending PRs. Enter one PURCHASE_REQ_NO to test a single PR.",
+            info=(
+                "Leave blank to process all pending approved PRs. "
+                "Enter one PURCHASE_REQ_NO to force a full reprocess of that PR from scratch "
+                "(wipes all existing pipeline data for it, then reruns every stage)."
+            ),
         ),
         IntInput(
             name="batch_limit",
@@ -127,6 +131,8 @@ class PipelineStage123Node(Node):
             types=["Message"],
         ),
     ]
+
+    # ── Connection helpers ────────────────────────────────────────────────
 
     def _conn_str(self, conn_data: Data) -> str:
         d = conn_data.data or {}
@@ -161,6 +167,8 @@ class PipelineStage123Node(Node):
             self._blob_config_cache = _get_blob_config_by_name(self.blob_connector_name)
         return self._blob_config_cache
 
+    # ── Fetch pending PRs ─────────────────────────────────────────────────
+
     def _fetch_pending_prs(self, tgt_cs: str) -> list[str]:
         pr_filter = (self.pr_no_filter or "").strip()
         if pr_filter:
@@ -168,12 +176,22 @@ class PipelineStage123Node(Node):
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
         try:
+            # Matches run_pipeline.py logic:
+            #   - brand-new PRs (no tracker row)
+            #   - PRs reset for reprocess (current_stage_fk IS NULL)
+            #   - PRs stuck mid-pipeline (not at COMPLETE=8 or terminal 90/91/99)
+            # Only processes fully-approved PRs.
             cur.execute(
                 """
                 SELECT TOP (?) prm.PURCHASE_REQ_NO
-                  FROM purchase_req_mst prm
-                  LEFT JOIN ras_tracker rt ON rt.purchase_req_no = prm.PURCHASE_REQ_NO
-                 WHERE (rt.current_stage_fk IS NULL OR rt.current_stage_fk < 1)
+                  FROM [ras_procurement].[purchase_req_mst] prm
+                  LEFT JOIN [ras_procurement].[ras_tracker] rt
+                    ON prm.PURCHASE_REQ_NO = rt.purchase_req_no
+                 WHERE (rt.purchase_req_no IS NULL
+                        OR rt.current_stage_fk IS NULL
+                        OR rt.current_stage_fk NOT IN (8, 90, 91, 99))
+                   AND UPPER(prm.PURCHASEFINALAPPROVALSTATUS)
+                           IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
                  ORDER BY prm.C_DATETIME ASC
                 """,
                 int(self.batch_limit),
@@ -181,6 +199,130 @@ class PipelineStage123Node(Node):
             return [row[0] for row in cur.fetchall()]
         finally:
             conn.close()
+
+    # ── Pre-run cleanup ───────────────────────────────────────────────────
+
+    def _cleanup_for_pr(self, tgt_cs: str, pr_no: str) -> None:
+        """Deletes all prior pipeline output for this PR before (re-)processing.
+        No-op for brand-new PRs. Matches orchestrator.cleanup_for_pr logic."""
+        conn = self._connect(tgt_cs)
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker] WHERE purchase_req_no = ?",
+            pr_no,
+        )
+        existing = cur.fetchone()
+        conn.close()
+
+        if existing is None:
+            self.log(f"[{pr_no}] New PR — no prior data to clean")
+            return
+
+        self.log(f"[{pr_no}] Existing PR — cleaning prior pipeline output before reprocessing")
+        conn = self._connect(tgt_cs)
+        cur  = conn.cursor()
+        try:
+            # NULL FK references on other PRs' benchmark rows pointing at this PR's quotation items
+            cur.execute(
+                """
+                UPDATE br SET br.low_hist_item_fk = NULL
+                  FROM [ras_procurement].[benchmark_result] br
+                  JOIN [ras_procurement].[quotation_extracted_items] qi
+                    ON br.low_hist_item_fk = qi.extracted_item_uuid_pk
+                  JOIN [ras_procurement].[attachment_classification] ac
+                    ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
+                  JOIN [ras_procurement].[ras_tracker] rt
+                    ON ac.ras_uuid_pk = rt.ras_uuid_pk
+                 WHERE rt.purchase_req_no = ?
+                """,
+                pr_no,
+            )
+            cur.execute(
+                """
+                UPDATE br SET br.last_hist_item_fk = NULL
+                  FROM [ras_procurement].[benchmark_result] br
+                  JOIN [ras_procurement].[quotation_extracted_items] qi
+                    ON br.last_hist_item_fk = qi.extracted_item_uuid_pk
+                  JOIN [ras_procurement].[attachment_classification] ac
+                    ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
+                  JOIN [ras_procurement].[ras_tracker] rt
+                    ON ac.ras_uuid_pk = rt.ras_uuid_pk
+                 WHERE rt.purchase_req_no = ?
+                """,
+                pr_no,
+            )
+            # Delete benchmark_result rows for this PR
+            cur.execute(
+                """
+                DELETE br
+                  FROM [ras_procurement].[benchmark_result] br
+                  JOIN [ras_procurement].[quotation_extracted_items] qi
+                    ON br.extracted_item_uuid_fk = qi.extracted_item_uuid_pk
+                  JOIN [ras_procurement].[attachment_classification] ac
+                    ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
+                  JOIN [ras_procurement].[ras_tracker] rt
+                    ON ac.ras_uuid_pk = rt.ras_uuid_pk
+                 WHERE rt.purchase_req_no = ?
+                """,
+                pr_no,
+            )
+            # Delete quotation_extracted_items for this PR
+            cur.execute(
+                """
+                DELETE qi
+                  FROM [ras_procurement].[quotation_extracted_items] qi
+                  JOIN [ras_procurement].[attachment_classification] ac
+                    ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
+                  JOIN [ras_procurement].[ras_tracker] rt
+                    ON ac.ras_uuid_pk = rt.ras_uuid_pk
+                 WHERE rt.purchase_req_no = ?
+                """,
+                pr_no,
+            )
+            # SP cleans attachment_classification, embedded_attachment_classification, BI dashboard row
+            cur.execute("EXEC [ras_procurement].[usp_cleanup_pr_data] ?", pr_no)
+            conn.commit()
+            self.log(f"[{pr_no}] Cleanup complete")
+        except Exception as exc:
+            conn.rollback()
+            raise RuntimeError(f"Pre-run cleanup failed for PR {pr_no}: {exc}") from exc
+        finally:
+            conn.close()
+
+    # ── Single-PR tracker reset ───────────────────────────────────────────
+
+    def _reset_for_reprocess(self, tgt_cs: str, pr_no: str) -> None:
+        """Wipes exception rows and sets current_stage_fk = NULL (keeps ras_uuid_pk).
+        Increments retry_count so history is preserved. Matches tracker.reset_for_reprocess."""
+        conn = self._connect(tgt_cs)
+        cur  = conn.cursor()
+        try:
+            cur.execute(
+                """
+                DELETE FROM [ras_procurement].[ras_pipeline_exceptions]
+                 WHERE ras_tracker_id = (
+                     SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker]
+                      WHERE purchase_req_no = ?
+                 )
+                """,
+                pr_no,
+            )
+            cur.execute(
+                """
+                UPDATE [ras_procurement].[ras_tracker]
+                   SET current_stage_fk = NULL,
+                       retry_count      = COALESCE(retry_count, 0) + 1,
+                       updated_at       = SYSUTCDATETIME()
+                 WHERE purchase_req_no = ?
+                """,
+                pr_no,
+            )
+            conn.commit()
+            self.log(f"[{pr_no}] Tracker reset for reprocess (retry_count incremented)")
+        finally:
+            conn.close()
+
+    # ── Attachments ───────────────────────────────────────────────────────
 
     def _fetch_attachments(self, src_cs: str, pr_no: str) -> list[dict]:
         conn = self._connect(src_cs)
@@ -230,17 +372,20 @@ class PipelineStage123Node(Node):
         ).get_blob_client(container=cfg["container_name"], blob=blob_name).upload_blob(raw, overwrite=True)
         return blob_name
 
+    # ── Tracker advances ──────────────────────────────────────────────────
+
     def _advance_tracker(self, tgt_cs: str, pr_no: str, stage_id: int) -> None:
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
         try:
             if stage_id == _STAGE_INGESTION:
+                # MERGE: INSERT on first run, UPDATE on retry — matches tracker.upsert_stage
                 cur.execute(
                     """
-                    MERGE ras_tracker WITH (HOLDLOCK) AS target
+                    MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
                     USING (
                         SELECT PURCHASE_REQ_NO, PURCHASEFINALAPPROVALSTATUS
-                          FROM purchase_req_mst WHERE PURCHASE_REQ_NO = ?
+                          FROM [ras_procurement].[purchase_req_mst] WHERE PURCHASE_REQ_NO = ?
                     ) AS src ON target.purchase_req_no = src.PURCHASE_REQ_NO
                     WHEN MATCHED THEN
                         UPDATE SET current_stage_fk = ?, updated_at = SYSUTCDATETIME()
@@ -251,17 +396,74 @@ class PipelineStage123Node(Node):
                     pr_no, stage_id, stage_id,
                 )
             else:
+                # Plain UPDATE for stages 2+ — matches tracker.advance_stage
                 cur.execute(
-                    "UPDATE ras_tracker SET current_stage_fk=?, updated_at=SYSUTCDATETIME() WHERE purchase_req_no=?",
+                    """
+                    UPDATE [ras_procurement].[ras_tracker]
+                       SET current_stage_fk = ?, updated_at = SYSUTCDATETIME()
+                     WHERE purchase_req_no = ?
+                    """,
                     stage_id, pr_no,
                 )
             conn.commit()
         finally:
             conn.close()
 
+    # ── Exception recording ───────────────────────────────────────────────
+
+    def _record_exception(self, tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) -> None:
+        """Sets ras_tracker to EXCEPTION (99) and inserts into ras_pipeline_exceptions.
+        Matches tracker.record_exception. PR will not be retried by batch runs."""
+        try:
+            conn = self._connect(tgt_cs)
+            cur  = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
+                    USING (
+                        SELECT PURCHASE_REQ_NO, PURCHASEFINALAPPROVALSTATUS
+                          FROM [ras_procurement].[purchase_req_mst] WHERE PURCHASE_REQ_NO = ?
+                    ) AS src ON target.purchase_req_no = src.PURCHASE_REQ_NO
+                    WHEN MATCHED THEN
+                        UPDATE SET current_stage_fk = 99, updated_at = SYSUTCDATETIME()
+                    WHEN NOT MATCHED THEN
+                        INSERT (purchase_req_no, ras_status, current_stage_fk)
+                        VALUES (src.PURCHASE_REQ_NO, src.PURCHASEFINALAPPROVALSTATUS, 99);
+                    """,
+                    pr_no,
+                )
+                cur.execute(
+                    "SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker] WHERE purchase_req_no = ?",
+                    pr_no,
+                )
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        """
+                        INSERT INTO [ras_procurement].[ras_pipeline_exceptions]
+                            (ras_tracker_id, stage_id, exception_message)
+                        VALUES (?, ?, ?)
+                        """,
+                        row[0], stage_id, error_msg[:4000],
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(f"[{pr_no}] Could not write exception record to DB: {exc}")
+
+    # ── Process single PR ─────────────────────────────────────────────────
+
     def _process_pr(self, pr_no: str, src_cs: str, tgt_cs: str) -> dict:
         result: dict = {"pr_no": pr_no, "files": [], "status": "failed", "error": ""}
+        current_stage = _STAGE_INGESTION
         try:
+            # Pre-run cleanup: removes stale DB rows for retries; no-op for new PRs
+            self._cleanup_for_pr(tgt_cs, pr_no)
+
+            # Stage 1 — INGESTION
+            current_stage = _STAGE_INGESTION
             self._advance_tracker(tgt_cs, pr_no, _STAGE_INGESTION)
             self.log(f"[{pr_no}] Stage 1 — ingested")
 
@@ -287,21 +489,29 @@ class PipelineStage123Node(Node):
                     "raw":       att["content"],
                 })
 
+            # Stage 2 — EMBED_DOC_EXTRACTION
+            current_stage = _STAGE_EMBED_DOC
             self._advance_tracker(tgt_cs, pr_no, _STAGE_EMBED_DOC)
             self.log(f"[{pr_no}] Stage 2 — {len(file_data)} file(s) extracted")
 
             for fd in file_data:
                 fd["blob"] = self._upload_blob(fd["filename"], fd["raw"], pr_no)
 
+            # Stage 3 — BLOB_UPLOAD
+            current_stage = _STAGE_BLOB_UPLOAD
             self._advance_tracker(tgt_cs, pr_no, _STAGE_BLOB_UPLOAD)
             self.log(f"[{pr_no}] Stage 3 — blobs uploaded")
 
             result["files"]  = file_data
             result["status"] = "success"
         except Exception as exc:
-            logger.opt(exception=True).error("[{}] Stage 1-3 failed: {}", pr_no, exc)
+            logger.opt(exception=True).error("[{}] Stage 1-3 failed at stage {}: {}", pr_no, current_stage, exc)
             result["error"] = str(exc)
+            # Mark ras_tracker as EXCEPTION (99) and log to ras_pipeline_exceptions
+            self._record_exception(tgt_cs, pr_no, current_stage, str(exc))
         return result
+
+    # ── Entry point ───────────────────────────────────────────────────────
 
     def build_file_batch(self) -> Message:
         if hasattr(self, "_cached_result"):
@@ -310,11 +520,20 @@ class PipelineStage123Node(Node):
         src_cs = self._conn_str(self.source_connection)
         tgt_cs = self._conn_str(self.target_connection)
 
-        pr_list = self._fetch_pending_prs(tgt_cs)
+        pr_filter = (self.pr_no_filter or "").strip()
+        pr_list   = self._fetch_pending_prs(tgt_cs)
+
         if not pr_list:
             msg = Message(text="[No pending PRs to process]")
             self._cached_result = msg
             return msg
+
+        # Single-PR forced reprocess: wipe all existing data then reset tracker.
+        # _process_pr will call _cleanup_for_pr again but it's a no-op at that point.
+        if pr_filter:
+            self._cleanup_for_pr(tgt_cs, pr_filter)
+            self._reset_for_reprocess(tgt_cs, pr_filter)
+            self.log(f"Single-PR reprocess: {pr_filter!r} — all existing pipeline data wiped, reprocessing from scratch")
 
         self.log(f"Processing {len(pr_list)} PR(s)…")
 
