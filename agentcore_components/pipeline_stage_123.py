@@ -402,13 +402,13 @@ class PipelineStage123Node(Node):
             return f"[Extraction error: {exc}]"
 
     def _upload_blob(self, filename: str, raw: bytes, pr_no: str) -> str:
-        from azure.identity import DefaultAzureCredential
+        from azure.identity import AzureCliCredential
         from azure.storage.blob import BlobServiceClient
         cfg       = self._blob_cfg()
         blob_name = f"{pr_no}/{filename}"
         BlobServiceClient(
             account_url=cfg["account_url"],
-            credential=DefaultAzureCredential(),
+            credential=AzureCliCredential(),
         ).get_blob_client(container=cfg["container_name"], blob=blob_name).upload_blob(raw, overwrite=True)
         return blob_name
 
