@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
-import io
-import os
-import random
-import time
-
-import pyodbc
 from loguru import logger
 
 from agentcore.custom import Node
@@ -152,7 +145,8 @@ class PipelineStage123Node(Node):
         kw = ["connection reset", "timeout", "throttl", "resource limit", "broken pipe", "transport-level", "login failed"]
         return any(k in str(exc).lower() for k in kw)
 
-    def _connect(self, conn_str: str) -> pyodbc.Connection:
+    def _connect(self, conn_str: str):
+        import pyodbc, random, time
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 return pyodbc.connect(conn_str, timeout=30)
@@ -350,6 +344,7 @@ class PipelineStage123Node(Node):
             conn.close()
 
     def _extract_text(self, filename: str, raw: bytes) -> str:
+        import os
         ext = os.path.splitext(filename.lower())[1]
         try:
             if ext in _TEXT_EXT:  return raw.decode("utf-8", errors="replace")
@@ -537,6 +532,7 @@ class PipelineStage123Node(Node):
 
         self.log(f"Processing {len(pr_list)} PR(s)…")
 
+        import concurrent.futures
         results: list[dict] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=int(self.parallel_workers)) as pool:
             futures = {pool.submit(self._process_pr, pr, src_cs, tgt_cs): pr for pr in pr_list}
@@ -568,7 +564,7 @@ class PipelineStage123Node(Node):
 
 
 def _extract_pdf(raw: bytes) -> str:
-    import fitz
+    import io, fitz
     parts: list[str] = []
     with fitz.open(stream=raw, filetype="pdf") as doc:
         for page in doc:
@@ -577,7 +573,7 @@ def _extract_pdf(raw: bytes) -> str:
 
 
 def _extract_excel(raw: bytes) -> str:
-    import openpyxl
+    import io, openpyxl
     wb    = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     parts: list[str] = []
     for ws in wb.worksheets:
@@ -590,12 +586,13 @@ def _extract_excel(raw: bytes) -> str:
 
 
 def _extract_word(raw: bytes) -> str:
-    import docx
+    import io, docx
     doc = docx.Document(io.BytesIO(raw))
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 
 def _extract_pptx(raw: bytes) -> str:
+    import io
     from pptx import Presentation
     prs   = Presentation(io.BytesIO(raw))
     parts: list[str] = []
@@ -607,6 +604,7 @@ def _extract_pptx(raw: bytes) -> str:
 
 
 def _detect_file_type(filename: str) -> str:
+    import os
     ext = os.path.splitext(filename.lower())[1]
     return {
         ".pdf": "PDF",
@@ -620,6 +618,7 @@ def _detect_file_type(filename: str) -> str:
 
 
 def _build_extra_metadata(filename: str, raw: bytes, text: str) -> str:
+    import os, io
     ext   = os.path.splitext(filename.lower())[1]
     lines: list[str] = []
     if ext == ".pdf":
