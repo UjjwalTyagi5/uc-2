@@ -1,0 +1,353 @@
+from __future__ import annotations
+
+import json
+import time
+from typing import Optional
+
+import pyodbc
+
+from agentcore.custom import Node
+from agentcore.io import DataInput, HandleInput, IntInput, MessageTextInput, Output
+from agentcore.schema.data import Data
+from agentcore.schema.message import Message
+
+
+class PipelineStage48Node(Node):
+    display_name = "Pipeline Stage 4-8"
+    description = (
+        "Stage 4: Saves classification results to DB. "
+        "Stage 5: Saves extracted items to quotation_extracted_items. "
+        "Stage 6: Embeds selected items to Pinecone via AgentCore Pinecone service. "
+        "Stage 7: Price benchmark (Pinecone similarity + LLM). "
+        "Stage 8: Marks PR complete in ras_tracker."
+    )
+    icon = "CheckCheck"
+    name = "PipelineStage48Node"
+
+    inputs = [
+        HandleInput(
+            name="worker_result",
+            display_name="Worker Node Response",
+            input_types=["Message"],
+        ),
+        DataInput(name="target_connection", display_name="Target DB (Azure SQL)"),
+        DataInput(name="pipeline_context", display_name="Pipeline Context (from Stage 1-3)"),
+        HandleInput(
+            name="embed_model",
+            display_name="Embedding Model",
+            input_types=["Embeddings"],
+        ),
+        HandleInput(
+            name="bench_llm",
+            display_name="Benchmark LLM (GPT-4o)",
+            input_types=["LanguageModel"],
+        ),
+        MessageTextInput(name="pinecone_index", display_name="Pinecone Index Name", value="ras-quotations"),
+        MessageTextInput(name="pinecone_namespace", display_name="Pinecone Namespace", value="procurement"),
+        IntInput(name="pinecone_top_k", display_name="Benchmark Similarity Top-K", value=10, advanced=True),
+        IntInput(name="embed_dimension", display_name="Embedding Dimension", value=3072, advanced=True),
+    ]
+
+    outputs = [
+        Output(display_name="Pipeline Summary", name="result", method="run_stages_48")
+    ]
+
+    # ── DB helpers ─────────────────────────────────────────────────────────────
+
+    def _conn_str(self, d: dict) -> str:
+        driver = d.get("driver", "ODBC Driver 18 for SQL Server")
+        return (
+            f"DRIVER={{{driver}}};SERVER={d.get('host', '')},{d.get('port', 1433)};"
+            f"DATABASE={d.get('database_name', '')};UID={d.get('username', '')};"
+            f"PWD={d.get('password', '')};TrustServerCertificate=yes;Connection Timeout=30;"
+        )
+
+    def _db(self, cs: str) -> pyodbc.Connection:
+        for i in range(4):
+            try:
+                return pyodbc.connect(cs, timeout=30)
+            except Exception:
+                if i == 3: raise
+                time.sleep(2 ** i)
+
+    def _advance_tracker(self, conn: pyodbc.Connection, schema: str, pr_no: str, stage: int) -> None:
+        conn.cursor().execute(
+            f"UPDATE [{schema}].[ras_tracker] "
+            f"SET current_stage_fk=?,updated_at=SYSUTCDATETIME() WHERE purchase_req_no=?",
+            stage, pr_no,
+        )
+        conn.commit()
+
+    # ── Stage 4: Save classifications ──────────────────────────────────────────
+
+    def _save_classification(
+        self, conn: pyodbc.Connection, schema: str,
+        pr_no: str, att_id: str, blob_path: str, doc_type: str, conf: float,
+    ) -> None:
+        conn.cursor().execute(
+            f"MERGE [{schema}].[attachment_classification] AS tgt "
+            f"USING (SELECT ? AS attachment_id) AS src ON tgt.attachment_id = src.attachment_id "
+            f"WHEN MATCHED THEN UPDATE SET "
+            f"  doc_type=?,classification_conf=?,blob_file_path=?,updated_at=SYSUTCDATETIME() "
+            f"WHEN NOT MATCHED THEN INSERT "
+            f"  (purchase_req_no,attachment_id,blob_file_path,doc_type,classification_conf,created_at,updated_at) "
+            f"  VALUES(?,?,?,?,?,SYSUTCDATETIME(),SYSUTCDATETIME());",
+            att_id, doc_type, conf, blob_path,
+            pr_no, att_id, blob_path, doc_type, conf,
+        )
+        conn.commit()
+
+    # ── Stage 5: Save extracted items ──────────────────────────────────────────
+
+    def _save_items(
+        self, conn: pyodbc.Connection, schema: str,
+        pr_no: str, blob_path: str, items: list[dict],
+    ) -> None:
+        cur = conn.cursor()
+        for item in items:
+            cur.execute(
+                f"INSERT INTO [{schema}].[quotation_extracted_items] "
+                f"(purchase_req_no,blob_file_path,item_name,quantity,unit_price,"
+                f" total_price,currency,delivery_time,payment_terms,supplier_name,created_at) "
+                f"VALUES(?,?,?,?,?,?,?,?,?,?,SYSUTCDATETIME())",
+                pr_no,
+                blob_path,
+                item.get("item_name"),
+                item.get("quantity"),
+                item.get("unit_price"),
+                item.get("total_price"),
+                item.get("currency"),
+                str(item.get("delivery_time") or "")[:200],
+                str(item.get("payment_terms") or "")[:200],
+                item.get("supplier_name"),
+            )
+        conn.commit()
+
+    # ── Stage 6: Embeddings via AgentCore Pinecone service ─────────────────────
+
+    def _run_embeddings(
+        self, conn: pyodbc.Connection, schema: str, pr_no: str,
+    ) -> int:
+        # Fetch selected items
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT item_name, purchase_dtl_id "
+            f"FROM [{schema}].[quotation_extracted_items] "
+            f"WHERE purchase_req_no=? AND is_selected_quote=1",
+            pr_no,
+        )
+        rows = cur.fetchall()
+        if not rows:
+            self.log(f"[{pr_no}] No selected items to embed")
+            return 0
+
+        try:
+            from agentcore.services.pinecone_service_client import (
+                ensure_index_via_service,
+                ingest_via_service,
+            )
+
+            ensure_index_via_service(
+                index_name=self.pinecone_index,
+                embedding_dimension=self.embed_dimension,
+                cloud_provider="aws",
+                cloud_region="us-east-1",
+            )
+
+            texts = [item_name for item_name, _ in rows if item_name]
+            metadatas = [
+                {"purchase_req_no": pr_no, "purchase_dtl_id": int(dtl_id or 0)}
+                for _, dtl_id in rows if texts
+            ]
+
+            vectors = self.embed_model.embed_documents(texts)
+            documents = [{"page_content": t, "metadata": m} for t, m in zip(texts, metadatas)]
+
+            result = ingest_via_service(
+                index_name=self.pinecone_index,
+                namespace=self.pinecone_namespace,
+                text_key="text",
+                documents=documents,
+                embedding_vectors=vectors,
+                auto_create_index=True,
+                embedding_dimension=self.embed_dimension,
+            )
+            count = result.get("vectors_upserted", 0)
+            self.log(f"[{pr_no}] Stage 6: {count} vector(s) upserted to Pinecone")
+            return count
+
+        except Exception as exc:
+            self.log(f"[{pr_no}] Embeddings error: {exc}")
+            return 0
+
+    # ── Stage 7: Price benchmark ───────────────────────────────────────────────
+
+    _BENCH_SYSTEM = (
+        "You are a procurement price benchmark analyst. "
+        "Given a current item and similar historical items, recommend a benchmark unit price. "
+        "Return ONLY JSON: {\"bp_unit_price\": number_or_null, \"summary\": \"2-3 sentence analysis\"}"
+    )
+
+    def _run_benchmark(
+        self, conn: pyodbc.Connection, schema: str, pr_no: str,
+    ) -> int:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT item_name, quantity, currency, purchase_dtl_id "
+            f"FROM [{schema}].[quotation_extracted_items] "
+            f"WHERE purchase_req_no=? AND is_selected_quote=1",
+            pr_no,
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return 0
+
+        try:
+            from agentcore.services.pinecone_service_client import search_via_service
+            from langchain_core.messages import HumanMessage, SystemMessage
+        except Exception as exc:
+            self.log(f"[{pr_no}] Benchmark import error: {exc}")
+            return 0
+
+        written = 0
+        for item_name, quantity, currency, dtl_id in rows:
+            if not item_name:
+                continue
+            try:
+                # Embed query
+                query_vec = self.embed_model.embed_query(item_name)
+
+                # Search Pinecone for similar historical items (exclude current PR)
+                results = search_via_service(
+                    index_name=self.pinecone_index,
+                    namespace=self.pinecone_namespace,
+                    text_key="text",
+                    query=item_name,
+                    query_embedding=query_vec,
+                    number_of_results=self.pinecone_top_k,
+                )
+                historical = [
+                    r for r in results.get("results", [])
+                    if r.get("metadata", {}).get("purchase_req_no") != pr_no
+                ]
+
+                # LLM benchmark analysis
+                user_msg = (
+                    f"CURRENT ITEM: {item_name}\n"
+                    f"Quantity: {quantity}, Currency: {currency}\n\n"
+                    f"HISTORICAL SIMILAR ITEMS ({len(historical)}):\n"
+                    + json.dumps([
+                        {"item": r.get("text", ""), "meta": r.get("metadata", {})}
+                        for r in historical[:5]
+                    ], indent=2)
+                    + "\n\nReturn JSON only."
+                )
+                resp = self.bench_llm.invoke([
+                    SystemMessage(content=self._BENCH_SYSTEM),
+                    HumanMessage(content=user_msg),
+                ])
+                raw = resp.content.strip()
+                if raw.startswith("```"):
+                    parts = raw.split("```")
+                    raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
+                bench = json.loads(raw)
+                bp_unit = bench.get("bp_unit_price")
+                summary = bench.get("summary", "")
+
+                # Save to benchmark_result
+                conn.cursor().execute(
+                    f"MERGE [{schema}].[benchmark_result] AS tgt "
+                    f"USING (SELECT ? AS purchase_dtl_id) AS src ON tgt.purchase_dtl_id = src.purchase_dtl_id "
+                    f"WHEN MATCHED THEN UPDATE SET bp_unit_price=?,summary=?,updated_at=SYSUTCDATETIME() "
+                    f"WHEN NOT MATCHED THEN INSERT "
+                    f"  (purchase_dtl_id,bp_unit_price,summary,created_at,updated_at) "
+                    f"  VALUES(?,?,?,SYSUTCDATETIME(),SYSUTCDATETIME());",
+                    dtl_id, bp_unit, summary, dtl_id, bp_unit, summary,
+                )
+                conn.commit()
+                written += 1
+
+            except Exception as exc:
+                self.log(f"[{pr_no}] Benchmark item error ({item_name}): {exc}")
+
+        return written
+
+    # ── Main ───────────────────────────────────────────────────────────────────
+
+    async def run_stages_48(self) -> Message:
+        # Parse Worker Node JSON response
+        worker_text = (
+            self.worker_result.text
+            if hasattr(self.worker_result, "text")
+            else str(self.worker_result)
+        )
+        try:
+            raw = worker_text.strip()
+            if raw.startswith("```"):
+                parts = raw.split("```")
+                raw = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
+            file_results: list[dict] = json.loads(raw)
+        except Exception as exc:
+            return Message(text=f"Could not parse Worker Node response: {exc}\n\nRaw:\n{worker_text[:500]}")
+
+        # Get context
+        ctx = self.pipeline_context.data or {}
+        schema = ctx.get("az_schema", "ras_procurement")
+        pr_nos: list[str] = ctx.get("pr_nos", [])
+
+        tgt_cs = self._conn_str(self.target_connection.data or {})
+        conn = self._db(tgt_cs)
+
+        stage_summary: dict[str, dict] = {pr: {} for pr in pr_nos}
+
+        try:
+            # ── Stage 4: Classification ───────────────────────────────────────
+            for rec in file_results:
+                pr_no = rec.get("pr_no", "")
+                self._save_classification(
+                    conn, schema,
+                    pr_no, rec.get("att_id", ""), rec.get("blob_path", ""),
+                    rec.get("doc_type", "Others"), float(rec.get("classification_conf", 0.0)),
+                )
+            for pr_no in pr_nos:
+                self._advance_tracker(conn, schema, pr_no, 4)
+                stage_summary[pr_no]["CLASSIFICATION"] = "OK"
+            self.log("Stage 4 (Classification) complete")
+
+            # ── Stage 5: Metadata extraction ──────────────────────────────────
+            for rec in file_results:
+                if rec.get("doc_type") == "Quotation" and rec.get("items"):
+                    self._save_items(conn, schema, rec["pr_no"], rec["blob_path"], rec["items"])
+            for pr_no in pr_nos:
+                self._advance_tracker(conn, schema, pr_no, 5)
+                stage_summary[pr_no]["METADATA_EXTRACTION"] = "OK"
+            self.log("Stage 5 (Metadata Extraction) complete")
+
+            # ── Stage 6: Embeddings (AgentCore Pinecone) ──────────────────────
+            for pr_no in pr_nos:
+                count = self._run_embeddings(conn, schema, pr_no)
+                self._advance_tracker(conn, schema, pr_no, 6)
+                stage_summary[pr_no]["EMBEDDINGS"] = f"OK ({count} vectors)"
+
+            # ── Stage 7: Price Benchmark ──────────────────────────────────────
+            for pr_no in pr_nos:
+                count = self._run_benchmark(conn, schema, pr_no)
+                self._advance_tracker(conn, schema, pr_no, 7)
+                stage_summary[pr_no]["PRICE_BENCHMARK"] = f"OK ({count} rows)"
+
+            # ── Stage 8: Complete ─────────────────────────────────────────────
+            for pr_no in pr_nos:
+                self._advance_tracker(conn, schema, pr_no, 8)
+                stage_summary[pr_no]["COMPLETE"] = "OK"
+            self.log("Stage 8 (Complete) — all PRs done")
+
+        except Exception as exc:
+            return Message(text=f"Stage 4-8 failed: {exc}")
+        finally:
+            conn.close()
+
+        lines = ["Pipeline Run Complete\n"]
+        for pr_no, stages in stage_summary.items():
+            stages_str = " → ".join(f"{k}: {v}" for k, v in stages.items())
+            lines.append(f"  PR [{pr_no}]: {stages_str}")
+        return Message(text="\n".join(lines))
