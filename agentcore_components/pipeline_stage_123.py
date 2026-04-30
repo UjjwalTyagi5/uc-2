@@ -161,9 +161,13 @@ class PipelineStage123Node(Node):
             name="blob_connector",
             display_name="Azure Blob Connector",
             info="Select the Azure Blob connector configured in Settings → Connectors. "
-                 "account_url and container_name are read automatically from the catalogue.",
-            options=_fetch_blob_connectors,
+                 "Click the refresh button (↻) to load available connectors. "
+                 "account_url and container_name are resolved automatically.",
+            options=[],
             value="",
+            refresh_button=True,
+            real_time_refresh=True,
+            combobox=True,
         ),
         MessageTextInput(
             name="pr_no_filter",
@@ -203,6 +207,22 @@ class PipelineStage123Node(Node):
             types=["Message"],
         ),
     ]
+
+    # ── dropdown refresh ──────────────────────────────────────────────────────
+
+    def update_build_config(self, build_config: dict, field_value: str, field_name: str | None = None):
+        """Populate the blob_connector dropdown when the user clicks refresh (↻)."""
+        if field_name == "blob_connector":
+            try:
+                options = _fetch_blob_connectors()
+                build_config["blob_connector"]["options"] = options if options else []
+                current = build_config["blob_connector"].get("value", "")
+                if current not in options:
+                    build_config["blob_connector"]["value"] = options[0] if options else ""
+            except Exception as exc:
+                logger.warning(f"Error fetching blob connectors: {exc}")
+                build_config["blob_connector"]["options"] = []
+        return build_config
 
     # ── pyodbc helpers ────────────────────────────────────────────────────────
 
