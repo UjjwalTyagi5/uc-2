@@ -2,15 +2,15 @@
 
 Canvas wiring
 ─────────────
-  On-Prem DB Connector ──► source_connection
-  Azure SQL Connector  ──► target_connection
-  (storage_account_url and container_name are filled in the component UI)
+  On-Prem DB Connector  ──► source_connection
+  Azure SQL Connector   ──► target_connection
+  blob_connector        — DropdownInput: pick your Azure Blob entry from the
+                          Connectors Catalogue (no extra node needed on canvas)
 
 Output: a single Message whose text is the "file batch" — one section per
-attachment, formatted as:
-
-    === FILE: <filename> (PR: <pr_no>) ===
-    <extracted text>
+attachment, formatted using the exact USER_PROMPT_TEXT structure from
+file_classifier/classifier/prompt_templates.py (filename, file_type,
+extra_metadata, extracted_content).
 
 The file-batch Message fans out to TWO destinations on the canvas:
   1. The classification Prompt Template  ({file_batch} variable)
@@ -23,7 +23,6 @@ import concurrent.futures
 import io
 import os
 import random
-import re
 import time
 from typing import Optional
 
@@ -31,9 +30,90 @@ import pyodbc
 from loguru import logger
 
 from agentcore.custom import Node
-from agentcore.io import HandleInput, IntInput, MessageTextInput, Output
+from agentcore.io import DropdownInput, HandleInput, IntInput, MessageTextInput, Output
 from agentcore.schema.data import Data
 from agentcore.schema.message import Message
+
+
+# ── blob connector catalogue helpers ──────────────────────────────────────────
+
+def _fetch_blob_connectors() -> list[str]:
+    """Return all azure_blob connectors from the Connectors Catalogue."""
+    try:
+        import asyncio
+        import concurrent.futures as _cf
+
+        async def _query():
+            from agentcore.services.deps import get_db_service
+            from sqlalchemy import select
+            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
+
+            db_service = get_db_service()
+            async with db_service.with_session() as session:
+                stmt = (
+                    select(ConnectorCatalogue)
+                    .where(ConnectorCatalogue.provider == "azure_blob")
+                    .where(ConnectorCatalogue.status == "connected")
+                    .order_by(ConnectorCatalogue.name)
+                )
+                result = await session.execute(stmt)
+                rows = result.scalars().all()
+                return [f"{r.name} | azure_blob | {r.id}" for r in rows]
+
+        try:
+            asyncio.get_running_loop()
+            with _cf.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, _query()).result(timeout=10)
+        except RuntimeError:
+            return asyncio.run(_query())
+
+    except Exception as exc:
+        logger.warning(f"Could not fetch blob connectors from catalogue: {exc}")
+        return ["(no blob connectors found — add one in Settings → Connectors)"]
+
+
+def _get_blob_config(connector_value: str) -> dict:
+    """Resolve account_url + container_name from a catalogue blob connector."""
+    # connector_value format: "name | azure_blob | <uuid>"
+    parts = connector_value.split(" | ")
+    if len(parts) < 3:
+        raise ValueError(f"Unexpected connector value format: {connector_value!r}")
+
+    connector_id = parts[-1].strip()
+
+    try:
+        import asyncio
+        import concurrent.futures as _cf
+        from uuid import UUID
+
+        async def _fetch():
+            from agentcore.services.deps import get_db_service
+            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
+
+            db_service = get_db_service()
+            async with db_service.with_session() as session:
+                row = await session.get(ConnectorCatalogue, UUID(connector_id))
+                if row is None:
+                    raise ValueError(f"Blob connector {connector_id} not found in catalogue")
+                # Resolve encrypted fields if needed
+                account_url    = row.host or ""
+                container_name = row.database_name or ""
+                blob_prefix    = row.schema_name or ""
+                return {
+                    "account_url":    account_url,
+                    "container_name": container_name,
+                    "blob_prefix":    blob_prefix,
+                }
+
+        try:
+            asyncio.get_running_loop()
+            with _cf.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, _fetch()).result(timeout=10)
+        except RuntimeError:
+            return asyncio.run(_fetch())
+
+    except Exception as exc:
+        raise RuntimeError(f"Failed to resolve blob connector config: {exc}") from exc
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -77,17 +157,13 @@ class PipelineStage123Node(Node):
             input_types=["Data"],
             info="Connection Config output from the Azure SQL Database Connector node.",
         ),
-        MessageTextInput(
-            name="storage_account_url",
-            display_name="Azure Storage Account URL",
-            value="https://<account>.blob.core.windows.net",
-            info="e.g. https://mystorageaccount.blob.core.windows.net  "
-                 "(uses DefaultAzureCredential — no key needed when running on Azure)",
-        ),
-        MessageTextInput(
-            name="container_name",
-            display_name="Blob Container Name",
-            value="agentcore-knowledge-container",
+        DropdownInput(
+            name="blob_connector",
+            display_name="Azure Blob Connector",
+            info="Select the Azure Blob connector configured in Settings → Connectors. "
+                 "account_url and container_name are read automatically from the catalogue.",
+            options=_fetch_blob_connectors,
+            value="",
         ),
         MessageTextInput(
             name="pr_no_filter",
@@ -229,17 +305,24 @@ class PipelineStage123Node(Node):
             logger.warning("Text extraction failed for {}: {}", filename, exc)
             return f"[Extraction error: {exc}]"
 
+    def _blob_cfg(self) -> dict:
+        """Resolve blob config from the Connectors Catalogue once per run."""
+        if not hasattr(self, "_blob_config_cache"):
+            self._blob_config_cache = _get_blob_config(self.blob_connector)
+        return self._blob_config_cache
+
     def _upload_blob(self, filename: str, raw: bytes, pr_no: str) -> str:
         from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
 
-        blob_name   = f"{pr_no}/{filename}"
-        svc_client  = BlobServiceClient(
-            account_url=self.storage_account_url,
+        cfg        = self._blob_cfg()
+        blob_name  = f"{pr_no}/{filename}"
+        svc_client = BlobServiceClient(
+            account_url=cfg["account_url"],
             credential=DefaultAzureCredential(),
         )
         svc_client.get_blob_client(
-            container=self.container_name, blob=blob_name,
+            container=cfg["container_name"], blob=blob_name,
         ).upload_blob(raw, overwrite=True)
         return blob_name
 
