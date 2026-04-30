@@ -1,22 +1,3 @@
-"""Pipeline Stage 1-3: Ingestion → Text Extraction → Azure Blob Upload.
-
-Canvas wiring
-─────────────
-  On-Prem DB Connector  ──► source_connection
-  Azure SQL Connector   ──► target_connection
-  blob_connector        — DropdownInput: pick your Azure Blob entry from the
-                          Connectors Catalogue (no extra node needed on canvas)
-
-Output: a single Message whose text is the "file batch" — one section per
-attachment, formatted using the exact USER_PROMPT_TEXT structure from
-file_classifier/classifier/prompt_templates.py (filename, file_type,
-extra_metadata, extracted_content).
-
-The file-batch Message fans out to TWO destinations on the canvas:
-  1. The classification Prompt Template  ({file_batch} variable)
-  2. Pipeline Stage 5-8                  (file_batch HandleInput)
-"""
-
 from __future__ import annotations
 
 import concurrent.futures
@@ -34,60 +15,8 @@ from agentcore.io import HandleInput, IntInput, MessageTextInput, Output
 from agentcore.schema.data import Data
 from agentcore.schema.message import Message
 
-
-# ── blob connector catalogue helper ───────────────────────────────────────────
-
-def _get_blob_config_by_name(connector_name: str) -> dict:
-    """Look up an azure_blob connector by name and return account_url + container_name."""
-    name = (connector_name or "").strip()
-    if not name:
-        raise ValueError(
-            "blob_connector_name is empty. "
-            "Enter the connector name from Settings → Connectors."
-        )
-    try:
-        import asyncio
-        import concurrent.futures as _cf
-        from sqlalchemy import select
-
-        async def _fetch():
-            from agentcore.services.deps import get_db_service
-            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
-
-            db_service = get_db_service()
-            async with db_service.with_session() as session:
-                stmt = (
-                    select(ConnectorCatalogue)
-                    .where(ConnectorCatalogue.name == name)
-                    .where(ConnectorCatalogue.provider == "azure_blob")
-                )
-                result = await session.execute(stmt)
-                row = result.scalars().first()
-                if row is None:
-                    raise ValueError(
-                        f"No azure_blob connector named {name!r} found in catalogue. "
-                        "Check Settings → Connectors."
-                    )
-                return {
-                    "account_url":    row.host or "",
-                    "container_name": row.database_name or "",
-                    "blob_prefix":    row.schema_name or "",
-                }
-
-        try:
-            asyncio.get_running_loop()
-            with _cf.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, _fetch()).result(timeout=10)
-        except RuntimeError:
-            return asyncio.run(_fetch())
-
-    except Exception as exc:
-        raise RuntimeError(f"Blob connector lookup failed: {exc}") from exc
-
-# ── constants ──────────────────────────────────────────────────────────────────
-
 _MAX_RETRIES = 3
-_BASE_DELAY = 2.0
+_BASE_DELAY  = 2.0
 
 _STAGE_INGESTION = 1
 _STAGE_EMBED_DOC = 2
@@ -100,16 +29,47 @@ _WORD_EXT  = {".doc", ".docx"}
 _PPTX_EXT  = {".ppt", ".pptx"}
 
 
-# ── component ──────────────────────────────────────────────────────────────────
+def _get_blob_config_by_name(connector_name: str) -> dict:
+    name = (connector_name or "").strip()
+    if not name:
+        raise ValueError("blob_connector_name is empty. Enter the connector name from Settings → Connectors.")
+    try:
+        import asyncio
+        import concurrent.futures as _cf
+        from sqlalchemy import select
+
+        async def _fetch():
+            from agentcore.services.deps import get_db_service
+            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
+            db_service = get_db_service()
+            async with db_service.with_session() as session:
+                stmt = (
+                    select(ConnectorCatalogue)
+                    .where(ConnectorCatalogue.name == name)
+                    .where(ConnectorCatalogue.provider == "azure_blob")
+                )
+                result = await session.execute(stmt)
+                row = result.scalars().first()
+                if row is None:
+                    raise ValueError(f"No azure_blob connector named {name!r} found. Check Settings → Connectors.")
+                return {
+                    "account_url":    row.host or "",
+                    "container_name": row.database_name or "",
+                }
+
+        try:
+            asyncio.get_running_loop()
+            with _cf.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, _fetch()).result(timeout=10)
+        except RuntimeError:
+            return asyncio.run(_fetch())
+    except Exception as exc:
+        raise RuntimeError(f"Blob connector lookup failed: {exc}") from exc
+
 
 class PipelineStage123Node(Node):
     display_name = "Pipeline Stage 1-3"
-    description = (
-        "Stage 1: MERGE ras_tracker (ingestion). "
-        "Stage 2: Download VARBINARY attachments from on-prem SQL Server and extract text. "
-        "Stage 3: Upload files to Azure Blob Storage. "
-        "Outputs a file-batch Message for the classifier and extractor."
-    )
+    description = "Stage 1: Ingestion. Stage 2: Text extraction. Stage 3: Azure Blob upload."
     icon = "Database"
     name = "PipelineStage123Node"
 
@@ -118,49 +78,44 @@ class PipelineStage123Node(Node):
             name="source_connection",
             display_name="Source DB — On-Prem SQL Server",
             input_types=["Data"],
-            info="Connection Config output from the on-prem Database Connector node.",
+            info="Connection Config from the on-prem Database Connector node.",
         ),
         HandleInput(
             name="target_connection",
             display_name="Target DB — Azure SQL",
             input_types=["Data"],
-            info="Connection Config output from the Azure SQL Database Connector node.",
+            info="Connection Config from the Azure SQL Database Connector node.",
         ),
         MessageTextInput(
             name="blob_connector_name",
             display_name="Azure Blob Connector Name",
             value="",
-            info="Enter the exact name of your Azure Blob connector as it appears in "
-                 "Settings → Connectors (e.g. 'agentcore-blob'). "
-                 "account_url and container_name are resolved from the catalogue automatically.",
+            info="Exact name of your Azure Blob connector in Settings → Connectors (e.g. agentcore-blob).",
         ),
         MessageTextInput(
             name="pr_no_filter",
             display_name="PR Number Filter (optional)",
             value="",
-            info="Leave blank to process all pending PRs. "
-                 "Enter a single PURCHASE_REQ_NO to re-run just that PR.",
             advanced=True,
+            info="Leave blank to process all pending PRs. Enter one PURCHASE_REQ_NO to test a single PR.",
         ),
         IntInput(
             name="batch_limit",
             display_name="Max PRs per Run",
             value=50,
             advanced=True,
-            info="How many pending PRs to pick up in one execution.",
         ),
         IntInput(
             name="parallel_workers",
-            display_name="Parallel Workers (per-PR)",
+            display_name="Parallel Workers",
             value=4,
             advanced=True,
         ),
         IntInput(
             name="max_content_chars",
-            display_name="Max Characters per File (extraction)",
+            display_name="Max Characters per File",
             value=80000,
             advanced=True,
-            info="Truncate extracted text at this length to keep the file-batch manageable.",
         ),
     ]
 
@@ -172,8 +127,6 @@ class PipelineStage123Node(Node):
             types=["Message"],
         ),
     ]
-
-    # ── pyodbc helpers ────────────────────────────────────────────────────────
 
     def _conn_str(self, conn_data: Data) -> str:
         d = conn_data.data or {}
@@ -190,8 +143,7 @@ class PipelineStage123Node(Node):
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:
-        kw = ["connection reset", "timeout", "throttl", "resource limit",
-              "broken pipe", "transport-level", "login failed"]
+        kw = ["connection reset", "timeout", "throttl", "resource limit", "broken pipe", "transport-level", "login failed"]
         return any(k in str(exc).lower() for k in kw)
 
     def _connect(self, conn_str: str) -> pyodbc.Connection:
@@ -204,13 +156,15 @@ class PipelineStage123Node(Node):
                 time.sleep(_BASE_DELAY * (2 ** attempt) * (1 + random.random() * 0.2))
         raise RuntimeError("unreachable")
 
-    # ── stage helpers ─────────────────────────────────────────────────────────
+    def _blob_cfg(self) -> dict:
+        if not hasattr(self, "_blob_config_cache"):
+            self._blob_config_cache = _get_blob_config_by_name(self.blob_connector_name)
+        return self._blob_config_cache
 
     def _fetch_pending_prs(self, tgt_cs: str) -> list[str]:
         pr_filter = (self.pr_no_filter or "").strip()
         if pr_filter:
             return [pr_filter]
-
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
         try:
@@ -218,8 +172,7 @@ class PipelineStage123Node(Node):
                 """
                 SELECT TOP (?) prm.PURCHASE_REQ_NO
                   FROM purchase_req_mst prm
-                  LEFT JOIN ras_tracker rt
-                         ON rt.purchase_req_no = prm.PURCHASE_REQ_NO
+                  LEFT JOIN ras_tracker rt ON rt.purchase_req_no = prm.PURCHASE_REQ_NO
                  WHERE (rt.current_stage_fk IS NULL OR rt.current_stage_fk < 1)
                  ORDER BY prm.C_DATETIME ASC
                 """,
@@ -235,11 +188,9 @@ class PipelineStage123Node(Node):
         try:
             cur.execute(
                 """
-                SELECT a.ATTACHMENT_ID, a.FILENAME, a.FILECONTENT,
-                       a.FILE_TYPE, a.PURCHASE_REQ_NO
+                SELECT a.ATTACHMENT_ID, a.FILENAME, a.FILECONTENT, a.FILE_TYPE, a.PURCHASE_REQ_NO
                   FROM purchase_req_attachments a
-                 WHERE a.PURCHASE_REQ_NO = ?
-                   AND a.FILECONTENT IS NOT NULL
+                 WHERE a.PURCHASE_REQ_NO = ? AND a.FILECONTENT IS NOT NULL
                 """,
                 pr_no,
             )
@@ -259,40 +210,24 @@ class PipelineStage123Node(Node):
     def _extract_text(self, filename: str, raw: bytes) -> str:
         ext = os.path.splitext(filename.lower())[1]
         try:
-            if ext in _TEXT_EXT:
-                return raw.decode("utf-8", errors="replace")
-            if ext in _PDF_EXT:
-                return _extract_pdf(raw)
-            if ext in _EXCEL_EXT:
-                return _extract_excel(raw)
-            if ext in _WORD_EXT:
-                return _extract_word(raw)
-            if ext in _PPTX_EXT:
-                return _extract_pptx(raw)
+            if ext in _TEXT_EXT:  return raw.decode("utf-8", errors="replace")
+            if ext in _PDF_EXT:   return _extract_pdf(raw)
+            if ext in _EXCEL_EXT: return _extract_excel(raw)
+            if ext in _WORD_EXT:  return _extract_word(raw)
+            if ext in _PPTX_EXT:  return _extract_pptx(raw)
             return f"[Binary — {ext} not text-extractable]"
         except Exception as exc:
-            logger.warning("Text extraction failed for {}: {}", filename, exc)
             return f"[Extraction error: {exc}]"
-
-    def _blob_cfg(self) -> dict:
-        """Resolve blob config from the Connectors Catalogue once per run."""
-        if not hasattr(self, "_blob_config_cache"):
-            self._blob_config_cache = _get_blob_config_by_name(self.blob_connector_name)
-        return self._blob_config_cache
 
     def _upload_blob(self, filename: str, raw: bytes, pr_no: str) -> str:
         from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
-
-        cfg        = self._blob_cfg()
-        blob_name  = f"{pr_no}/{filename}"
-        svc_client = BlobServiceClient(
+        cfg       = self._blob_cfg()
+        blob_name = f"{pr_no}/{filename}"
+        BlobServiceClient(
             account_url=cfg["account_url"],
             credential=DefaultAzureCredential(),
-        )
-        svc_client.get_blob_client(
-            container=cfg["container_name"], blob=blob_name,
-        ).upload_blob(raw, overwrite=True)
+        ).get_blob_client(container=cfg["container_name"], blob=blob_name).upload_blob(raw, overwrite=True)
         return blob_name
 
     def _advance_tracker(self, tgt_cs: str, pr_no: str, stage_id: int) -> None:
@@ -300,40 +235,29 @@ class PipelineStage123Node(Node):
         cur  = conn.cursor()
         try:
             if stage_id == _STAGE_INGESTION:
-                # MERGE — creates the row on first visit
                 cur.execute(
                     """
                     MERGE ras_tracker WITH (HOLDLOCK) AS target
                     USING (
                         SELECT PURCHASE_REQ_NO, PURCHASEFINALAPPROVALSTATUS
-                          FROM purchase_req_mst
-                         WHERE PURCHASE_REQ_NO = ?
+                          FROM purchase_req_mst WHERE PURCHASE_REQ_NO = ?
                     ) AS src ON target.purchase_req_no = src.PURCHASE_REQ_NO
                     WHEN MATCHED THEN
-                        UPDATE SET current_stage_fk = ?,
-                                   updated_at       = SYSUTCDATETIME()
+                        UPDATE SET current_stage_fk = ?, updated_at = SYSUTCDATETIME()
                     WHEN NOT MATCHED THEN
                         INSERT (purchase_req_no, ras_status, current_stage_fk)
-                        VALUES (src.PURCHASE_REQ_NO,
-                                src.PURCHASEFINALAPPROVALSTATUS, ?);
+                        VALUES (src.PURCHASE_REQ_NO, src.PURCHASEFINALAPPROVALSTATUS, ?);
                     """,
                     pr_no, stage_id, stage_id,
                 )
             else:
                 cur.execute(
-                    """
-                    UPDATE ras_tracker
-                       SET current_stage_fk = ?,
-                           updated_at       = SYSUTCDATETIME()
-                     WHERE purchase_req_no  = ?
-                    """,
+                    "UPDATE ras_tracker SET current_stage_fk=?, updated_at=SYSUTCDATETIME() WHERE purchase_req_no=?",
                     stage_id, pr_no,
                 )
             conn.commit()
         finally:
             conn.close()
-
-    # ── per-PR processing ─────────────────────────────────────────────────────
 
     def _process_pr(self, pr_no: str, src_cs: str, tgt_cs: str) -> dict:
         result: dict = {"pr_no": pr_no, "files": [], "status": "failed", "error": ""}
@@ -351,42 +275,37 @@ class PipelineStage123Node(Node):
             for att in attachments:
                 text      = self._extract_text(att["filename"], att["content"])
                 file_type = _detect_file_type(att["filename"])
-                extra_meta = _build_extra_metadata(att["filename"], att["content"], file_type, text)
+                extra     = _build_extra_metadata(att["filename"], att["content"], text)
                 if self.max_content_chars and len(text) > int(self.max_content_chars):
                     text = text[: int(self.max_content_chars)]
                 file_data.append({
-                    "filename":   att["filename"],
-                    "pr_no":      pr_no,
-                    "file_type":  file_type,
-                    "extra_meta": extra_meta,
-                    "text":       text,
-                    "raw":        att["content"],
+                    "filename":  att["filename"],
+                    "pr_no":     pr_no,
+                    "file_type": file_type,
+                    "extra":     extra,
+                    "text":      text,
+                    "raw":       att["content"],
                 })
 
             self._advance_tracker(tgt_cs, pr_no, _STAGE_EMBED_DOC)
             self.log(f"[{pr_no}] Stage 2 — {len(file_data)} file(s) extracted")
 
             for fd in file_data:
-                blob_path    = self._upload_blob(fd["filename"], fd["raw"], pr_no)
-                fd["blob"]   = blob_path
+                fd["blob"] = self._upload_blob(fd["filename"], fd["raw"], pr_no)
 
             self._advance_tracker(tgt_cs, pr_no, _STAGE_BLOB_UPLOAD)
             self.log(f"[{pr_no}] Stage 3 — blobs uploaded")
 
             result["files"]  = file_data
             result["status"] = "success"
-
         except Exception as exc:
             logger.opt(exception=True).error("[{}] Stage 1-3 failed: {}", pr_no, exc)
             result["error"] = str(exc)
-
         return result
-
-    # ── main output method ────────────────────────────────────────────────────
 
     def build_file_batch(self) -> Message:
         if hasattr(self, "_cached_result"):
-            return self._cached_result  # type: ignore[return-value]
+            return self._cached_result
 
         src_cs = self._conn_str(self.source_connection)
         tgt_cs = self._conn_str(self.target_connection)
@@ -397,21 +316,14 @@ class PipelineStage123Node(Node):
             self._cached_result = msg
             return msg
 
-        self.log(f"Processing {len(pr_list)} PR(s) with {self.parallel_workers} workers…")
+        self.log(f"Processing {len(pr_list)} PR(s)…")
 
         results: list[dict] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=int(self.parallel_workers)) as pool:
-            futures = {
-                pool.submit(self._process_pr, pr, src_cs, tgt_cs): pr
-                for pr in pr_list
-            }
+            futures = {pool.submit(self._process_pr, pr, src_cs, tgt_cs): pr for pr in pr_list}
             for f in concurrent.futures.as_completed(futures):
                 results.append(f.result())
 
-        # Format each file using the exact USER_PROMPT_TEXT structure from
-        # file_classifier/classifier/prompt_templates.py so the Worker Node
-        # receives per-file metadata (filename, file_type, extra_metadata,
-        # extracted_content) matching what the original classify_file() passes.
         parts: list[str] = []
         for r in results:
             for fd in r.get("files", []):
@@ -422,7 +334,7 @@ class PipelineStage123Node(Node):
                     f"============================================================\n"
                     f"Filename: {fd['filename']}\n"
                     f"File Type: {fd['file_type']}\n"
-                    f"{fd['extra_meta']}"
+                    f"{fd['extra']}"
                     f"============================================================\n"
                     f"EXTRACTED CONTENT\n"
                     f"============================================================\n"
@@ -436,11 +348,8 @@ class PipelineStage123Node(Node):
         return msg
 
 
-# ── file-format extraction helpers ────────────────────────────────────────────
-
 def _extract_pdf(raw: bytes) -> str:
-    import fitz  # PyMuPDF
-
+    import fitz
     parts: list[str] = []
     with fitz.open(stream=raw, filetype="pdf") as doc:
         for page in doc:
@@ -450,7 +359,6 @@ def _extract_pdf(raw: bytes) -> str:
 
 def _extract_excel(raw: bytes) -> str:
     import openpyxl
-
     wb    = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     parts: list[str] = []
     for ws in wb.worksheets:
@@ -464,14 +372,12 @@ def _extract_excel(raw: bytes) -> str:
 
 def _extract_word(raw: bytes) -> str:
     import docx
-
     doc = docx.Document(io.BytesIO(raw))
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 
 def _extract_pptx(raw: bytes) -> str:
     from pptx import Presentation
-
     prs   = Presentation(io.BytesIO(raw))
     parts: list[str] = []
     for slide in prs.slides:
@@ -482,31 +388,21 @@ def _extract_pptx(raw: bytes) -> str:
 
 
 def _detect_file_type(filename: str) -> str:
-    """Mirror file_classifier.utils.file_utils.detect_file_type()."""
     ext = os.path.splitext(filename.lower())[1]
     return {
-        ".pdf":  "PDF",
+        ".pdf": "PDF",
         ".xlsx": "Excel", ".xls": "Excel", ".xlsm": "Excel", ".xlsb": "Excel",
         ".docx": "Word",  ".doc": "Word",
         ".pptx": "PowerPoint", ".ppt": "PowerPoint",
-        ".txt":  "Text",  ".csv": "CSV",
-        ".xml":  "XML",   ".json": "JSON",
-        ".html": "HTML",  ".htm": "HTML",
-        ".msg":  "Email", ".eml": "Email",
-        ".png":  "Image", ".jpg": "Image", ".jpeg": "Image",
-        ".tiff": "Image", ".bmp": "Image",
+        ".txt": "Text", ".csv": "CSV", ".xml": "XML", ".json": "JSON",
+        ".html": "HTML", ".htm": "HTML", ".msg": "Email", ".eml": "Email",
+        ".png": "Image", ".jpg": "Image", ".jpeg": "Image",
     }.get(ext, f"Unknown ({ext})")
 
 
-def _build_extra_metadata(filename: str, raw: bytes, file_type: str, text: str) -> str:
-    """Build the {extra_metadata} block matching USER_PROMPT_TEXT expectations.
-
-    Mirrors the metadata that file_classifier/extractors populate per file type.
-    """
+def _build_extra_metadata(filename: str, raw: bytes, text: str) -> str:
+    ext   = os.path.splitext(filename.lower())[1]
     lines: list[str] = []
-    ext = os.path.splitext(filename.lower())[1]
-
-    # page / sheet counts
     if ext == ".pdf":
         try:
             import fitz
@@ -514,7 +410,6 @@ def _build_extra_metadata(filename: str, raw: bytes, file_type: str, text: str) 
                 lines.append(f"- page_count: {doc.page_count}")
         except Exception:
             pass
-
     if ext in {".xlsx", ".xls", ".xlsm", ".xlsb"}:
         try:
             import openpyxl
@@ -523,16 +418,12 @@ def _build_extra_metadata(filename: str, raw: bytes, file_type: str, text: str) 
             lines.append(f"- sheet_names: {', '.join(wb.sheetnames[:10])}")
         except Exception:
             pass
-
     if ext in {".pptx", ".ppt"}:
         try:
             from pptx import Presentation
-            prs = Presentation(io.BytesIO(raw))
-            lines.append(f"- slide_count: {len(prs.slides)}")
+            lines.append(f"- slide_count: {len(Presentation(io.BytesIO(raw)).slides)}")
         except Exception:
             pass
-
     lines.append(f"- char_count: {len(text)}")
     lines.append(f"- size_bytes: {len(raw)}")
-
     return ("\n".join(lines) + "\n") if lines else ""
