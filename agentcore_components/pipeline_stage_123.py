@@ -297,14 +297,18 @@ class PipelineStage123Node(Node):
 
             file_data = []
             for att in attachments:
-                text = self._extract_text(att["filename"], att["content"])
+                text      = self._extract_text(att["filename"], att["content"])
+                file_type = _detect_file_type(att["filename"])
+                extra_meta = _build_extra_metadata(att["filename"], att["content"], file_type, text)
                 if self.max_content_chars and len(text) > int(self.max_content_chars):
                     text = text[: int(self.max_content_chars)]
                 file_data.append({
-                    "filename":  att["filename"],
-                    "pr_no":     pr_no,
-                    "text":      text,
-                    "raw":       att["content"],
+                    "filename":   att["filename"],
+                    "pr_no":      pr_no,
+                    "file_type":  file_type,
+                    "extra_meta": extra_meta,
+                    "text":       text,
+                    "raw":        att["content"],
                 })
 
             self._advance_tracker(tgt_cs, pr_no, _STAGE_EMBED_DOC)
@@ -352,12 +356,26 @@ class PipelineStage123Node(Node):
             for f in concurrent.futures.as_completed(futures):
                 results.append(f.result())
 
+        # Format each file using the exact USER_PROMPT_TEXT structure from
+        # file_classifier/classifier/prompt_templates.py so the Worker Node
+        # receives per-file metadata (filename, file_type, extra_metadata,
+        # extracted_content) matching what the original classify_file() passes.
         parts: list[str] = []
         for r in results:
             for fd in r.get("files", []):
                 parts.append(
                     f"=== FILE: {fd['filename']} (PR: {fd['pr_no']}) ===\n"
-                    f"{fd['text']}\n\n"
+                    f"============================================================\n"
+                    f"FILE METADATA\n"
+                    f"============================================================\n"
+                    f"Filename: {fd['filename']}\n"
+                    f"File Type: {fd['file_type']}\n"
+                    f"{fd['extra_meta']}"
+                    f"============================================================\n"
+                    f"EXTRACTED CONTENT\n"
+                    f"============================================================\n"
+                    f"{fd['text']}\n"
+                    f"============================================================\n\n"
                 )
 
         batch_text = "".join(parts) if parts else "[No files extracted]"
@@ -409,3 +427,60 @@ def _extract_pptx(raw: bytes) -> str:
             if hasattr(shape, "text") and shape.text.strip():
                 parts.append(shape.text)
     return "\n".join(parts)
+
+
+def _detect_file_type(filename: str) -> str:
+    """Mirror file_classifier.utils.file_utils.detect_file_type()."""
+    ext = os.path.splitext(filename.lower())[1]
+    return {
+        ".pdf":  "PDF",
+        ".xlsx": "Excel", ".xls": "Excel", ".xlsm": "Excel", ".xlsb": "Excel",
+        ".docx": "Word",  ".doc": "Word",
+        ".pptx": "PowerPoint", ".ppt": "PowerPoint",
+        ".txt":  "Text",  ".csv": "CSV",
+        ".xml":  "XML",   ".json": "JSON",
+        ".html": "HTML",  ".htm": "HTML",
+        ".msg":  "Email", ".eml": "Email",
+        ".png":  "Image", ".jpg": "Image", ".jpeg": "Image",
+        ".tiff": "Image", ".bmp": "Image",
+    }.get(ext, f"Unknown ({ext})")
+
+
+def _build_extra_metadata(filename: str, raw: bytes, file_type: str, text: str) -> str:
+    """Build the {extra_metadata} block matching USER_PROMPT_TEXT expectations.
+
+    Mirrors the metadata that file_classifier/extractors populate per file type.
+    """
+    lines: list[str] = []
+    ext = os.path.splitext(filename.lower())[1]
+
+    # page / sheet counts
+    if ext == ".pdf":
+        try:
+            import fitz
+            with fitz.open(stream=raw, filetype="pdf") as doc:
+                lines.append(f"- page_count: {doc.page_count}")
+        except Exception:
+            pass
+
+    if ext in {".xlsx", ".xls", ".xlsm", ".xlsb"}:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            lines.append(f"- sheet_count: {len(wb.sheetnames)}")
+            lines.append(f"- sheet_names: {', '.join(wb.sheetnames[:10])}")
+        except Exception:
+            pass
+
+    if ext in {".pptx", ".ppt"}:
+        try:
+            from pptx import Presentation
+            prs = Presentation(io.BytesIO(raw))
+            lines.append(f"- slide_count: {len(prs.slides)}")
+        except Exception:
+            pass
+
+    lines.append(f"- char_count: {len(text)}")
+    lines.append(f"- size_bytes: {len(raw)}")
+
+    return ("\n".join(lines) + "\n") if lines else ""
