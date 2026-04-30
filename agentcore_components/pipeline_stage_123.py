@@ -318,30 +318,54 @@ class PipelineStage123Node(Node):
 
     # ── Attachments ───────────────────────────────────────────────────────
 
-    def _fetch_attachments(self, src_cs: str, pr_no: str) -> list[dict]:
-        conn = self._connect(src_cs)
-        cur  = conn.cursor()
+    def _fetch_attachments(self, src_cs: str, tgt_cs: str, pr_no: str) -> list[dict]:
+        # Step 1: get attachment IDs + filenames from Azure SQL
+        tgt = self._connect(tgt_cs)
+        cur = tgt.cursor()
         try:
             cur.execute(
                 """
-                SELECT a.ATTACHMENT_ID, a.FILENAME, a.FILECONTENT, a.FILE_TYPE, a.PURCHASE_REQ_NO
-                  FROM purchase_req_attachments a
-                 WHERE a.PURCHASE_REQ_NO = ? AND a.FILECONTENT IS NOT NULL
+                SELECT pa.[ATTACHMENT_ID], pa.[FILES_NAME]
+                  FROM [ras_procurement].[purchase_req_mst] prm
+                  JOIN [ras_procurement].[purchase_attachments] pa
+                    ON prm.[PURCHASE_REQ_ID] = pa.[PURCHASE_ID]
+                 WHERE prm.[PURCHASE_REQ_NO] = ?
+                   AND pa.[ATTACHMENT_ID] IS NOT NULL
+                   AND pa.[FILES_NAME]    IS NOT NULL
                 """,
                 pr_no,
             )
+            rows = cur.fetchall()
+        finally:
+            tgt.close()
+
+        if not rows:
+            return []
+
+        id_to_filename = {str(r[0]): r[1] for r in rows}
+        att_ids = list(id_to_filename.keys())
+
+        # Step 2: fetch binary content from on-prem ras_attachments
+        placeholders = ",".join(["?"] * len(att_ids))
+        src = self._connect(src_cs)
+        cur = src.cursor()
+        try:
+            cur.execute(
+                f"SELECT [attachment_id], [doc] FROM [dbo].[ras_attachments]"
+                f" WHERE [attachment_id] IN ({placeholders}) AND [doc] IS NOT NULL",
+                att_ids,
+            )
             return [
                 {
-                    "attachment_id": r[0],
-                    "filename":      r[1] or f"attachment_{r[0]}",
-                    "content":       bytes(r[2]),
-                    "file_type":     r[3],
-                    "pr_no":         r[4],
+                    "attachment_id": str(r[0]),
+                    "filename":      id_to_filename.get(str(r[0]), f"attachment_{r[0]}"),
+                    "content":       bytes(r[1]),
+                    "pr_no":         pr_no,
                 }
                 for r in cur.fetchall()
             ]
         finally:
-            conn.close()
+            src.close()
 
     def _extract_text(self, filename: str, raw: bytes) -> str:
         import os
@@ -462,7 +486,7 @@ class PipelineStage123Node(Node):
             self._advance_tracker(tgt_cs, pr_no, _STAGE_INGESTION)
             self.log(f"[{pr_no}] Stage 1 — ingested")
 
-            attachments = self._fetch_attachments(src_cs, pr_no)
+            attachments = self._fetch_attachments(src_cs, tgt_cs, pr_no)
             if not attachments:
                 self.log(f"[{pr_no}] No attachments — skipping")
                 result["status"] = "skipped"
