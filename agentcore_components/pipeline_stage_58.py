@@ -70,7 +70,7 @@ _EXT_TO_TYPE = {
 
 VALID_CLASSIFICATIONS = {"RFQ", "Quotation", "MPBC", "BER", "E-Auction", "Other"}
 
-# ── Classification system prompt ──────────────────────────────────────────────
+# ── Classification system prompt (full original recovered from file_classifier) ──
 CLASSIFICATION_SYSTEM_PROMPT = """You are an expert document classifier for Motherson's procurement team. You will be given the content of a file (extracted text, tables, sheet structure, or an image) and you must classify it into EXACTLY ONE of six categories.
 
 ============================================================
@@ -79,59 +79,224 @@ CRITICAL: MULTILINGUAL SUPPORT
 Documents may be in ANY language: English, German, Czech, Hindi, French, Spanish, Chinese, Japanese, Hungarian, and others. You MUST:
 - Match fields by MEANING, not by exact English labels
 - Recognize translated equivalents. Common examples:
-  • German: "Preisspiegel" / "Angebotsvergleich" = Bid Comparison (MPBC), "Angebot" = Quotation/Offer, "Anfrage" = Inquiry/RFQ
-  • Czech: "Nabídka" = Offer/Quotation, "Poptávka" = RFQ/Inquiry, "Dodavatel" = Supplier
+  • German: "Preisspiegel" / "Angebotsvergleich" = Bid Comparison (MPBC), "Angebot" = Quotation/Offer, "Anfrage" = Inquiry/RFQ, "Lieferant" = Supplier, "Preis" = Price, "Lieferzeit" = Delivery Time, "Zahlungsbedingungen" = Payment Terms, "Genehmigung" = Approval, "Begründung" = Justification
+  • Czech: "Nabídka" = Offer/Quotation, "Poptávka" = RFQ/Inquiry, "Dodavatel" = Supplier, "Cena" = Price, "Technický požadavek" / "Lastenheft" = Technical Specification
+  • Hindi: "कोटेशन" = Quotation, "मूल्य" = Price, "आपूर्तिकर्ता" = Supplier
 - Apply the same field-matching logic regardless of language
+- If a document is in a language you recognize, translate field names mentally and match against the English category definitions
 
 ============================================================
 CLASSIFICATION METHOD
 ============================================================
-Classification is FIELD-BASED VALIDATION. Each category has mandatory fields. The category whose mandatory fields are most completely satisfied wins.
+Classification is FIELD-BASED VALIDATION. Each category has a list of mandatory fields. You must verify the presence of those fields in the document content (allowing for naming/labeling variations, synonyms, AND translations in any language — the underlying meaning matters, not the exact label). The category whose mandatory fields are most completely satisfied wins.
 
 ============================================================
 CATEGORIES & MANDATORY FIELDS
 ============================================================
 
 1. **MPBC** — Motherson Purchase BID Comparison
-   Side-by-side comparison of quotations from 3+ suppliers.
-   Key signals: "MPBC" or "Motherson Purchase BID Comparison" title; Supplier 1/2/3 columns; RAS Number; GSP terminology; multi-sheet Excel with "1. MPBC", "BER", "Supp X risk" sheets.
-   German: "Preisspiegel" / "Angebotsvergleich" with 3+ suppliers = MPBC.
+   Official Motherson template that consolidates quotations from multiple suppliers (typically 3+) into a side-by-side comparison for procurement evaluation. Sheet usually titled "MPBC" or "Motherson Purchase BID Comparison". May be a multi-sheet workbook with sheets like "1. MPBC", "2. mandatory cells", "BER", "Supp X risk", "exchange_rates", etc.
 
-2. **Quotation** — A SINGLE vendor's price offer
-   Synonyms: Quote, Estimate, Offer, Proposal, Price Bid.
-   Key signals: Vendor Name + Address; Date; Total Amount; Payment Terms; Delivery Time; Validity; Item Description with prices.
-   CRITICAL: One vendor only. If 3+ vendors compared side-by-side → MPBC.
+   Mandatory fields (yellow-marked in the official MPBC template — must find most of these):
+   PROJECT / HEADER:
+     • Project Detail
+     • RAS Number
+     • Sheet No.
+     • Indenter, Originator or RFQ Responsible
+     • Contact Number
+   PER-SUPPLIER (repeated for each of typically 3+ suppliers):
+     • Name of the Supplier
+     • Preference (Preferred source / Second Source / etc.)
+     • Quote meet spec (Yes/No)
+     • Supplier's Contact Person
+     • Offer No.
+     • Offer Date
+     • Offer Validity
+     • Supplier Country / Classification
+     • Country of Origin / Classification
+   PRICING:
+     • Currency for Comparison
+     • Total Amount in supplier currency
+     • Total Amount in EUR
+     • Saving %age
+   SOURCING DECISION:
+     • Insourcing
+     • Hybrid
+     • Single sourcing
+     • Supplier justification (BER) signed
+     • In case of Cust. funded: Revenue in EUR
+     • Target against Budget
+   COMMERCIAL TERMS (per supplier):
+     • Incoterms
+     • Packing and Forwarding
+     • Freight
+     • Insurance
+     • Taxes
+     • Customs / duties
+     • Installation
+     • Delivery Period (Weeks)
+     • Advance payment (any payment before delivery to MOTHERSON)
+     • SCF (Supply Chain Finance Program)
+     • Payment Terms
+   APPROVAL / FINAL:
+     • GSP Purchase Saving %age
+     • GSP Purchase Saving amount in EUR
+     • Approved Supplier / Classification
+     • Approved Cost (total amount)
+     • Landed Cost (for Reference)
+     • Approvals (Department / Name / Date / Approver Signature for Purchasing, Technics, Controlling, Sales, Plant Manager)
+
+   Strongest distinguishing signals:
+     • Title / sheet name contains "MPBC" or "Motherson Purchase BID Comparison"
+     • Supplier 1 / Supplier 2 / Supplier 3 columns appearing side-by-side
+     • Presence of RAS Number, GSP (Global Strategic Procurement) terminology
+     • Multi-sheet Excel with sheets like "1. MPBC", "2. mandatory cells", "BER", "Supp X risk"
+     • MULTILINGUAL: German "Preisspiegel" (price mirror) / "Angebotsvergleich" (offer comparison) / "Bid comparison (Purchased parts)" = MPBC. If 3+ suppliers are compared side-by-side in ANY language with pricing, it is MPBC even without the exact Motherson MPBC template fields like RAS Number.
+   Allow naming variations / synonyms / translations; the MEANING of fields matters, not exact labels.
+
+2. **Quotation** — A SINGLE vendor's price offer / response to an RFQ (vendor → buyer such as Motherson)
+   Synonyms commonly used as the document title: "Quotation", "Quote", "Estimate", "Offer", "Proposal", "Price Bid". Treat all of these as Quotation candidates.
+
+   Mandatory fields (naming may vary widely; identify by MEANING — Indian, German, and other vendor styles all appear):
+     • Vendor Name (vendor's company name appears in letterhead at top AND in signature/footer like "For [Company Name]")
+     • Vendor Address (postal address of the vendor)
+     • Date of Quotation (e.g., "Date:", "Quotation Dt.", "Offer Date", "Est. Date")
+     • Total Amount / Value (grand total / net amount / total in supplier currency)
+     • Payment Terms (e.g., "30 days", "100% advance", "Against delivery", "100% after PO confirmation")
+     • Delivery Time (e.g., "15-20 days", "within 2-3 weeks", "Delivery Period", "Lead Time", "Dispatch Time")
+     • Validity (e.g., "Quotation valid until ___", "Offer Validity: 60 days", "Valid for one month")
+     • Specifications (technical / product / scope specifications — may be a separate "TECH SPEC" sheet in Excel)
+     • Item Description (line items with descriptions — columns like "Description of Goods", "Item Description", "Sr. No. + Description + Qty + Rate + Amount", "BOQ items")
+
+   Additional supporting signals frequently observed (not all needed, but strengthen confidence):
+     • Vendor letterhead at top: company logo / name + address + phone + email + GST No. / GSTIN / PAN No. / VAT No.
+     • A reference / quotation number (e.g., "Quotation No.: PPAQ004560", "Ref: Q/875", "Offer No.", "Est. No.: SCL/Haryana/20-21/21", "Ref: MIPL/MATE/...")
+     • Addressed to: "To, M/s [Customer Name]", "Client:", "Kind Attn: Mr./Ms. ___"
+     • Formal letter language: "We are pleased to offer / quote", "With reference to your enquiry", "Thanking you", "Yours faithfully"
+     • Closing: "For [Vendor Company]" + "Authorised Signatory" / "Proprietor" / "Sales Manager"
+     • Tax columns: HSN/SAC Code, CGST %, SGST %, IGST %, Excise Duty, GST @ 18 %
+     • Bank details / E. & O. E. / "Please mention our quotation number on your purchase order"
+
+   CRITICAL DISAMBIGUATION:
+     • A Quotation is from ONE vendor. If THREE OR MORE vendor names appear as parallel columns/sections being compared → it is MPBC, not Quotation.
+     • A Quotation MAY be a multi-sheet Excel (e.g., "COMMERCIAL", "TECH. SPEC.", "Summary", "NPV", "Vendors" sheets) but with only ONE vendor. Do not misclassify these as MPBC — check vendor count, not sheet count.
+     • If price columns are EMPTY (template for vendor to fill) → it is RFQ, not Quotation.
+     • Filename is unreliable — e.g., "(875) CK Motherson Auto Hitech.docx" was issued BY Hi-Tech to CK Motherson; the customer name in the filename does not make it MPBC or RFQ.
+     • PDF extraction may produce duplicated characters from font issues (e.g., "TTOO" instead of "TO", "QQUUOOTTAATTIIOONN" instead of "QUOTATION") — interpret semantically.
+     • **A Quotation can use the buyer's RFQ TEMPLATE FORMAT.** When a supplier fills in an RFQ specification template with their technical responses AND populates pricing fields with actual monetary values, the document has become a Quotation. Key differentiator: if ACTUAL PRICES are filled in (not blank placeholders) and a supplier contact person / company name is prominently featured, treat it as Quotation even if the original RFQ structure is retained.
 
 3. **RFQ** — Request For Quotation (Motherson → vendors)
-   Issued BY Motherson TO vendors asking them to submit prices.
-   Key signals: "Supplier Spec/Confirmation" columns (blank/to fill); "Pls specify" language; technical spec table with Required/Not Required flags; no actual prices filled in.
+   A specification / scope document issued BY Motherson (the buyer) TO vendors, asking them to submit a quotation.
+
+   Mandatory fields:
+     • Project Name
+     • RFQ Number (reference / inquiry number)
+     • Date (issue date)
+     • Specifications — detailed technical / scope specifications structured as tables with:
+       - Sl. No / Item number
+       - Description / technical parameter
+       - "Required" / "Not Required" / "Std" flags
+       - "To be specified by the supplier" / "Supplier Spec/Confirmation" / "Pls specify" columns (blank or for vendor to fill)
+     • Commercials section asking for pricing breakdown (blank fields for vendors to fill)
+
+   Strong supporting signals:
+     • Sheet name contains "RFQ"
+     • "MATE-B Req" or "MATE Spec" column
+     • "Supplier Spec/Confirmation" or "Supplier Remarks" columns (empty = template)
+     • "Techno Commercial Comparison" as title
+     • Columns with "Fill this column by '0' if STD or Enter the cost if Optional"
+     • "Company Name:", "Contact Person:", "Telephone:", "Email:" fields for vendor to fill
+
+   CRITICAL DISAMBIGUATION:
+     • Even if vendors have filled some spec responses, it remains RFQ IF pricing fields are EMPTY and no supplier is prominently featured.
+     • If a supplier has populated actual pricing (USD/EUR/INR values) AND supplier contact details appear prominently → classify as Quotation, not RFQ.
+     • If 3+ vendors compared side-by-side in consolidated evaluation → MPBC, not RFQ.
 
 4. **BER** — Bid Exception Report
-   SPECIFICALLY the Motherson "BID EXCEPTION REPORT" template.
-   Key signals: "BID EXCEPTION REPORT" title; Order Value; Justification for waiver; checkbox options A-E; three approval rows (Prepared by / Purchasing / MD).
+   SPECIFICALLY the Motherson "BID EXCEPTION REPORT" template form.
+
+   Mandatory fields (ALL must be present or nearly all — strict template match):
+     • "BID EXCEPTION REPORT" appearing explicitly as a header / title (REQUIRED — generic "Waiver of Competition" or "Single Source Justification" is NOT sufficient)
+     • Reasoning for not obtaining at least three bids/quotes
+     • Order Value field (e.g., "Order Value: 671,57 €")
+     • Description of the product or service to be ordered
+     • Justification for waiver of competitive bidding
+
+   Strong supporting signals:
+     • Header "Capital Equipment & Indirect Purchasing"
+     • Budget Line Ref.
+     • Reference to "LCC Suppliers" / "Low Cost Country"
+     • Checkbox options A through E (A: less than three potential bidders; B: sole-source; C: national supply contract; D: similar item purchased in past 6 months; E: Other)
+     • Three approval rows: "Prepared by:" + "Purchasing approval:" + "Managing Director / COO / EVP approval:"
+     • Sheet named "BER" in an Excel workbook
+
+   CRITICAL: Do NOT classify as BER if the document is a generic waiver form, Single Source Justification from a non-Motherson template, or any exception document that does NOT use the specific Motherson BER template with the A-E checkbox structure. Classify those as "Other".
 
 5. **E-Auction** — E-Auction results / reports / trackers
-   Key signals: Event ID; Event Name; BID Id; BID Status; Participant; Basic Price; Extended Price; "eAuction"/"Reverse Auction" terminology; Rank column; Savings column.
+   Documents generated from or summarizing an online reverse-auction event.
 
-6. **Other** — Anything not matching the above
-   Examples: invoices, POs, delivery notes, contracts, drawings, internal memos.
+   Mandatory fields:
+     • Event ID
+     • Event Name
+     • Publish Date / Open Date / Close Date
+     • BID Id
+     • BID Status (e.g., "Accepted", "Default")
+     • Participant (vendor / bidder name)
+     • Basic Price (per unit price)
+     • Extended Price (total price for volume)
+
+   Strong supporting signals:
+     • "eAuction", "e-Auction", "Reverse Auction", "Japanese Auction" in title/headers
+     • Sheet names "Overview Sheet", "Full Bid Data Sheet"
+     • Rank column; Savings column; Capacity Planning Volume
+     • Pricing tiers: "Price 1" / "Price 2" / "Price 3" with savings definitions
+     • Tracker workbooks with sheets "Pivot", "Summary", "Project Details", "Project Negotiation"
+     • Presentation slides with "eAuction Overview", "eAuction Status", monthly savings summaries
+
+   IMPORTANT — Two tiers of E-Auction documents (BOTH classify as E-Auction):
+     TIER 1 (raw auction output): Contains most mandatory fields (Event ID, BID Id, Participant, prices). High confidence.
+     TIER 2 (summaries/trackers/presentations): May NOT contain individual event-level fields like Event ID or BID Id, but IS clearly ABOUT e-auction results — contains "eAuction" keyword prominently + pricing data (Price 1/2/3, savings, L1 price, Final price) + auction metadata (Auction type, Auction Month, GSP Buyer). Classify as E-Auction with moderate confidence (0.75-0.85) even if individual bid-level fields are missing.
+
+   CRITICAL DISAMBIGUATION:
+     • E-Auction focuses on AUCTION EVENT and BIDDING PROCESS with event metadata and time-sequenced bids. MPBC is a static comparison table — fundamentally different.
+     • E-Auction tracker/summary workbooks and .pptx presentations summarizing eAuction results are still E-Auction, not "Other".
+     • If the document is ABOUT eAuction (mentions "eAuction" + savings/prices), classify as E-Auction even if not all mandatory fields are present.
+
+6. **Other** — Anything that does NOT satisfy the mandatory field set of any category above
+   Examples: invoices, purchase orders, delivery notes, contracts, drawings, internal memos, generic emails, MSAs, NDAs, quality reports, etc.
 
 ============================================================
-DECISION PROCESS
+DECISION PROCESS (follow strictly)
 ============================================================
-Step 1: Identify which mandatory fields from each category are present.
-Step 2: Pick the category with the highest coverage (≥ 60%).
-Step 3: The strongest distinguishing signal must also be present.
-Step 4: If no category reaches 60%, classify as "Other".
-Step 5: Content always wins over filename.
-Step 6: Confidence: ≥0.90 = nearly all fields present; 0.75-0.89 = most present; 0.60-0.74 = enough but gaps; <0.60 = Other.
+Step 1 — Scan the document and identify which mandatory fields from each category are PRESENT (allowing synonyms / paraphrases / equivalent column names).
+Step 2 — For each candidate category, compute a coverage ratio: (fields present) / (total mandatory fields).
+Step 3 — Pick the category with the highest coverage. To classify as that category, coverage must be ≥ 60% AND the strongest distinguishing signal must be present (e.g., for MPBC: ≥ 3 vendors compared; for BER: explicit BER title + waiver justification; for E-Auction: event + bid columns).
+Step 4 — If no category reaches 60% coverage, classify as "Other".
+Step 5 — Filename can be a hint but content always wins. Ignore filename if content contradicts it.
+Step 6 — Confidence calibration:
+   • ≥ 0.90 → all or nearly all mandatory fields present and unambiguous
+   • 0.75 – 0.89 → most mandatory fields present; minor ambiguity
+   • 0.60 – 0.74 → enough fields present to classify but with notable gaps
+   • < 0.60 → genuine uncertainty — likely "Other"
 
 ============================================================
 OUTPUT FORMAT (strict JSON, no markdown, no commentary)
 ============================================================
-{"classification": "RFQ" | "Quotation" | "MPBC" | "BER" | "E-Auction" | "Other", "confidence": <float 0.0-1.0>, "reason": "<2-3 sentences>", "key_signals": ["<signal1>", "<signal2>", "<signal3>"], "fields_matched": ["<field1>", ...], "fields_missing": ["<field1>", ...]}
+{
+  "classification": "RFQ" | "Quotation" | "MPBC" | "BER" | "E-Auction" | "Other",
+  "confidence": <float 0.0 - 1.0>,
+  "reason": "<2-3 sentences explaining which mandatory fields you matched and which were missing>",
+  "key_signals": ["<mandatory field matched 1>", "<mandatory field matched 2>", "<mandatory field matched 3>"],
+  "fields_matched": ["<exact field/column/phrase observed in the document>", ...],
+  "fields_missing": ["<mandatory fields for the chosen category that were NOT found>", ...]
+}
 
-Rules: Pick exactly ONE category. key_signals = top 3-5 mandatory fields that drove the decision."""
+Rules:
+- Pick exactly ONE category.
+- key_signals = the top 3-5 mandatory fields that drove the decision.
+- fields_matched = up to 10 specific evidence items (column names, headers, phrases) you actually observed.
+- fields_missing = mandatory fields for the chosen category that you could NOT find.
+- Be specific in the reason — cite real evidence from the document, do not be vague."""
 
 # ── Classification user prompt templates ──────────────────────────────────────
 _CLASSIFY_USER_TEXT = """Classify the following file by checking its content against the mandatory fields for each category.
@@ -160,7 +325,7 @@ File Type: {file_type}
 {extra_metadata}
 ============================================================
 
-Examine the image carefully. Check the mandatory fields for each category. Return only the JSON object."""
+Examine the image carefully — read every visible field, column, and label. Check the mandatory fields for each category against what you see. Apply the decision process from the system prompt and return only the JSON object."""
 
 # ── Extraction prompt constants ────────────────────────────────────────────────
 EXTRACTION_SYSTEM_PROMPT = """You are a senior procurement analyst with deep experience evaluating supplier quotations across every spend category. Your job here is to read each quotation thoroughly and produce a complete, accurate, decision-grade extraction in a strict JSON schema. The downstream system uses your output to benchmark prices, pick winning suppliers, and approve purchase requisitions, so completeness and correctness directly affect business decisions.
@@ -492,7 +657,9 @@ def _extract_for_classification(file_bytes: bytes, filename: str) -> tuple:
         return _extract_pdf_classify(file_bytes, filename, meta_str)
     if ftype == "word":
         return _extract_word_classify(file_bytes, filename, meta_str)
-    if ftype in ("legacy_doc", "pptx"):
+    if ftype == "pptx":
+        return _extract_pptx_classify(file_bytes, filename, meta_str)
+    if ftype == "legacy_doc":
         return _extract_fitz_classify(file_bytes, filename, meta_str)
     if ftype == "image":
         return _extract_image_classify(file_bytes, filename, meta_str)
@@ -507,6 +674,7 @@ def _extract_for_classification(file_bytes: bytes, filename: str) -> tuple:
 
 def _extract_excel_classify(file_bytes, filename, meta_str):
     import io, pandas as pd
+    _MAX_SHEETS = 8
     buf  = io.BytesIO(file_bytes)
     parts: list[str] = []
     try:
@@ -521,19 +689,24 @@ def _extract_excel_classify(file_bytes, filename, meta_str):
             return "[Excel could not be opened]", None, meta_str
 
         sheets = xls.sheet_names
-        meta_str = f"- sheet_count: {len(sheets)}\n- sheet_names: {sheets}\n"
+        meta_str = f"- sheet_count: {len(sheets)}\n- sheet_names: {sheets}\n- multi_sheet: {len(sheets) > 1}\n"
         parts.append(f"## Workbook Structure\nTotal Sheets: {len(sheets)}\nSheet Names: {sheets}\n")
-        for idx, sheet in enumerate(sheets[:8]):
+        for idx, sheet in enumerate(sheets):
             try:
                 df = pd.read_excel(xls, sheet_name=sheet, nrows=40, header=None)
                 df = df.iloc[:, :30].dropna(how="all").dropna(axis=1, how="all")
-                if len(df) == 0:
-                    continue
-                parts.append(f"### Sheet {idx+1}: '{sheet}'")
-                try:
-                    parts.append(df.fillna("").astype(str).to_markdown(index=False))
-                except Exception:
-                    parts.append(df.fillna("").astype(str).to_string(index=False))
+                non_empty = len(df)
+                if idx < _MAX_SHEETS and non_empty > 0:
+                    parts.append(f"### Sheet {idx+1}: '{sheet}'")
+                    parts.append(f"Non-empty rows in sample: {non_empty}")
+                    try:
+                        hdrs = [f"col_{c}" for c in range(df.shape[1])]
+                        parts.append(df.fillna("").astype(str).to_markdown(index=False, headers=hdrs))
+                    except Exception:
+                        parts.append(df.fillna("").astype(str).to_string(index=False))
+                    parts.append("")
+                else:
+                    parts.append(f"### Sheet {idx+1}: '{sheet}' (summary only — {non_empty} non-empty rows)\n")
             except Exception:
                 pass
         return "\n".join(parts)[:_MAX_CLASSIFY_CHARS], None, meta_str
@@ -556,22 +729,45 @@ def _extract_csv_classify(file_bytes, meta_str):
 
 def _extract_pdf_classify(file_bytes, filename, meta_str):
     import io
+    _MAX_PAGES = 10
     try:
         import pdfplumber
         buf  = io.BytesIO(file_bytes)
         with pdfplumber.open(buf) as pdf:
             total = len(pdf.pages)
-            meta_str = f"- total_pages: {total}\n"
-            page_idxs = list(range(min(total, 8))) + (
-                list(range(total-2, total)) if total > 8 else []
-            )
-            page_idxs = sorted(set(page_idxs))
+            meta_str = f"- total_pages: {total}\n- pages_processed: {min(total, _MAX_PAGES)}\n"
+            if total == 0:
+                return "[Empty or corrupt PDF — no pages found]", None, meta_str
+
+            # smart selection: first N-2 pages + last 2 pages (captures pricing summaries at end)
+            if total <= _MAX_PAGES:
+                page_idxs = list(range(total))
+            else:
+                page_idxs = sorted(set(list(range(_MAX_PAGES - 2)) + list(range(total - 2, total))))
+
             text_parts: list[str] = []
+            table_parts: list[str] = []
             for i in page_idxs:
-                t = (pdf.pages[i].extract_text() or "").strip()
+                page = pdf.pages[i]
+                t = (page.extract_text() or "").strip()
                 if t:
                     text_parts.append(f"--- Page {i+1} ---\n{t}")
+                # extract tables from this page
+                for t_idx, table in enumerate(page.extract_tables() or []):
+                    if not table:
+                        continue
+                    header = table[0]
+                    rows   = table[1:]
+                    tstr   = " | ".join(str(c) for c in header) + "\n"
+                    tstr  += " | ".join("---" for _ in header) + "\n"
+                    for row in rows[:20]:
+                        tstr += " | ".join(str(c) for c in row) + "\n"
+                    table_parts.append(f"Table {t_idx+1} (Page {i+1}):\n{tstr}")
+
             combined = "\n\n".join(text_parts)
+            if table_parts:
+                combined += "\n\n### Extracted Tables\n" + "\n\n".join(table_parts)
+
             if len(combined.strip()) < 50:
                 return _extract_pdf_as_image_classify(file_bytes, filename, meta_str, total)
             return combined[:_MAX_CLASSIFY_CHARS], None, meta_str
@@ -615,29 +811,104 @@ def _extract_pdf_as_image_classify(file_bytes, filename, meta_str, total):
 
 
 def _extract_word_classify(file_bytes, filename, meta_str):
-    import io
+    import io, zipfile, base64
     try:
         from docx import Document
+        from PIL import Image
         doc   = Document(io.BytesIO(file_bytes))
         parts: list[str] = []
-        for i, para in enumerate(doc.paragraphs):
-            if i >= 200: break
-            if para.text.strip():
-                parts.append(para.text.strip())
+        para_count = 0
+        for para in doc.paragraphs:
+            if para_count >= 200:
+                break
+            text = para.text.strip()
+            if not text:
+                continue
+            if para.style and para.style.name.startswith("Heading"):
+                lvl = para.style.name.replace("Heading ", "").strip()
+                try:
+                    lvl = int(lvl)
+                except ValueError:
+                    lvl = 1
+                parts.append(f"{'#' * lvl} {text}")
+            else:
+                parts.append(text)
+            para_count += 1
         for i, tbl in enumerate(doc.tables):
             rows = []
             for row in tbl.rows:
                 cells = [c.text.strip() for c in row.cells]
-                rows.append("| " + " | ".join(cells) + " |")
+                rows.append(cells)
             if rows:
-                parts.append(f"\n### Table {i+1}\n" + "\n".join(rows))
+                hdr = rows[0]
+                tstr  = " | ".join(hdr) + "\n"
+                tstr += " | ".join("---" for _ in hdr) + "\n"
+                for row in rows[1:20]:
+                    tstr += " | ".join(row) + "\n"
+                parts.append(f"\n### Table {i+1}\n{tstr}")
         text = "\n\n".join(parts)
         meta_str = f"- paragraphs: {len(doc.paragraphs)}\n- tables: {len(doc.tables)}\n"
         if len(text.strip()) < 50:
+            # try to extract largest embedded image from word/media/
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+                    imgs = sorted([n for n in z.namelist() if n.startswith("word/media/")])
+                    if imgs:
+                        largest = max(imgs, key=lambda n: z.getinfo(n).file_size)
+                        img_bytes = z.read(largest)
+                        img = Image.open(io.BytesIO(img_bytes))
+                        if img.mode not in ("RGB", "L"):
+                            img = img.convert("RGB")
+                        if max(img.size) > 2048:
+                            img.thumbnail((2048, 2048), Image.LANCZOS)
+                        buf2 = io.BytesIO()
+                        img.save(buf2, format="PNG")
+                        b64 = base64.b64encode(buf2.getvalue()).decode()
+                        return "[Word document is image-based - content sent as image for visual analysis]", b64, meta_str
+            except Exception:
+                pass
             return _extract_fitz_classify(file_bytes, filename, meta_str)
         return text[:_MAX_CLASSIFY_CHARS], None, meta_str
     except Exception as exc:
         return f"[Word extraction error: {exc}]", None, meta_str
+
+
+def _extract_pptx_classify(file_bytes, filename, meta_str):
+    import io
+    _MAX_SLIDES = 15
+    try:
+        from pptx import Presentation
+        buf = io.BytesIO(file_bytes)
+        prs = Presentation(buf)
+        slides = list(prs.slides)
+        total  = len(slides)
+        parts  = [f"## Presentation: {total} slides\n"]
+        for i, slide in enumerate(slides[:_MAX_SLIDES]):
+            slide_parts: list[str] = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        t = para.text.strip()
+                        if t:
+                            slide_parts.append(t)
+                if shape.has_table:
+                    tbl = shape.table
+                    rows = [[c.text.strip() for c in row.cells] for row in tbl.rows]
+                    if rows:
+                        hdr   = rows[0]
+                        tstr  = " | ".join(hdr) + "\n"
+                        tstr += " | ".join("---" for _ in hdr) + "\n"
+                        for row in rows[1:20]:
+                            tstr += " | ".join(row) + "\n"
+                        slide_parts.append(tstr)
+            if slide_parts:
+                parts.append(f"### Slide {i+1}")
+                parts.append("\n".join(slide_parts))
+                parts.append("")
+        meta_str = f"- total_slides: {total}\n- slides_extracted: {min(total, _MAX_SLIDES)}\n"
+        return "\n".join(parts)[:_MAX_CLASSIFY_CHARS], None, meta_str
+    except Exception as exc:
+        return _extract_fitz_classify(file_bytes, filename, meta_str)
 
 
 def _extract_fitz_classify(file_bytes, filename, meta_str):
