@@ -764,10 +764,25 @@ def _is_trivial_image(file_bytes: bytes, filename: str) -> tuple:
 
 # ── Classification ─────────────────────────────────────────────────────────────
 
-def _classify_file(llm, file_bytes: bytes, filename: str) -> tuple:
+def _get_prompt_text(msg_input, default: str) -> str:
+    """Extract text from an optional wired Message input; fall back to default."""
+    if msg_input is None:
+        return default
+    text = getattr(msg_input, "text", None)
+    if text and str(text).strip():
+        return str(text).strip()
+    return default
+
+
+def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None = None) -> tuple:
     """Returns (doc_type: str, confidence: float)."""
     import os
     from langchain_core.messages import HumanMessage, SystemMessage
+
+    p = prompts or {}
+    sys_prompt      = p.get("cls_system", CLASSIFICATION_SYSTEM_PROMPT)
+    user_text_tmpl  = p.get("cls_user_text", _CLASSIFY_USER_TEXT)
+    user_image_tmpl = p.get("cls_user_image", _CLASSIFY_USER_IMAGE)
 
     ext = os.path.splitext(filename.lower())[1]
     if ext not in _SUPPORTED_CLASSIFY_EXTS:
@@ -783,20 +798,20 @@ def _classify_file(llm, file_bytes: bytes, filename: str) -> tuple:
 
     try:
         if image_b64:
-            user_prompt = _CLASSIFY_USER_IMAGE.format(
+            user_prompt = user_image_tmpl.format(
                 filename=filename, file_type=file_type, extra_metadata=meta_str
             )
             content = [
                 {"type": "text", "text": user_prompt},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}", "detail": "high"}},
             ]
-            messages = [SystemMessage(content=CLASSIFICATION_SYSTEM_PROMPT), HumanMessage(content=content)]
+            messages = [SystemMessage(content=sys_prompt), HumanMessage(content=content)]
         else:
-            user_prompt = _CLASSIFY_USER_TEXT.format(
+            user_prompt = user_text_tmpl.format(
                 filename=filename, file_type=file_type,
                 extra_metadata=meta_str, extracted_content=text_content,
             )
-            messages = [SystemMessage(content=CLASSIFICATION_SYSTEM_PROMPT), HumanMessage(content=user_prompt)]
+            messages = [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
 
         response = llm.invoke(messages)
         raw = (getattr(response, "content", None) or str(response)).strip()
@@ -818,7 +833,7 @@ def _classify_file(llm, file_bytes: bytes, filename: str) -> tuple:
 
 # ── Stage 4: run classification for a PR ──────────────────────────────────────
 
-def _run_classification(llm, tgt_cs: str, blob_cfg: dict, pr_no: str) -> None:
+def _run_classification(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict | None = None) -> None:
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
@@ -854,7 +869,7 @@ def _run_classification(llm, tgt_cs: str, blob_cfg: dict, pr_no: str) -> None:
             file_bytes = _download_blob(blob_path, blob_cfg)
             import os
             filename   = os.path.basename(blob_path)
-            doc_type, conf = _classify_file(llm, file_bytes, filename)
+            doc_type, conf = _classify_file(llm, file_bytes, filename, prompts)
             _update_parent_classification(tgt_cs, att_id, doc_type, conf)
             logger.info(f"[{pr_no}] Parent {filename!r}: {doc_type} (conf={conf:.2f})")
         except Exception as exc:
@@ -869,7 +884,7 @@ def _run_classification(llm, tgt_cs: str, blob_cfg: dict, pr_no: str) -> None:
             file_bytes = _download_blob(blob_path, blob_cfg)
             import os
             filename   = os.path.basename(blob_path)
-            doc_type, conf = _classify_file(llm, file_bytes, filename)
+            doc_type, conf = _classify_file(llm, file_bytes, filename, prompts)
             _update_embedded_classification(tgt_cs, parent_pk, blob_path, doc_type, conf)
             logger.info(f"[{pr_no}] Embedded {filename!r}: {doc_type} (conf={conf:.2f})")
         except Exception as exc:
@@ -1282,7 +1297,7 @@ def _build_raw_context(ctx: RASContext) -> str:
 
 # ── Extraction LLM call ────────────────────────────────────────────────────────
 
-def _build_extraction_user_prompt(ctx: RASContext, doc: DocumentContent) -> str:
+def _build_extraction_user_prompt(ctx: RASContext, doc: DocumentContent, prompts: dict | None = None) -> str:
     def _f(v): return str(v) if v is not None else "N/A"
     if doc.ocr_source and doc.text:
         doc_content_str = f"[OCR markdown from Azure Document Intelligence]\n\n{doc.text}"
@@ -1293,7 +1308,8 @@ def _build_extraction_user_prompt(ctx: RASContext, doc: DocumentContent) -> str:
     else:
         doc_content_str = doc.text or "[No content extracted]"
 
-    return EXTRACTION_USER_TEMPLATE.format(
+    user_tmpl = (prompts or {}).get("ext_user", EXTRACTION_USER_TEMPLATE)
+    return user_tmpl.format(
         purchase_req_no=_f(ctx.purchase_req_no),
         purchase_req_id=_f(ctx.purchase_req_id),
         justification=_f(ctx.justification),
@@ -1325,16 +1341,17 @@ def _build_extraction_user_prompt(ctx: RASContext, doc: DocumentContent) -> str:
         po_date=_f(ctx.po_date),
         category_buyer=_f(ctx.category_buyer),
         line_items_table=_build_line_items_table(ctx),
-        item_taxonomy=ITEM_TAXONOMY,
+        item_taxonomy=(prompts or {}).get("ext_taxonomy", ITEM_TAXONOMY),
         document_content=doc_content_str,
         raw_ras_context=_build_raw_context(ctx),
     )
 
 
-def _call_extraction_llm(llm, ctx: RASContext, doc: DocumentContent) -> str:
+def _call_extraction_llm(llm, ctx: RASContext, doc: DocumentContent, prompts: dict | None = None) -> str:
     from langchain_core.messages import HumanMessage, SystemMessage
-    user_prompt = _build_extraction_user_prompt(ctx, doc)
-    messages: list = [SystemMessage(content=EXTRACTION_SYSTEM_PROMPT)]
+    user_prompt = _build_extraction_user_prompt(ctx, doc, prompts)
+    sys_prompt  = (prompts or {}).get("ext_system", EXTRACTION_SYSTEM_PROMPT)
+    messages: list = [SystemMessage(content=sys_prompt)]
     if doc.is_image_based and doc.images:
         img_detail = "low" if doc.text else "high"
         images = doc.images[:50]
@@ -1639,7 +1656,7 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
 
 # ── Stage 5: run extraction for a PR ──────────────────────────────────────────
 
-def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str) -> int:
+def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict | None = None) -> int:
     ctx = _build_ras_context(tgt_cs, pr_no)
     if ctx is None:
         logger.warning(f"[{pr_no}] No RAS context found — skipping extraction")
@@ -1661,7 +1678,7 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str) -> int:
         try:
             file_bytes = _download_blob(blob_path, blob_cfg)
             doc        = _load_document(file_bytes, filename)
-            raw        = _call_extraction_llm(llm, ctx, doc)
+            raw        = _call_extraction_llm(llm, ctx, doc, prompts)
             items      = _parse_extraction_response(raw, src, ctx)
             items      = _align_to_ras_line_items(items, ctx, src)
             all_items.extend(items)
@@ -1893,6 +1910,51 @@ class PipelineStage4567Node(Node):
             display_name="Embeddings Model",
             input_types=["Embeddings"],
         ),
+        # ── Optional prompt overrides ──────────────────────────────────────────
+        # Wire a Prompt Template node to any of these to override the built-in prompts.
+        # Leave disconnected to use the default prompts baked into this component.
+        HandleInput(
+            name="cls_system_prompt",
+            display_name="[Classification] System Prompt",
+            input_types=["Message"],
+            required=False,
+            info="Override the classification system prompt. Connect a Prompt Template node.",
+        ),
+        HandleInput(
+            name="cls_user_text_prompt",
+            display_name="[Classification] User Prompt — Text/Tabular Files",
+            input_types=["Message"],
+            required=False,
+            info="Override the user prompt for text/Excel/Word/PDF files. Must keep {filename}, {file_type}, {extra_metadata}, {extracted_content} placeholders.",
+        ),
+        HandleInput(
+            name="cls_user_image_prompt",
+            display_name="[Classification] User Prompt — Image/Scanned Files",
+            input_types=["Message"],
+            required=False,
+            info="Override the user prompt sent with base64 image content. Must keep {filename}, {file_type}, {extra_metadata} placeholders.",
+        ),
+        HandleInput(
+            name="ext_system_prompt",
+            display_name="[Extraction] System Prompt",
+            input_types=["Message"],
+            required=False,
+            info="Override the extraction system prompt. Connect a Prompt Template node.",
+        ),
+        HandleInput(
+            name="ext_user_template",
+            display_name="[Extraction] User Prompt Template",
+            input_types=["Message"],
+            required=False,
+            info="Override the extraction user template. Must keep all {field} placeholders from the RAS context and {document_content}.",
+        ),
+        HandleInput(
+            name="ext_item_taxonomy",
+            display_name="[Extraction] Item Taxonomy",
+            input_types=["Message"],
+            required=False,
+            info="Override the item taxonomy guidelines injected into {item_taxonomy} of the extraction user template.",
+        ),
         MessageTextInput(
             name="blob_connector_name",
             display_name="Azure Blob Connector Name",
@@ -1922,6 +1984,21 @@ class PipelineStage4567Node(Node):
         blob_cfg  = _get_blob_config_by_name(self.blob_connector_name)
         pr_list   = _fetch_pending_prs(tgt_cs, pr_filter, int(self.batch_limit))
 
+        # Build prompt overrides from wired Prompt Template nodes (None = use default)
+        prompts: dict = {}
+        _p = getattr(self, "cls_system_prompt",   None)
+        if _p: prompts["cls_system"]    = _get_prompt_text(_p, CLASSIFICATION_SYSTEM_PROMPT)
+        _p = getattr(self, "cls_user_text_prompt", None)
+        if _p: prompts["cls_user_text"] = _get_prompt_text(_p, _CLASSIFY_USER_TEXT)
+        _p = getattr(self, "cls_user_image_prompt", None)
+        if _p: prompts["cls_user_image"] = _get_prompt_text(_p, _CLASSIFY_USER_IMAGE)
+        _p = getattr(self, "ext_system_prompt",   None)
+        if _p: prompts["ext_system"]    = _get_prompt_text(_p, EXTRACTION_SYSTEM_PROMPT)
+        _p = getattr(self, "ext_user_template",   None)
+        if _p: prompts["ext_user"]      = _get_prompt_text(_p, EXTRACTION_USER_TEMPLATE)
+        _p = getattr(self, "ext_item_taxonomy",   None)
+        if _p: prompts["ext_taxonomy"]  = _get_prompt_text(_p, ITEM_TAXONOMY)
+
         if not pr_list:
             return Message(text="No PRs at stage 3 to process.")
 
@@ -1934,14 +2011,14 @@ class PipelineStage4567Node(Node):
             try:
                 # Stage 4 — Classification
                 self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
-                _run_classification(self.llm, tgt_cs, blob_cfg, pr_no)
+                _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
                 _advance_tracker(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
                 self.log(f"[{pr_no}] Stage 4 — classification complete")
 
                 # Stage 5 — Extraction
                 current_stage = _STAGE_EXTRACTION
                 self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
-                n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no)
+                n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
                 _advance_tracker(tgt_cs, pr_no, _STAGE_EXTRACTION)
                 self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
 
