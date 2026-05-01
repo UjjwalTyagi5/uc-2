@@ -405,7 +405,8 @@ class PipelineStage123Node(Node):
         from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
         cfg        = self._blob_cfg()
-        blob_name  = f"{pr_no}/{filename}"
+        safe_pr_no = pr_no.replace("/", "_")
+        blob_name  = f"{safe_pr_no}/{filename}"
         credential = DefaultAzureCredential(
             exclude_environment_credential=True,
             exclude_interactive_browser_credential=True,
