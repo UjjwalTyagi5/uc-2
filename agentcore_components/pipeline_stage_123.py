@@ -447,6 +447,7 @@ class PipelineStage123Node(Node):
 
     outputs = [
         Output(display_name="File Batch", name="file_batch", method="build_file_batch", types=["Message"]),
+        Output(display_name="Processed PRs", name="processed_prs", method="get_processed_prs", types=["Data"]),
     ]
 
     # ── Connection helpers ────────────────────────────────────────────────
@@ -903,6 +904,7 @@ class PipelineStage123Node(Node):
         if not pr_list:
             msg = Message(text="[No pending PRs to process]")
             self._cached_result = msg
+            self._cached_pr_numbers = []
             return msg
 
         if pr_filter:
@@ -943,7 +945,18 @@ class PipelineStage123Node(Node):
         batch_text = "".join(parts) if parts else "[No files extracted]"
         msg = Message(text=batch_text)
         self._cached_result = msg
+        self._cached_pr_numbers = [
+            r["pr_no"] for r in results if r.get("status") in ("success", "skipped")
+        ]
         return msg
+
+    def get_processed_prs(self) -> Data:
+        """Returns the PR numbers that reached stage 3 in this run.
+        Wire this output to Stage 4-8's 'Stage 1-3 Result' input so Stage 4-8
+        processes exactly those PRs synchronously after Stage 1-3 finishes."""
+        if not hasattr(self, "_cached_pr_numbers"):
+            self.build_file_batch()
+        return Data(data={"pr_numbers": self._cached_pr_numbers})
 
 
 # ── Text extraction helpers ───────────────────────────────────────────────

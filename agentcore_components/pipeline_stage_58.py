@@ -1896,11 +1896,12 @@ class PipelineStage4567Node(Node):
     inputs = [
         HandleInput(
             name="stage123_result",
-            display_name="Stage 1-3 Result (trigger)",
-            input_types=["Message"],
+            display_name="Stage 1-3 Processed PRs",
+            input_types=["Data"],
             required=False,
-            info="Wire the Sync Status output of the Stage 1-3 component here. "
-                 "This is not read — it only ensures Stage 4-8 starts AFTER Stage 1-3 finishes.",
+            info="Wire the 'Processed PRs' Data output of the Stage 1-3 component here. "
+                 "Stage 4-8 will process exactly those PR numbers synchronously. "
+                 "If left disconnected, Stage 4-8 queries the DB for all stage=3 PRs.",
         ),
         HandleInput(
             name="target_connection",
@@ -1990,7 +1991,17 @@ class PipelineStage4567Node(Node):
         tgt_cs    = _conn_str(self.target_connection)
         pr_filter = (self.pr_no_filter or "").strip()
         blob_cfg  = _get_blob_config_by_name(self.blob_connector_name)
-        pr_list   = _fetch_pending_prs(tgt_cs, pr_filter, int(self.batch_limit))
+
+        # If Stage 1-3 is wired, use its exact PR numbers (synchronous per-PR flow).
+        # Otherwise fall back to querying the DB for all stage=3 PRs.
+        stage123 = getattr(self, "stage123_result", None)
+        if stage123 is not None and isinstance(stage123, Data):
+            pr_numbers_from_123 = (stage123.data or {}).get("pr_numbers", [])
+            if pr_filter:
+                pr_numbers_from_123 = [p for p in pr_numbers_from_123 if p == pr_filter]
+            pr_list = pr_numbers_from_123
+        else:
+            pr_list = _fetch_pending_prs(tgt_cs, pr_filter, int(self.batch_limit))
 
         # Build prompt overrides from wired Prompt Template nodes (None = use default)
         prompts: dict = {}
