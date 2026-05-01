@@ -144,6 +144,13 @@ dependencies = [
     "extract-msg>=0.48.0,<1.0.0",
     "py7zr>=0.21.0,<1.0.0",
     "rarfile>=4.2,<5.0.0",
+    # --- Procurement pipeline (Stage 4-8) classification extractors ---
+    # pdfplumber: PDF text + table extraction for classification accuracy
+    "pdfplumber>=0.11.0",
+    # xlrd: fallback engine for legacy .xls files in ExcelExtractor
+    "xlrd>=2.0.0,<3.0.0",
+    # Azure Document Intelligence (new SDK) — prebuilt-read OCR for scanned docs
+    "azure-ai-documentintelligence>=1.0.0,<2.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
