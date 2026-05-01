@@ -819,7 +819,8 @@ class PipelineStage123Node(Node):
                             embedded.append({
                                 "filename":    emb_name,
                                 "content":     emb_content,
-                                "blob_path":   f"{safe_pr}/{att_id}/extracted/{emb_name}",
+                                # Include procurement/ prefix so upload path == DB path
+                                "blob_path":   f"procurement/{safe_pr}/{att_id}/extracted/{emb_name}",
                                 "att_id":      att_id,
                                 "is_embedded": True,
                             })
@@ -833,15 +834,15 @@ class PipelineStage123Node(Node):
                     embedded_count = len(embedded),
                 )
 
-                # Record embedded files in embedded_attachment_classification
+                # Record embedded files — blob_path already has procurement/ prefix
                 for emb in embedded:
-                    emb_db_path = f"procurement/{emb['blob_path']}"
-                    self._upsert_embedded_classification(tgt_cs, parent_pk, att_id, emb_db_path)
+                    self._upsert_embedded_classification(tgt_cs, parent_pk, att_id, emb["blob_path"])
 
                 all_files.append({
                     "filename":    att["filename"],
                     "content":     att["content"],
-                    "blob_path":   f"{safe_pr}/{att_id}/{att['filename']}",
+                    # Include procurement/ prefix so upload path == DB path
+                    "blob_path":   f"procurement/{safe_pr}/{att_id}/{att['filename']}",
                     "att_id":      att_id,
                     "is_embedded": False,
                 })
