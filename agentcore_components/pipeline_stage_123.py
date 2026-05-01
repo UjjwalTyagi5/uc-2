@@ -401,12 +401,12 @@ class PipelineStage123Node(Node):
         except Exception as exc:
             return f"[Extraction error: {exc}]"
 
-    def _upload_blob(self, filename: str, raw: bytes, pr_no: str) -> str:
+    def _upload_blob(self, filename: str, raw: bytes, pr_no: str, att_id: str) -> str:
         from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
         cfg        = self._blob_cfg()
         safe_pr_no = pr_no.replace("/", "_")
-        blob_name  = f"{safe_pr_no}/{filename}"
+        blob_name  = f"{safe_pr_no}/{att_id}/{filename}"
         credential = DefaultAzureCredential(
             exclude_environment_credential=True,
             exclude_interactive_browser_credential=True,
@@ -540,7 +540,7 @@ class PipelineStage123Node(Node):
             self.log(f"[{pr_no}] Stage 2 — {len(file_data)} file(s) extracted")
 
             for fd in file_data:
-                fd["blob"] = self._upload_blob(fd["filename"], fd["raw"], pr_no)
+                fd["blob"] = self._upload_blob(fd["filename"], fd["raw"], pr_no, fd["attachment_id"])
 
             # Stage 3 — BLOB_UPLOAD
             current_stage = _STAGE_BLOB_UPLOAD
