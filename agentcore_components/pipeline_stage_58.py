@@ -1035,26 +1035,21 @@ def _load_document(file_bytes: bytes, filename: str, max_pages: int = 20) -> Doc
 
 
 def _load_pdf_for_extract(file_bytes: bytes, max_pages: int) -> DocumentContent:
-    import io, base64
+    """Render every page as a 200-dpi image — matches original pipeline behaviour.
+    PDFs are always sent to the LLM as vision (images), never as extracted text,
+    because scanned/mixed PDFs lose critical layout/table information when OCR'd."""
+    import base64
     try:
         import fitz
-        doc   = fitz.open(stream=file_bytes, filetype="pdf")
-        total = len(doc)
-        n     = min(total, max_pages)
-        text_pages: list[str] = []
-        images:     list[str] = []
+        doc    = fitz.open(stream=file_bytes, filetype="pdf")
+        total  = len(doc)
+        n      = min(total, max_pages)
+        images = []
         for i in range(n):
-            page = doc[i]
-            t    = page.get_text("text").strip()
-            if len(t) >= 50:
-                text_pages.append(f"[Page {i+1}]\n{t}")
-                pix = page.get_pixmap(dpi=72)
-            else:
-                pix = page.get_pixmap(dpi=150)
+            pix = doc[i].get_pixmap(dpi=200)
             images.append(base64.b64encode(pix.tobytes("png")).decode())
         doc.close()
-        text = "\n\n".join(text_pages) if text_pages else None
-        return DocumentContent(text=text, images=images, page_count=n)
+        return DocumentContent(images=images, page_count=n)
     except Exception as exc:
         return DocumentContent(text=f"[PDF error: {exc}]", page_count=0)
 
@@ -1353,13 +1348,12 @@ def _call_extraction_llm(llm, ctx: RASContext, doc: DocumentContent, prompts: di
     sys_prompt  = (prompts or {}).get("ext_system", EXTRACTION_SYSTEM_PROMPT)
     messages: list = [SystemMessage(content=sys_prompt)]
     if doc.is_image_based and doc.images:
-        img_detail = "low" if doc.text else "high"
         images = doc.images[:50]
         content_parts: list = [{"type": "text", "text": user_prompt}]
         for b64 in images:
             content_parts.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}", "detail": img_detail},
+                "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
             })
         messages.append(HumanMessage(content=content_parts))
     else:
