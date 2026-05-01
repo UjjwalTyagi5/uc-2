@@ -1895,6 +1895,14 @@ class PipelineStage4567Node(Node):
 
     inputs = [
         HandleInput(
+            name="stage123_result",
+            display_name="Stage 1-3 Result (trigger)",
+            input_types=["Message"],
+            required=False,
+            info="Wire the Sync Status output of the Stage 1-3 component here. "
+                 "This is not read — it only ensures Stage 4-8 starts AFTER Stage 1-3 finishes.",
+        ),
+        HandleInput(
             name="target_connection",
             display_name="Target DB — Azure SQL",
             input_types=["Data"],
