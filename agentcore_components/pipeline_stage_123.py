@@ -580,6 +580,12 @@ class PipelineStage123Node(Node):
             else:
                 self.log(f"[{pr_no}] Warning — Pinecone index/namespace not configured; {len(pinecone_uuids)} stale vector(s) NOT deleted")
 
+        # Delete the PR's entire blob folder (non-fatal — DB cleanup still runs)
+        try:
+            self._delete_blob_folder(pr_no)
+        except Exception as exc:
+            self.log(f"[{pr_no}] Warning — Azure Blob folder cleanup failed (non-fatal): {exc}")
+
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
         try:
@@ -858,7 +864,31 @@ class PipelineStage123Node(Node):
         finally:
             tgt_conn.close()
 
-    # ── Blob upload ───────────────────────────────────────────────────────
+    # ── Blob helpers ──────────────────────────────────────────────────────
+
+    def _delete_blob_folder(self, pr_no: str) -> None:
+        """Delete every blob under procurement/{pr_no}/ in Azure Blob Storage."""
+        from azure.identity import DefaultAzureCredential
+        from azure.storage.blob import BlobServiceClient
+        cfg        = self._blob_cfg()
+        credential = DefaultAzureCredential(
+            exclude_environment_credential=True,
+            exclude_interactive_browser_credential=True,
+        )
+        safe_pr = pr_no.replace("/", "_")
+        prefix  = f"procurement/{safe_pr}/"
+        container_client = BlobServiceClient(
+            account_url=cfg["account_url"],
+            credential=credential,
+        ).get_container_client(cfg["container_name"])
+        blobs = [b.name for b in container_client.list_blobs(name_starts_with=prefix)]
+        if not blobs:
+            return
+        # delete_blobs accepts up to 256 names per call
+        _BATCH = 256
+        for i in range(0, len(blobs), _BATCH):
+            container_client.delete_blobs(*blobs[i : i + _BATCH])
+        self.log(f"[{pr_no}] Deleted {len(blobs)} blob(s) from {prefix}")
 
     def _upload_blob(self, raw: bytes, blob_path: str) -> None:
         from azure.identity import DefaultAzureCredential
