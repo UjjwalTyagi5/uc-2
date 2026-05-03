@@ -2083,76 +2083,82 @@ def _record_exception(tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) ->
 # ── Embeddings + benchmark (Stage 6-7) ────────────────────────────────────────
 
 def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str) -> None:
+    # Structural errors (import, DB connect, index creation) propagate — caller records exception.
+    from agentcore.services.pinecone_service_client import ensure_index_via_service, ingest_via_service
+    ensure_index_via_service(index_name=pinecone_index, dimension=1536, metric="cosine")
+    conn = _connect(tgt_cs)
+    cur  = conn.cursor()
     try:
-        from agentcore.services.pinecone_service_client import ensure_index_via_service, ingest_via_service
-        ensure_index_via_service(index_name=pinecone_index, dimension=1536, metric="cosine")
-        conn = _connect(tgt_cs)
-        cur  = conn.cursor()
+        cur.execute("""
+            SELECT qi.[extracted_item_uuid_pk], qi.[item_description], qi.[item_name],
+                   qi.[attachment_classify_fk], qi.[purchase_dtl_id]
+              FROM [ras_procurement].[quotation_extracted_items] qi
+              JOIN [ras_procurement].[attachment_classification] ac
+                ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+              JOIN [ras_procurement].[ras_tracker] rt
+                ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+             WHERE rt.[purchase_req_no] = ?
+               AND qi.[doc_type] = 'Quotation'
+        """, pr_no)
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        item_uuid, desc, name, classify_fk, dtl_id = row
+        content = f"{name or ''} {desc or ''}".strip()[:8000]
+        if not content: continue
         try:
-            cur.execute("""
-                SELECT qi.[extracted_item_uuid_pk], qi.[item_description], qi.[item_name],
-                       qi.[attachment_classify_fk], qi.[purchase_dtl_id]
-                  FROM [ras_procurement].[quotation_extracted_items] qi
-                  JOIN [ras_procurement].[attachment_classification] ac
-                    ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
-                  JOIN [ras_procurement].[ras_tracker] rt
-                    ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
-                 WHERE rt.[purchase_req_no] = ?
-                   AND qi.[doc_type] = 'Quotation'
-            """, pr_no)
-            rows = cur.fetchall()
-        finally:
-            conn.close()
-        for row in rows:
-            item_uuid, desc, name, classify_fk, dtl_id = row
-            content = f"{name or ''} {desc or ''}".strip()[:8000]
-            if not content: continue
             embedding = embed_model.embed_query(content)
             ingest_via_service(
                 index_name=pinecone_index, namespace=pinecone_ns,
                 vectors=[{"id": str(item_uuid), "values": embedding,
                           "metadata": {"purchase_req_no": pr_no, "purchase_dtl_id": str(dtl_id or "")}}],
             )
-    except Exception as exc:
-        logger.warning(f"[{pr_no}] Embeddings stage failed: {exc}")
+        except Exception as exc:
+            logger.warning(f"[{pr_no}] Embedding failed for item {item_uuid}: {exc}")
 
 
 def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str, top_k: int) -> None:
+    # Structural errors (import, DB connect, query) propagate — caller records exception.
+    from agentcore.services.pinecone_service_client import search_via_service
+    from langchain_core.messages import HumanMessage
+    conn = _connect(tgt_cs)
+    cur  = conn.cursor()
     try:
-        from agentcore.services.pinecone_service_client import search_via_service
-        from langchain_core.messages import HumanMessage
-        conn = _connect(tgt_cs)
-        cur  = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id],
-                       qi.[item_name], qi.[item_description],
-                       qi.[unit_price], qi.[quantity]
-                  FROM [ras_procurement].[quotation_extracted_items] qi
-                  JOIN [ras_procurement].[attachment_classification] ac
-                    ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
-                  JOIN [ras_procurement].[ras_tracker] rt
-                    ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
-                 WHERE rt.[purchase_req_no] = ?
-                   AND qi.[is_selected_quote] = 1
-                   AND qi.[purchase_dtl_id] IS NOT NULL
-            """, pr_no)
-            items = cur.fetchall()
-        finally:
-            conn.close()
+        cur.execute("""
+            SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id],
+                   qi.[item_name], qi.[item_description],
+                   qi.[unit_price], qi.[quantity]
+              FROM [ras_procurement].[quotation_extracted_items] qi
+              JOIN [ras_procurement].[attachment_classification] ac
+                ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+              JOIN [ras_procurement].[ras_tracker] rt
+                ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+             WHERE rt.[purchase_req_no] = ?
+               AND qi.[is_selected_quote] = 1
+               AND qi.[purchase_dtl_id] IS NOT NULL
+        """, pr_no)
+        items = cur.fetchall()
+    finally:
+        conn.close()
 
-        conn2 = _connect(tgt_cs)
-        cur2  = conn2.cursor()
+    conn2 = _connect(tgt_cs)
+    cur2  = conn2.cursor()
+    try:
         for row in items:
             item_uuid, dtl_id, name, desc, unit_price, qty = row
             item_text = f"{name or ''} {desc or ''}".strip()
             if not item_text: continue
-            embedding = embed_model.embed_query(item_text[:500])
-            similar = search_via_service(
-                index_name=pinecone_index, namespace=pinecone_ns,
-                vector=embedding, top_k=top_k,
-                filter={"purchase_req_no": {"$ne": pr_no}},
-            )
+            try:
+                embedding = embed_model.embed_query(item_text[:500])
+                similar = search_via_service(
+                    index_name=pinecone_index, namespace=pinecone_ns,
+                    vector=embedding, top_k=top_k,
+                    filter={"purchase_req_no": {"$ne": pr_no}},
+                )
+            except Exception as exc:
+                logger.warning(f"[{pr_no}] Benchmark similarity failed dtl_id={dtl_id}: {exc}")
+                continue
             if not similar: continue
             bench_prompt = (
                 f"Recommend a benchmark unit price for this item based on historical similar purchases.\n"
@@ -2190,9 +2196,12 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
             except Exception as exc:
                 logger.warning(f"Benchmark write failed dtl_id={dtl_id}: {exc}")
         conn2.commit()
+    except Exception:
+        try: conn2.rollback()
+        except Exception: pass
+        raise
+    finally:
         conn2.close()
-    except Exception as exc:
-        logger.warning(f"[{pr_no}] Benchmark stage failed: {exc}")
 
 
 # ── Fetch pending PRs ──────────────────────────────────────────────────────────
