@@ -1847,6 +1847,77 @@ def _select_best_quotes(all_items: list, ctx: RASContext) -> None:
         max(candidates, key=_score)["is_selected_quote"] = True
 
 
+# ── Currency conversion helper ─────────────────────────────────────────────────
+
+_EUR_CUR_ID      = 3
+_RATE_IS_MULTIPLY = True
+
+
+def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) -> "Decimal | None":
+    """Return amount converted to EUR using EXCHANGE_RATE table.
+
+    Returns None if amount is None or conversion data is unavailable.
+    """
+    if amount is None:
+        return None
+    try:
+        from decimal import Decimal as _Dec
+        amount_dec = _Dec(str(amount))
+    except Exception:
+        return None
+    if not currency_code:
+        return None
+    try:
+        import re as _re
+        from datetime import date as _date_cls, datetime as _dt_cls
+        if isinstance(ref_date, _date_cls):
+            date_val = ref_date
+        elif ref_date:
+            m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", str(ref_date))
+            if m:
+                date_val = _date_cls(int(m[1]), int(m[2]), int(m[3]))
+            else:
+                date_val = _dt_cls.utcnow().date()
+        else:
+            from datetime import datetime as _dt_cls2
+            date_val = _dt_cls2.utcnow().date()
+        conn = _connect(tgt_cs)
+        try:
+            cur = conn.cursor()
+            # look up source currency id
+            cur.execute(
+                "SELECT [CUR_ID] FROM [ras_procurement].[currency_mst] "
+                "WHERE UPPER([CURRENCY_CODE]) = UPPER(?)",
+                currency_code,
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            src_cur_id = row[0]
+            if src_cur_id == _EUR_CUR_ID:
+                return amount_dec
+            # look up exchange rate valid for ref_date
+            cur.execute(
+                "SELECT TOP 1 [CONVERSION_RATE] "
+                "FROM [ras_procurement].[EXCHANGE_RATE] "
+                "WHERE [FROM_CUR_ID] = ? AND [TO_CUR_ID] = ? "
+                "  AND [STATUS_ID] = 10 "
+                "  AND [EFFECTIVE_FROM_DATE] <= ? AND [EFFECTIVE_TO_DATE] >= ? "
+                "ORDER BY [EFFECTIVE_FROM_DATE] DESC",
+                src_cur_id, _EUR_CUR_ID, date_val, date_val,
+            )
+            rate_row = cur.fetchone()
+            if rate_row is None:
+                return None
+            from decimal import Decimal as _Dec2
+            rate = _Dec2(str(rate_row[0]))
+            return amount_dec * rate if _RATE_IS_MULTIPLY else amount_dec / rate
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
 # ── DB writer: extracted items ─────────────────────────────────────────────────
 
 def _save_extracted_items(tgt_cs: str, items: list) -> int:
@@ -1878,6 +1949,8 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
                     if m: return date_cls(int(m[1]), int(m[2]), int(m[3]))
                 except Exception: pass
                 return None
+            unit_price_eur  = _convert_to_eur(tgt_cs, item.get("unit_price"),  item.get("currency"), item.get("quotation_date"))
+            total_price_eur = _convert_to_eur(tgt_cs, item.get("total_price"), item.get("currency"), item.get("quotation_date"))
             cur.execute("""
                 INSERT INTO [ras_procurement].[quotation_extracted_items] (
                     [attachment_classify_fk],[embedded_classify_fk],[purchase_dtl_id],
@@ -1890,9 +1963,10 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
                     [delivery_date],[delivery_time_days],
                     [item_level_1],[item_level_2],[item_level_3],[item_level_4],
                     [item_level_5],[item_level_6],[item_level_7],[item_level_8],
-                    [commodity_tag],[item_summary]
+                    [commodity_tag],[item_summary],
+                    [unit_price_eur],[total_price_eur]
                 ) VALUES (
-                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
             """,
                 _v("attachment_classify_fk"), _v("embedded_classify_fk"),
@@ -1907,6 +1981,7 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
                 _v("item_level_1"), _v("item_level_2"), _v("item_level_3"), _v("item_level_4"),
                 _v("item_level_5"), _v("item_level_6"), _v("item_level_7"), _v("item_level_8"),
                 _v("commodity_tag"), _v("item_summary"),
+                unit_price_eur, total_price_eur,
             )
             saved += 1
         conn.commit()
