@@ -531,15 +531,19 @@ class PipelineStage123Node(Node):
     # ── Pre-run cleanup ───────────────────────────────────────────────────
 
     def _cleanup_for_pr(self, tgt_cs: str, pr_no: str) -> None:
+        """Delete all prior pipeline output for a PR — runs only if the PR already
+        exists in ras_tracker (i.e. it has been processed before). New PRs are
+        skipped entirely so their data is never touched."""
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
         cur.execute("SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker] WHERE purchase_req_no = ?", pr_no)
         existing = cur.fetchone()
         conn.close()
         if existing is None:
-            self.log(f"[{pr_no}] New PR — no prior data to clean")
+            # Brand-new PR — nothing to clean, proceed straight to Stage 1.
+            self.log(f"[{pr_no}] New PR — skipping cleanup")
             return
-        self.log(f"[{pr_no}] Existing PR — cleaning prior pipeline output")
+        self.log(f"[{pr_no}] Existing PR detected — cleaning prior data before reprocessing")
 
         # Collect existing Pinecone vector UUIDs BEFORE deleting from DB
         pinecone_uuids: list[str] = []
@@ -911,7 +915,9 @@ class PipelineStage123Node(Node):
         current_stage = _STAGE_INGESTION
         work_dir      = tempfile.mkdtemp()
         try:
-            # Pre-run cleanup (no-op for new PRs)
+            # ── Cleanup at start — only for PRs that already have prior data ──
+            # Checks ras_tracker: new PR → skipped; existing/retried PR → blobs +
+            # Pinecone vectors + quotation_extracted_items + benchmark_result deleted.
             self._cleanup_for_pr(tgt_cs, pr_no)
 
             # Stage 1 — INGESTION
@@ -1055,9 +1061,11 @@ class PipelineStage123Node(Node):
             return msg
 
         if pr_filter:
-            self._cleanup_for_pr(tgt_cs, pr_filter)
+            # Reset tracker from exception/any stage back to NULL so _process_pr
+            # picks it up cleanly. Actual data cleanup (blobs, Pinecone, DB tables)
+            # happens inside _process_pr at the start via _cleanup_for_pr.
             self._reset_for_reprocess(tgt_cs, pr_filter)
-            self.log(f"Single-PR reprocess: {pr_filter!r} — all existing pipeline data wiped")
+            self.log(f"Single-PR reprocess: {pr_filter!r} — tracker reset, cleanup will run at processing start")
 
         self.log(f"Processing {len(pr_list)} PR(s)…")
 
