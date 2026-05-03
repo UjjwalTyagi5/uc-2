@@ -2085,7 +2085,7 @@ def _record_exception(tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) ->
 def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str) -> None:
     # Structural errors (import, DB connect, index creation) propagate — caller records exception.
     from agentcore.services.pinecone_service_client import ensure_index_via_service, ingest_via_service
-    ensure_index_via_service(index_name=pinecone_index, dimension=1536, metric="cosine")
+    ensure_index_via_service(index_name=pinecone_index, embedding_dimension=1536)
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
@@ -2110,9 +2110,17 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
         try:
             embedding = embed_model.embed_query(content)
             ingest_via_service(
-                index_name=pinecone_index, namespace=pinecone_ns,
-                vectors=[{"id": str(item_uuid), "values": embedding,
-                          "metadata": {"purchase_req_no": pr_no, "purchase_dtl_id": str(dtl_id or "")}}],
+                index_name=pinecone_index,
+                namespace=pinecone_ns,
+                text_key="content",
+                documents=[{
+                    "content": content,
+                    "purchase_req_no": pr_no,
+                    "purchase_dtl_id": str(dtl_id or ""),
+                }],
+                embedding_vectors=[embedding],
+                vector_ids=[str(item_uuid)],
+                embedding_dimension=1536,
             )
         except Exception as exc:
             logger.warning(f"[{pr_no}] Embedding failed for item {item_uuid}: {exc}")
@@ -2151,11 +2159,24 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
             if not item_text: continue
             try:
                 embedding = embed_model.embed_query(item_text[:500])
-                similar = search_via_service(
-                    index_name=pinecone_index, namespace=pinecone_ns,
-                    vector=embedding, top_k=top_k,
-                    filter={"purchase_req_no": {"$ne": pr_no}},
+                raw_similar = search_via_service(
+                    index_name=pinecone_index,
+                    namespace=pinecone_ns,
+                    text_key="content",
+                    query=item_text[:500],
+                    query_embedding=embedding,
+                    number_of_results=top_k,
                 )
+                # normalise to list — service may return list or {"results": [...]}
+                if isinstance(raw_similar, list):
+                    similar = raw_similar
+                elif isinstance(raw_similar, dict):
+                    similar = raw_similar.get("results", raw_similar.get("matches", []))
+                else:
+                    similar = []
+                # exclude vectors from the same PR (no server-side filter in sync API)
+                similar = [s for s in similar
+                           if (s.get("metadata") or {}).get("purchase_req_no") != pr_no]
             except Exception as exc:
                 logger.warning(f"[{pr_no}] Benchmark similarity failed dtl_id={dtl_id}: {exc}")
                 continue
