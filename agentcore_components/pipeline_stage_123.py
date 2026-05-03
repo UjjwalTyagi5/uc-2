@@ -440,6 +440,20 @@ class PipelineStage123Node(Node):
                 "Enter one PURCHASE_REQ_NO to force a full reprocess from scratch."
             ),
         ),
+        MessageTextInput(
+            name="pinecone_index",
+            display_name="Pinecone Index Name (for retry cleanup)",
+            value="ras-quotations",
+            advanced=True,
+            info="Pinecone index used by Stage 4-8. Old embedding vectors are deleted here on PR retry.",
+        ),
+        MessageTextInput(
+            name="pinecone_namespace",
+            display_name="Pinecone Namespace (for retry cleanup)",
+            value="procurement",
+            advanced=True,
+            info="Pinecone namespace used by Stage 4-8. Old embedding vectors are deleted here on PR retry.",
+        ),
         IntInput(name="batch_limit",       display_name="Max PRs per Run",          value=50,    advanced=True),
         IntInput(name="parallel_workers",  display_name="Parallel Workers",          value=4,     advanced=True),
         IntInput(name="max_content_chars", display_name="Max Characters per File",   value=80000, advanced=True),
@@ -526,6 +540,46 @@ class PipelineStage123Node(Node):
             self.log(f"[{pr_no}] New PR — no prior data to clean")
             return
         self.log(f"[{pr_no}] Existing PR — cleaning prior pipeline output")
+
+        # Collect existing Pinecone vector UUIDs BEFORE deleting from DB
+        pinecone_uuids: list[str] = []
+        try:
+            conn_uuid = self._connect(tgt_cs)
+            cur_uuid  = conn_uuid.cursor()
+            try:
+                cur_uuid.execute("""
+                    SELECT qi.[extracted_item_uuid_pk]
+                      FROM [ras_procurement].[quotation_extracted_items] qi
+                      JOIN [ras_procurement].[attachment_classification] ac
+                        ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+                      JOIN [ras_procurement].[ras_tracker] rt
+                        ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+                     WHERE rt.[purchase_req_no] = ?
+                """, pr_no)
+                pinecone_uuids = [str(r[0]) for r in cur_uuid.fetchall()]
+            finally:
+                conn_uuid.close()
+        except Exception as exc:
+            self.log(f"[{pr_no}] Warning — could not collect Pinecone vector IDs: {exc}")
+
+        # Delete stale vectors from Pinecone (non-fatal — DB cleanup still runs)
+        if pinecone_uuids:
+            pinecone_index = (getattr(self, "pinecone_index", None) or "").strip()
+            pinecone_ns    = (getattr(self, "pinecone_namespace", None) or "").strip()
+            if pinecone_index and pinecone_ns:
+                try:
+                    from agentcore.services.pinecone_service_client import delete_vectors_via_service
+                    delete_vectors_via_service(
+                        index_name=pinecone_index,
+                        namespace=pinecone_ns,
+                        vector_ids=pinecone_uuids,
+                    )
+                    self.log(f"[{pr_no}] Deleted {len(pinecone_uuids)} stale Pinecone vector(s)")
+                except Exception as exc:
+                    self.log(f"[{pr_no}] Warning — Pinecone vector cleanup failed (non-fatal): {exc}")
+            else:
+                self.log(f"[{pr_no}] Warning — Pinecone index/namespace not configured; {len(pinecone_uuids)} stale vector(s) NOT deleted")
+
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
         try:
