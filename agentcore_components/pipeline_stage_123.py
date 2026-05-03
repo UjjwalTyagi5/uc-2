@@ -545,55 +545,24 @@ class PipelineStage123Node(Node):
             return
         self.log(f"[{pr_no}] Existing PR detected — cleaning prior data before reprocessing")
 
-        # Collect existing Pinecone vector UUIDs BEFORE deleting from DB
-        pinecone_uuids: list[str] = []
-        try:
-            conn_uuid = self._connect(tgt_cs)
-            cur_uuid  = conn_uuid.cursor()
-            try:
-                cur_uuid.execute("""
-                    SELECT qi.[extracted_item_uuid_pk]
-                      FROM [ras_procurement].[quotation_extracted_items] qi
-                      JOIN [ras_procurement].[attachment_classification] ac
-                        ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
-                      JOIN [ras_procurement].[ras_tracker] rt
-                        ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
-                     WHERE rt.[purchase_req_no] = ?
-                """, pr_no)
-                pinecone_uuids = [str(r[0]) for r in cur_uuid.fetchall()]
-            finally:
-                conn_uuid.close()
-        except Exception as exc:
-            self.log(f"[{pr_no}] Warning — could not collect Pinecone vector IDs: {exc}")
-
-        # Delete stale vectors from Pinecone (non-fatal — DB cleanup still runs)
-        if pinecone_uuids:
-            pinecone_index = (getattr(self, "pinecone_index", None) or "").strip()
-            pinecone_ns    = (getattr(self, "pinecone_namespace", None) or "").strip()
-            if pinecone_index and pinecone_ns:
-                try:
-                    from agentcore.services.pinecone_service_client import delete_vectors_via_service
-                    delete_vectors_via_service(
-                        index_name=pinecone_index,
-                        namespace=pinecone_ns,
-                        vector_ids=pinecone_uuids,
-                    )
-                    self.log(f"[{pr_no}] Deleted {len(pinecone_uuids)} stale Pinecone vector(s)")
-                except Exception as exc:
-                    self.log(f"[{pr_no}] Warning — Pinecone vector cleanup failed (non-fatal): {exc}")
-            else:
-                self.log(f"[{pr_no}] Warning — Pinecone index/namespace not configured; {len(pinecone_uuids)} stale vector(s) NOT deleted")
-
-        # Delete the PR's entire blob folder (non-fatal — DB cleanup still runs)
-        try:
-            self._delete_blob_folder(pr_no)
-        except Exception as exc:
-            self.log(f"[{pr_no}] Warning — Azure Blob folder cleanup failed (non-fatal): {exc}")
-
+        # Single connection for all DB cleanup work (collect UUIDs + delete tables)
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
+        pinecone_uuids: list[str] = []
         try:
-            # 1. Null FK back-references in benchmark_result before deleting rows it points to
+            # Collect Pinecone vector UUIDs FIRST, before deleting quotation_extracted_items
+            cur.execute("""
+                SELECT qi.[extracted_item_uuid_pk]
+                  FROM [ras_procurement].[quotation_extracted_items] qi
+                  JOIN [ras_procurement].[attachment_classification] ac
+                    ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+                  JOIN [ras_procurement].[ras_tracker] rt
+                    ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+                 WHERE rt.[purchase_req_no] = ?
+            """, pr_no)
+            pinecone_uuids = [str(r[0]) for r in cur.fetchall()]
+
+            # 1. Null FK back-references in benchmark_result
             cur.execute("""
                 UPDATE br SET br.low_hist_item_fk = NULL
                   FROM [ras_procurement].[benchmark_result] br
@@ -621,7 +590,7 @@ class PipelineStage123Node(Node):
                   JOIN [ras_procurement].[attachment_classification] ac ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
                   JOIN [ras_procurement].[ras_tracker] rt ON ac.ras_uuid_pk = rt.ras_uuid_pk
                  WHERE rt.purchase_req_no = ?""", pr_no)
-            # 4. embedded_attachment_classification (child of attachment_classification)
+            # 4. embedded_attachment_classification
             cur.execute("""
                 DELETE ec FROM [ras_procurement].[embedded_attachment_classification] ec
                   JOIN [ras_procurement].[attachment_classification] ac ON ec.attachment_classification_id = ac.attachment_classify_uuid_pk
@@ -632,25 +601,49 @@ class PipelineStage123Node(Node):
                 DELETE ac FROM [ras_procurement].[attachment_classification] ac
                   JOIN [ras_procurement].[ras_tracker] rt ON ac.ras_uuid_pk = rt.ras_uuid_pk
                  WHERE rt.purchase_req_no = ?""", pr_no)
-            # 6. BI dashboard rows for this PR
+            # 6. BI dashboard rows
             cur.execute("""
                 DELETE FROM [ras_procurement].[vw_get_ras_data_for_bidashboard]
                  WHERE [PURCHASE_REQ_NO] = ?""", pr_no)
-            # 7. Exception records for this PR
+            # 7. Exception records
             cur.execute("""
                 DELETE FROM [ras_procurement].[ras_pipeline_exceptions]
                  WHERE ras_tracker_id = (
                      SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker]
                       WHERE purchase_req_no = ?)""", pr_no)
-            # 8. Any remaining data handled by the SP (e.g. other linked tables)
+            # 8. Any remaining data via SP
             cur.execute("EXEC [ras_procurement].[usp_cleanup_pr_data] ?", pr_no)
             conn.commit()
-            self.log(f"[{pr_no}] Cleanup complete — all pipeline tables cleared")
         except Exception as exc:
             conn.rollback()
             raise RuntimeError(f"Pre-run cleanup failed for {pr_no}: {exc}") from exc
         finally:
             conn.close()
+
+        # Delete stale Pinecone vectors (non-fatal)
+        if pinecone_uuids:
+            pinecone_index = (getattr(self, "pinecone_index", None) or "").strip()
+            pinecone_ns    = (getattr(self, "pinecone_namespace", None) or "").strip()
+            if pinecone_index and pinecone_ns:
+                try:
+                    from agentcore.services.pinecone_service_client import delete_vectors_via_service
+                    delete_vectors_via_service(
+                        index_name=pinecone_index, namespace=pinecone_ns,
+                        vector_ids=pinecone_uuids,
+                    )
+                    self.log(f"[{pr_no}] Deleted {len(pinecone_uuids)} stale Pinecone vector(s)")
+                except Exception as exc:
+                    self.log(f"[{pr_no}] Warning — Pinecone cleanup failed (non-fatal): {exc}")
+            else:
+                self.log(f"[{pr_no}] Warning — Pinecone not configured; {len(pinecone_uuids)} vector(s) NOT deleted")
+
+        # Delete Azure Blob folder (non-fatal)
+        try:
+            self._delete_blob_folder(pr_no)
+        except Exception as exc:
+            self.log(f"[{pr_no}] Warning — Blob folder cleanup failed (non-fatal): {exc}")
+
+        self.log(f"[{pr_no}] Cleanup complete — all pipeline tables cleared")
 
     def _reset_for_reprocess(self, tgt_cs: str, pr_no: str) -> None:
         conn = self._connect(tgt_cs)
@@ -895,42 +888,37 @@ class PipelineStage123Node(Node):
 
     # ── Blob helpers ──────────────────────────────────────────────────────
 
+    def _container_client(self):
+        """Return a cached ContainerClient — credential is initialised once per component instance."""
+        if not hasattr(self, "_container_client_cache"):
+            from azure.identity import DefaultAzureCredential
+            from azure.storage.blob import BlobServiceClient
+            cfg        = self._blob_cfg()
+            credential = DefaultAzureCredential(
+                exclude_environment_credential=True,
+                exclude_interactive_browser_credential=True,
+            )
+            self._container_client_cache = BlobServiceClient(
+                account_url=cfg["account_url"],
+                credential=credential,
+            ).get_container_client(cfg["container_name"])
+        return self._container_client_cache
+
     def _delete_blob_folder(self, pr_no: str) -> None:
         """Delete every blob under procurement/{pr_no}/ in Azure Blob Storage."""
-        from azure.identity import DefaultAzureCredential
-        from azure.storage.blob import BlobServiceClient
-        cfg        = self._blob_cfg()
-        credential = DefaultAzureCredential(
-            exclude_environment_credential=True,
-            exclude_interactive_browser_credential=True,
-        )
         safe_pr = pr_no.replace("/", "_")
         prefix  = f"procurement/{safe_pr}/"
-        container_client = BlobServiceClient(
-            account_url=cfg["account_url"],
-            credential=credential,
-        ).get_container_client(cfg["container_name"])
-        blobs = [b.name for b in container_client.list_blobs(name_starts_with=prefix)]
+        cc      = self._container_client()
+        blobs   = [b.name for b in cc.list_blobs(name_starts_with=prefix)]
         if not blobs:
             return
-        # delete_blobs accepts up to 256 names per call
         _BATCH = 256
         for i in range(0, len(blobs), _BATCH):
-            container_client.delete_blobs(*blobs[i : i + _BATCH])
+            cc.delete_blobs(*blobs[i : i + _BATCH])
         self.log(f"[{pr_no}] Deleted {len(blobs)} blob(s) from {prefix}")
 
     def _upload_blob(self, raw: bytes, blob_path: str) -> None:
-        from azure.identity import DefaultAzureCredential
-        from azure.storage.blob import BlobServiceClient
-        cfg        = self._blob_cfg()
-        credential = DefaultAzureCredential(
-            exclude_environment_credential=True,
-            exclude_interactive_browser_credential=True,
-        )
-        BlobServiceClient(
-            account_url=cfg["account_url"],
-            credential=credential,
-        ).get_blob_client(container=cfg["container_name"], blob=blob_path).upload_blob(raw, overwrite=True)
+        self._container_client().get_blob_client(blob_path).upload_blob(raw, overwrite=True)
 
     # ── Process single PR ─────────────────────────────────────────────────
 
