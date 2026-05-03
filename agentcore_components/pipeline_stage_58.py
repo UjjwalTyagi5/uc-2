@@ -2085,7 +2085,7 @@ def _record_exception(tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) ->
 def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str) -> None:
     # Structural errors (import, DB connect, index creation) propagate — caller records exception.
     from agentcore.services.pinecone_service_client import ensure_index_via_service, ingest_via_service
-    ensure_index_via_service(index_name=pinecone_index, embedding_dimension=1536)
+    ensure_index_via_service(index_name=pinecone_index, embedding_dimension=3072)
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
@@ -2120,7 +2120,7 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
                 }],
                 embedding_vectors=[embedding],
                 vector_ids=[str(item_uuid)],
-                embedding_dimension=1536,
+                embedding_dimension=3072,
             )
         except Exception as exc:
             logger.warning(f"[{pr_no}] Embedding failed for item {item_uuid}: {exc}")
