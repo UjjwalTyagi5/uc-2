@@ -750,6 +750,60 @@ class PipelineStage123Node(Node):
         except Exception as exc:
             return f"[Extraction error: {exc}]"
 
+    # ── BI dashboard sync ─────────────────────────────────────────────────
+
+    def _sync_bi_dashboard(self, src_cs: str, tgt_cs: str, pr_no: str) -> None:
+        """Refresh the BI dashboard row for this PR.
+
+        Reads from on-prem view [dbo].[vw_get_ras_data_for_bidashboard],
+        deletes the old Azure row, inserts fresh data.
+        Non-fatal — caller wraps in try/except.
+        """
+        import pyodbc
+        # ── 1. read from on-prem ──────────────────────────────────────
+        src_conn = self._connect(src_cs)
+        try:
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT * FROM [dbo].[vw_get_ras_data_for_bidashboard] "
+                "WHERE [PURCHASE_REQ_NO] = ?",
+                pr_no,
+            )
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows    = cur.fetchall()
+        finally:
+            src_conn.close()
+
+        # ── 2. delete old + insert fresh in Azure ─────────────────────
+        tgt_conn = self._connect(tgt_cs)
+        try:
+            tc = tgt_conn.cursor()
+            tc.execute(
+                "DELETE FROM [ras_procurement].[vw_get_ras_data_for_bidashboard] "
+                "WHERE [PURCHASE_REQ_NO] = ?",
+                pr_no,
+            )
+            deleted = tc.rowcount
+            if rows and columns:
+                col_list     = ", ".join(f"[{c}]" for c in columns)
+                placeholders = ", ".join(["?"] * len(columns))
+                ins_sql = (
+                    f"INSERT INTO [ras_procurement].[vw_get_ras_data_for_bidashboard] "
+                    f"({col_list}) VALUES ({placeholders})"
+                )
+                tc.fast_executemany = True
+                tc.executemany(ins_sql, [list(r) for r in rows])
+            tgt_conn.commit()
+            self.log(
+                f"[{pr_no}] BI dashboard synced — "
+                f"deleted {deleted}, inserted {len(rows)} row(s)"
+            )
+        except Exception:
+            tgt_conn.rollback()
+            raise
+        finally:
+            tgt_conn.close()
+
     # ── Blob upload ───────────────────────────────────────────────────────
 
     def _upload_blob(self, raw: bytes, blob_path: str) -> None:
@@ -783,6 +837,14 @@ class PipelineStage123Node(Node):
 
             ras_uuid    = self._get_tracker_uuid(tgt_cs, pr_no)
             attachments = self._fetch_attachments(src_cs, tgt_cs, pr_no)
+
+            # BI dashboard sync: read on-prem view → refresh Azure row.
+            # Non-fatal — log and continue if it fails.
+            try:
+                self._sync_bi_dashboard(src_cs, tgt_cs, pr_no)
+            except Exception as _bi_exc:
+                self.log(f"[{pr_no}] Warning — BI dashboard sync failed (non-fatal): {_bi_exc}")
+
             if not attachments:
                 self.log(f"[{pr_no}] No attachments — skipping")
                 result["status"] = "skipped"
