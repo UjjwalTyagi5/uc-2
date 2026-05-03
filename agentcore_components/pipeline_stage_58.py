@@ -2098,7 +2098,7 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
               JOIN [ras_procurement].[ras_tracker] rt
                 ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
              WHERE rt.[purchase_req_no] = ?
-               AND qi.[doc_type] = 'Quotation'
+               AND ac.[doc_type] = 'Quotation'
         """, pr_no)
         rows = cur.fetchall()
     finally:
