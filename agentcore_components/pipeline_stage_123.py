@@ -593,6 +593,7 @@ class PipelineStage123Node(Node):
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
         try:
+            # 1. Null FK back-references in benchmark_result before deleting rows it points to
             cur.execute("""
                 UPDATE br SET br.low_hist_item_fk = NULL
                   FROM [ras_procurement].[benchmark_result] br
@@ -607,20 +608,44 @@ class PipelineStage123Node(Node):
                   JOIN [ras_procurement].[attachment_classification] ac ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
                   JOIN [ras_procurement].[ras_tracker] rt ON ac.ras_uuid_pk = rt.ras_uuid_pk
                  WHERE rt.purchase_req_no = ?""", pr_no)
+            # 2. benchmark_result
             cur.execute("""
                 DELETE br FROM [ras_procurement].[benchmark_result] br
                   JOIN [ras_procurement].[quotation_extracted_items] qi ON br.extracted_item_uuid_fk = qi.extracted_item_uuid_pk
                   JOIN [ras_procurement].[attachment_classification] ac ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
                   JOIN [ras_procurement].[ras_tracker] rt ON ac.ras_uuid_pk = rt.ras_uuid_pk
                  WHERE rt.purchase_req_no = ?""", pr_no)
+            # 3. quotation_extracted_items
             cur.execute("""
                 DELETE qi FROM [ras_procurement].[quotation_extracted_items] qi
                   JOIN [ras_procurement].[attachment_classification] ac ON qi.attachment_classify_fk = ac.attachment_classify_uuid_pk
                   JOIN [ras_procurement].[ras_tracker] rt ON ac.ras_uuid_pk = rt.ras_uuid_pk
                  WHERE rt.purchase_req_no = ?""", pr_no)
+            # 4. embedded_attachment_classification (child of attachment_classification)
+            cur.execute("""
+                DELETE ec FROM [ras_procurement].[embedded_attachment_classification] ec
+                  JOIN [ras_procurement].[attachment_classification] ac ON ec.attachment_classification_id = ac.attachment_classify_uuid_pk
+                  JOIN [ras_procurement].[ras_tracker] rt ON ac.ras_uuid_pk = rt.ras_uuid_pk
+                 WHERE rt.purchase_req_no = ?""", pr_no)
+            # 5. attachment_classification
+            cur.execute("""
+                DELETE ac FROM [ras_procurement].[attachment_classification] ac
+                  JOIN [ras_procurement].[ras_tracker] rt ON ac.ras_uuid_pk = rt.ras_uuid_pk
+                 WHERE rt.purchase_req_no = ?""", pr_no)
+            # 6. BI dashboard rows for this PR
+            cur.execute("""
+                DELETE FROM [ras_procurement].[vw_get_ras_data_for_bidashboard]
+                 WHERE [PURCHASE_REQ_NO] = ?""", pr_no)
+            # 7. Exception records for this PR
+            cur.execute("""
+                DELETE FROM [ras_procurement].[ras_pipeline_exceptions]
+                 WHERE ras_tracker_id = (
+                     SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker]
+                      WHERE purchase_req_no = ?)""", pr_no)
+            # 8. Any remaining data handled by the SP (e.g. other linked tables)
             cur.execute("EXEC [ras_procurement].[usp_cleanup_pr_data] ?", pr_no)
             conn.commit()
-            self.log(f"[{pr_no}] Cleanup complete")
+            self.log(f"[{pr_no}] Cleanup complete — all pipeline tables cleared")
         except Exception as exc:
             conn.rollback()
             raise RuntimeError(f"Pre-run cleanup failed for {pr_no}: {exc}") from exc
