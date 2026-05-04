@@ -1892,6 +1892,7 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
             )
             row = cur.fetchone()
             if row is None:
+                logger.warning(f"Currency conversion: no currency_mst row for code={currency_code!r}")
                 return None
             src_cur_id = row[0]
             if src_cur_id == _EUR_CUR_ID:
@@ -1908,13 +1909,18 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
             )
             rate_row = cur.fetchone()
             if rate_row is None:
+                logger.warning(
+                    f"Currency conversion: no EXCHANGE_RATE row for "
+                    f"FROM_CUR_ID={src_cur_id} TO_CUR_ID={_EUR_CUR_ID} date={date_val} STATUS_ID=10"
+                )
                 return None
             from decimal import Decimal as _Dec2
             rate = _Dec2(str(rate_row[0]))
             return amount_dec * rate if _RATE_IS_MULTIPLY else amount_dec / rate
         finally:
             conn.close()
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"Currency conversion failed currency={currency_code!r} date={ref_date}: {exc}")
         return None
 
 
@@ -2112,9 +2118,9 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
             ingest_via_service(
                 index_name=pinecone_index,
                 namespace=pinecone_ns,
-                text_key="content",
+                text_key="page_content",
                 documents=[{
-                    "content": content,
+                    "page_content": content,
                     "purchase_req_no": pr_no,
                     "purchase_dtl_id": str(dtl_id or ""),
                 }],
@@ -2209,11 +2215,14 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                     USING (SELECT ? AS purchase_dtl_id) AS src
                        ON target.purchase_dtl_id = src.purchase_dtl_id
                     WHEN MATCHED THEN
-                        UPDATE SET bp_unit_price=?, bp_total_price=?, summary=?, updated_at=SYSUTCDATETIME()
+                        UPDATE SET extracted_item_uuid_fk=?, bp_unit_price=?, bp_total_price=?,
+                                   summary=?, updated_at=SYSUTCDATETIME()
                     WHEN NOT MATCHED THEN
-                        INSERT (purchase_dtl_id, bp_unit_price, bp_total_price, summary)
-                        VALUES (?, ?, ?, ?);
-                """, dtl_id, bp_dec, bp_total, summary, dtl_id, bp_dec, bp_total, summary)
+                        INSERT (purchase_dtl_id, extracted_item_uuid_fk, bp_unit_price, bp_total_price, summary)
+                        VALUES (?, ?, ?, ?, ?);
+                """, dtl_id,
+                     item_uuid, bp_dec, bp_total, summary,
+                     dtl_id, item_uuid, bp_dec, bp_total, summary)
             except Exception as exc:
                 logger.warning(f"Benchmark write failed dtl_id={dtl_id}: {exc}")
         conn2.commit()
