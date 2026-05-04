@@ -561,6 +561,7 @@ class PipelineStage123Node(Node):
                  WHERE rt.[purchase_req_no] = ?
             """, pr_no)
             pinecone_uuids = [str(r[0]) for r in cur.fetchall()]
+            self.log(f"[{pr_no}] Pinecone cleanup: found {len(pinecone_uuids)} vector UUID(s) in DB for this PR")
 
             # 1. Null FK back-references in benchmark_result
             cur.execute("""
@@ -627,15 +628,28 @@ class PipelineStage123Node(Node):
             if pinecone_index and pinecone_ns:
                 try:
                     from agentcore.services.pinecone_service_client import delete_vectors_via_service
+                    preview = pinecone_uuids[:5]
+                    more    = len(pinecone_uuids) - 5
+                    self.log(
+                        f"[{pr_no}] Sending {len(pinecone_uuids)} UUID(s) to Pinecone delete "
+                        f"(index={pinecone_index!r}, namespace={pinecone_ns!r}) — "
+                        f"first 5: {preview}" + (f" … +{more} more" if more > 0 else "")
+                    )
                     delete_vectors_via_service(
                         index_name=pinecone_index, namespace=pinecone_ns,
                         vector_ids=pinecone_uuids,
                     )
-                    self.log(f"[{pr_no}] Deleted {len(pinecone_uuids)} stale Pinecone vector(s)")
+                    self.log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_uuids)} vector(s) removed")
                 except Exception as exc:
                     self.log(f"[{pr_no}] Warning — Pinecone cleanup failed (non-fatal): {exc}")
             else:
-                self.log(f"[{pr_no}] Warning — Pinecone not configured; {len(pinecone_uuids)} vector(s) NOT deleted")
+                self.log(
+                    f"[{pr_no}] Warning — pinecone_index or pinecone_namespace not set; "
+                    f"{len(pinecone_uuids)} vector(s) were NOT deleted from Pinecone. "
+                    f"Check the 'Pinecone Index' and 'Pinecone Namespace' inputs on the component."
+                )
+        else:
+            self.log(f"[{pr_no}] No Pinecone vector UUIDs found in DB for this PR — skipping Pinecone delete")
 
         # Delete Azure Blob folder (non-fatal)
         try:
