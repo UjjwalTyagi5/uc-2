@@ -4269,11 +4269,23 @@ class PipelineStage123Node(Node):
                     f"============================================================\n\n"
                 )
 
+        # Summary log — one line per status bucket
+        status_counts: dict[str, int] = {}
+        for r in results:
+            s = r.get("status", "failed")
+            status_counts[s] = status_counts.get(s, 0) + 1
+        summary_parts = [f"{v} {k}" for k, v in sorted(status_counts.items())]
+        self.log(f"Run complete — {len(results)} PR(s): {', '.join(summary_parts)}")
+        for r in results:
+            if r.get("error"):
+                self.log(f"  [{r['pr_no']}] {r['status']}: {r['error']}")
+
         batch_text = "".join(parts) if parts else "[No files extracted]"
         msg = Message(text=batch_text)
         self._cached_result = msg
         self._cached_pr_numbers = [
-            r["pr_no"] for r in results if r.get("status") in ("success", "skipped")
+            r["pr_no"] for r in results
+            if r.get("status") in ("complete", "success", "skipped")
         ]
         return msg
 
