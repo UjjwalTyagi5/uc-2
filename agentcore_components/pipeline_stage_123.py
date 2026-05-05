@@ -961,6 +961,7 @@ class PipelineStage123Node(Node):
         result        = {"pr_no": pr_no, "files": [], "status": "failed", "error": ""}
         current_stage = _STAGE_INGESTION
         work_dir      = tempfile.mkdtemp()
+        self.log(f"[{pr_no}] Worker started")
         try:
             # ── Cleanup at start — only for PRs that already have prior data ──
             # Checks ras_tracker: new PR → skipped; existing/retried PR → blobs +
@@ -1114,11 +1115,18 @@ class PipelineStage123Node(Node):
             self._reset_for_reprocess(tgt_cs, pr_filter)
             self.log(f"Single-PR reprocess: {pr_filter!r} — tracker reset, cleanup will run at processing start")
 
-        self.log(f"Processing {len(pr_list)} PR(s)…")
+        workers = max(1, int(self.parallel_workers))
+        self.log(f"Processing {len(pr_list)} PR(s) with {workers} parallel worker(s)…")
+
+        # Pre-warm shared caches before threads start so all workers reuse the
+        # same already-initialised ContainerClient / blob config rather than
+        # each racing to create their own copy.
+        self._blob_cfg()
+        self._container_client()
 
         import concurrent.futures
         results: list[dict] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=int(self.parallel_workers)) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(self._process_pr, pr, src_cs, tgt_cs): pr for pr in pr_list}
             for f in concurrent.futures.as_completed(futures):
                 results.append(f.result())
