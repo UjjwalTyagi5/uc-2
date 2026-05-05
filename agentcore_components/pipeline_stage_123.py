@@ -4014,11 +4014,19 @@ class PipelineStage123Node(Node):
             result["status"] = "complete"
 
         except Exception as exc:
+            stage_name = {
+                _STAGE_CLASSIFICATION:  "Stage 4 (Classification)",
+                _STAGE_EXTRACTION:      "Stage 5 (Extraction)",
+                _STAGE_EMBEDDINGS:      "Stage 6 (Embeddings)",
+                _STAGE_PRICE_BENCHMARK: "Stage 7 (Benchmark)",
+                _STAGE_COMPLETE:        "Stage 8 (Complete)",
+            }.get(current_stage, f"Stage {current_stage}")
             logger.opt(exception=True).error(
-                "[{}] Stage 4-8 failed at stage {}: {}", pr_no, current_stage, exc
+                "[{}] {} failed: {}", pr_no, stage_name, exc
             )
-            result["error"] = str(exc)
-            self._record_exception(tgt_cs, pr_no, current_stage, str(exc))
+            result["status"] = "failed_stages_48"
+            result["error"]  = f"{stage_name}: {exc}"
+            self._record_exception(tgt_cs, pr_no, current_stage, f"{stage_name}: {exc}")
 
     # ── Process single PR ─────────────────────────────────────────────────
 
@@ -4030,9 +4038,22 @@ class PipelineStage123Node(Node):
         self.log(f"[{pr_no}] Worker started")
         try:
             # ── Cleanup at start — only for PRs that already have prior data ──
-            # Checks ras_tracker: new PR → skipped; existing/retried PR → blobs +
+            # Checked before stage 1: new PR → skipped; existing PR → blobs +
             # Pinecone vectors + quotation_extracted_items + benchmark_result deleted.
-            self._cleanup_for_pr(tgt_cs, pr_no)
+            # Explicit handling so cleanup failures are recorded with a clear message
+            # before any stage tracker row exists.
+            try:
+                self._cleanup_for_pr(tgt_cs, pr_no)
+            except Exception as cleanup_exc:
+                logger.opt(exception=True).error(
+                    "[{}] Pre-run cleanup failed — aborting PR: {}", pr_no, cleanup_exc
+                )
+                self._record_exception(
+                    tgt_cs, pr_no, _STAGE_INGESTION,
+                    f"PRE_RUN_CLEANUP failed: {cleanup_exc}",
+                )
+                result["error"] = str(cleanup_exc)
+                return result
 
             # Stage 1 — INGESTION
             current_stage = _STAGE_INGESTION
@@ -4058,63 +4079,74 @@ class PipelineStage123Node(Node):
             extractor = FileExtractor()
             all_files = []   # dicts: filename, content, blob_path, att_id, is_embedded
 
+            failed_atts: list[str] = []
             for att in attachments:
                 att_id   = att["attachment_id"]
                 att_dir  = os.path.join(work_dir, att_id)
                 emb_dir  = os.path.join(att_dir, "extracted")
-                os.makedirs(att_dir, exist_ok=True)
-                os.makedirs(emb_dir,  exist_ok=True)
+                try:
+                    os.makedirs(att_dir, exist_ok=True)
+                    os.makedirs(emb_dir,  exist_ok=True)
 
-                # Save parent file to temp disk so FileExtractor can open it
-                parent_path = os.path.join(att_dir, att["filename"])
-                with open(parent_path, "wb") as fh:
-                    fh.write(att["content"])
+                    # Save parent file to temp disk so FileExtractor can open it
+                    parent_path = os.path.join(att_dir, att["filename"])
+                    with open(parent_path, "wb") as fh:
+                        fh.write(att["content"])
 
-                # Run embedded extraction
-                extractor.parent_prefix = os.path.splitext(att["filename"])[0]
-                extractor.process_file(parent_path, emb_dir)
+                    # Run embedded extraction
+                    extractor.parent_prefix = os.path.splitext(att["filename"])[0]
+                    extractor.process_file(parent_path, emb_dir)
 
-                # Collect embedded file contents
-                embedded = []
-                if os.path.isdir(emb_dir):
-                    for emb_name in sorted(os.listdir(emb_dir)):
-                        emb_path = os.path.join(emb_dir, emb_name)
-                        if os.path.isfile(emb_path):
-                            with open(emb_path, "rb") as fh:
-                                emb_content = fh.read()
-                            embedded.append({
-                                "filename":    emb_name,
-                                "content":     emb_content,
-                                # Include procurement/ prefix so upload path == DB path
-                                "blob_path":   f"procurement/{safe_pr}/{att_id}/extracted/{emb_name}",
-                                "att_id":      att_id,
-                                "is_embedded": True,
-                            })
+                    # Collect embedded file contents
+                    embedded = []
+                    if os.path.isdir(emb_dir):
+                        for emb_name in sorted(os.listdir(emb_dir)):
+                            emb_path = os.path.join(emb_dir, emb_name)
+                            if os.path.isfile(emb_path):
+                                with open(emb_path, "rb") as fh:
+                                    emb_content = fh.read()
+                                embedded.append({
+                                    "filename":    emb_name,
+                                    "content":     emb_content,
+                                    "blob_path":   f"procurement/{safe_pr}/{att_id}/extracted/{emb_name}",
+                                    "att_id":      att_id,
+                                    "is_embedded": True,
+                                })
 
-                # Record parent in attachment_classification
-                parent_blob_path = f"procurement/{safe_pr}/{att_id}/{att['filename']}"
-                parent_pk = self._upsert_parent_classification(
-                    tgt_cs, pr_no, ras_uuid, att_id,
-                    parent_blob_path,
-                    embedded_flag  = len(embedded) > 0,
-                    embedded_count = len(embedded),
-                )
+                    # Record parent in attachment_classification
+                    parent_blob_path = f"procurement/{safe_pr}/{att_id}/{att['filename']}"
+                    parent_pk = self._upsert_parent_classification(
+                        tgt_cs, pr_no, ras_uuid, att_id,
+                        parent_blob_path,
+                        embedded_flag  = len(embedded) > 0,
+                        embedded_count = len(embedded),
+                    )
 
-                # Record embedded files — blob_path already has procurement/ prefix
-                for emb in embedded:
-                    self._upsert_embedded_classification(tgt_cs, parent_pk, att_id, emb["blob_path"])
+                    # Record embedded files
+                    for emb in embedded:
+                        self._upsert_embedded_classification(tgt_cs, parent_pk, att_id, emb["blob_path"])
 
-                all_files.append({
-                    "filename":    att["filename"],
-                    "content":     att["content"],
-                    # Include procurement/ prefix so upload path == DB path
-                    "blob_path":   f"procurement/{safe_pr}/{att_id}/{att['filename']}",
-                    "att_id":      att_id,
-                    "is_embedded": False,
-                })
-                all_files.extend(embedded)
+                    all_files.append({
+                        "filename":    att["filename"],
+                        "content":     att["content"],
+                        "blob_path":   f"procurement/{safe_pr}/{att_id}/{att['filename']}",
+                        "att_id":      att_id,
+                        "is_embedded": False,
+                    })
+                    all_files.extend(embedded)
+                    self.log(f"[{pr_no}] [{att_id}] {att['filename']} — {len(embedded)} embedded file(s) extracted")
 
-                self.log(f"[{pr_no}] [{att_id}] {att['filename']} — {len(embedded)} embedded file(s) extracted")
+                except Exception as att_exc:
+                    # Log and continue — one bad attachment must not block the whole PR.
+                    # The attachment is excluded from further processing but the PR continues.
+                    logger.opt(exception=True).error(
+                        "[{}] Attachment {} ({}) failed during ingestion — skipping: {}",
+                        pr_no, att_id, att.get("filename", "?"), att_exc,
+                    )
+                    failed_atts.append(f"{att_id}({att.get('filename','?')}): {att_exc}")
+
+            if failed_atts:
+                self.log(f"[{pr_no}] {len(failed_atts)} attachment(s) skipped due to errors: {'; '.join(failed_atts)}")
 
             # Stage 2 — EMBED_DOC_EXTRACTION
             current_stage = _STAGE_EMBED_DOC
@@ -4155,9 +4187,16 @@ class PipelineStage123Node(Node):
             self._run_stages_48(pr_no, tgt_cs, result, self._build_prompts())
 
         except Exception as exc:
-            logger.opt(exception=True).error("[{}] Stage 1-3 failed at stage {}: {}", pr_no, current_stage, exc)
-            result["error"] = str(exc)
-            self._record_exception(tgt_cs, pr_no, current_stage, str(exc))
+            stage_name = {
+                _STAGE_INGESTION:   "Stage 1 (Ingestion)",
+                _STAGE_EMBED_DOC:   "Stage 2 (Embed Doc Extraction)",
+                _STAGE_BLOB_UPLOAD: "Stage 3 (Blob Upload)",
+            }.get(current_stage, f"Stage {current_stage}")
+            logger.opt(exception=True).error(
+                "[{}] {} failed: {}", pr_no, stage_name, exc
+            )
+            result["error"] = f"{stage_name}: {exc}"
+            self._record_exception(tgt_cs, pr_no, current_stage, f"{stage_name}: {exc}")
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
         return result
