@@ -1710,7 +1710,7 @@ def _parse_extraction_response(raw: str, source: dict, ctx: RASContext) -> list:
         "supplier_match_conf": float(match_conf),
         "attachment_classify_fk": source["attachment_classify_fk"],
         "embedded_classify_fk":   source["embedded_classify_fk"],
-        "is_selected_quote":      False,
+        "is_selected_quote":      0,
         "quote_rank":             None,
     }
 
@@ -1797,7 +1797,7 @@ def _align_to_ras_line_items(items: list, ctx: RASContext, source: dict) -> list
             "attachment_classify_fk": source["attachment_classify_fk"],
             "embedded_classify_fk":   source["embedded_classify_fk"],
             "purchase_dtl_id":        li.purchase_dtl_id,
-            "is_selected_quote":      False,
+            "is_selected_quote":      0,
             "supplier_match_conf":    0.0,
             "quote_rank":             None,
             "supplier_name":          donor.get("supplier_name"),
@@ -1834,7 +1834,7 @@ def _compute_quote_ranks(all_items: list) -> None:
 def _select_best_quotes(all_items: list, ctx: RASContext) -> None:
     from collections import defaultdict
     for item in all_items:
-        item["is_selected_quote"] = False
+        item["is_selected_quote"] = 0
     ras_by_dtl = {li.purchase_dtl_id: li for li in ctx.line_items}
     by_dtl: dict = defaultdict(list)
     for item in all_items:
@@ -1862,7 +1862,7 @@ def _select_best_quotes(all_items: list, ctx: RASContext) -> None:
             )
             has_price = int(it.get("unit_price") is not None)
             return (conf, price_fit, has_price)
-        max(candidates, key=_score)["is_selected_quote"] = True
+        max(candidates, key=_score)["is_selected_quote"] = 1
 
 
 # ── Currency conversion helper ─────────────────────────────────────────────────
@@ -2234,7 +2234,7 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
                 )
             """,
                 _v("attachment_classify_fk"), _v("embedded_classify_fk"),
-                _v("purchase_dtl_id", int), bool(item.get("is_selected_quote")),
+                _v("purchase_dtl_id", int), int(item.get("is_selected_quote") or 0),
                 _d("supplier_match_conf"), _v("quote_rank", int),
                 _v("supplier_name"), _v("supplier_address"), _v("supplier_country"),
                 _v("quotation_ref_no"), _date("quotation_date"), _v("currency"),
