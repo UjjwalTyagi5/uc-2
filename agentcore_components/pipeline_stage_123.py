@@ -434,10 +434,11 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 _MAX_CLASSIFY_CHARS = 12000   # ~3500 tokens for GPT-4o
 
 _EXT_TO_TYPE = {
-    ".xlsx": "excel",  ".xls": "excel",  ".csv": "csv",
+    ".xlsx": "excel",  ".xls": "excel",  ".xlsm": "excel",  ".xlsb": "excel",  ".csv": "csv",
     ".pdf":  "pdf",    ".docx": "word",  ".doc": "legacy_doc",
     ".pptx": "pptx",  ".ppt":  "legacy_doc",
     ".txt":  "text",   ".html": "html",  ".htm": "html",
+    ".xml":  "text",   ".json": "text",  ".eml": "text",
     ".png":  "image",  ".jpg":  "image", ".jpeg": "image",
     ".tiff": "image",  ".tif":  "image", ".bmp":  "image",
     ".msg":  "msg",
@@ -1686,59 +1687,94 @@ def _build_ras_context(tgt_cs: str, pr_no: str) -> Optional[RASContext]:
 # ── Document loader for extraction ─────────────────────────────────────────────
 
 def _load_document(file_bytes: bytes, filename: str, max_pages: int = 20) -> DocumentContent:
-    import io, os
+    import os
     ext = os.path.splitext(filename.lower())[1]
-    if ext == ".pdf":        return _load_pdf_for_extract(file_bytes, max_pages)
-    if ext in (".xlsx", ".xls"): return _load_spreadsheet_for_extract(file_bytes, ext)
-    if ext == ".docx":       return _load_docx_for_extract(file_bytes)
-    if ext == ".doc":        return _load_doc_legacy_for_extract(file_bytes, max_pages)
-    if ext in (".pptx", ".ppt"): return _load_pptx_for_extract(file_bytes, max_pages)
-    if ext in _IMAGE_EXTS:   return _load_image_for_extract(file_bytes, ext)
-    if ext in (".txt", ".csv"): return DocumentContent(
-        text=file_bytes.decode("utf-8", errors="replace")[:50000], page_count=1
-    )
-    if ext == ".msg":        return _load_msg_for_extract(file_bytes)
-    # Fallback: fitz render
+    if ext == ".pdf":                                  return _load_pdf_for_extract(file_bytes, max_pages)
+    if ext in (".xlsx", ".xls", ".xlsm", ".xlsb"):    return _load_spreadsheet_for_extract(file_bytes, ext)
+    if ext == ".docx":                                 return _load_docx_for_extract(file_bytes)
+    if ext == ".doc":                                  return _load_doc_legacy_for_extract(file_bytes, max_pages)
+    if ext in (".pptx", ".ppt"):                       return _load_pptx_for_extract(file_bytes, max_pages)
+    if ext in _IMAGE_EXTS:                             return _load_image_for_extract(file_bytes, ext)
+    if ext in (".txt", ".csv", ".xml", ".json", ".eml"):
+        return DocumentContent(text=file_bytes.decode("utf-8", errors="replace")[:50000], page_count=1)
+    if ext in (".html", ".htm"):                       return _load_html_for_extract(file_bytes)
+    if ext == ".msg":                                  return _load_msg_for_extract(file_bytes)
+    # Fallback: fitz render (handles most office formats via PyMuPDF)
     return _fitz_render_for_extract(file_bytes, max_pages)
 
 
 def _load_pdf_for_extract(file_bytes: bytes, max_pages: int) -> DocumentContent:
-    """Render every page as a 200-dpi image — matches original pipeline behaviour.
-    PDFs are always sent to the LLM as vision (images), never as extracted text,
-    because scanned/mixed PDFs lose critical layout/table information when OCR'd."""
+    """Hybrid PDF loader (matches doc-intel branch non-OCR strategy).
+
+    Digital page (≥50 extracted chars): captured as text + 72 DPI image for layout context.
+    Scanned page (<50 chars): captured as 150 DPI image only.
+    Returns both text and images so the extraction LLM has full context without Azure Doc Intel.
+    """
     import base64
+    _SCANNED_THRESHOLD = 50
     try:
         import fitz
-        doc    = fitz.open(stream=file_bytes, filetype="pdf")
-        total  = len(doc)
-        n      = min(total, max_pages)
-        images = []
-        for i in range(n):
-            pix = doc[i].get_pixmap(dpi=200)
+        doc        = fitz.open(stream=file_bytes, filetype="pdf")
+        page_count = len(doc)
+        total      = min(page_count, max_pages)
+        text_pages: list[str] = []
+        images:     list[str] = []
+        text_count = scanned_count = 0
+
+        for i in range(total):
+            page      = doc[i]
+            page_text = page.get_text("text").strip()
+            if len(page_text) >= _SCANNED_THRESHOLD:
+                # Digital page — extract text; low-res image preserves layout context
+                text_pages.append(f"[Page {i + 1}]\n{page_text}")
+                text_count   += 1
+                pix = page.get_pixmap(dpi=72)
+            else:
+                # Scanned/image page — high-res render is the only usable content
+                scanned_count += 1
+                pix = page.get_pixmap(dpi=150)
             images.append(base64.b64encode(pix.tobytes("png")).decode())
+
         doc.close()
-        return DocumentContent(images=images, page_count=n)
+        logger.debug(
+            "PDF loaded: {} page(s) — {} digital (72 DPI text+image), {} scanned (150 DPI image)",
+            total, text_count, scanned_count,
+        )
+        text = "\n\n".join(text_pages) if text_pages else None
+        return DocumentContent(text=text, images=images, page_count=total)
     except Exception as exc:
         return DocumentContent(text=f"[PDF error: {exc}]", page_count=0)
 
 
 def _load_spreadsheet_for_extract(file_bytes: bytes, ext: str) -> DocumentContent:
+    """Load Excel workbook as a markdown table string.
+
+    .xlsx / .xlsm — openpyxl (handles macro-enabled workbooks too)
+    .xls           — xlrd (legacy binary format)
+    .xlsb          — openpyxl attempt; falls back to fitz image render
+    """
     import io
     parts: list[str] = []
+
+    def _openpyxl_parts(raw: bytes) -> list[str]:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        result: list[str] = []
+        for ws in wb.worksheets:
+            lines = [f"### Sheet: {ws.title}"]
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(c.strip() for c in cells):
+                    lines.append("| " + " | ".join(cells) + " |")
+            if len(lines) > 1:
+                result.append("\n".join(lines))
+        wb.close()
+        return result
+
     try:
-        if ext == ".xlsx":
-            from openpyxl import load_workbook
-            wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
-            for ws in wb.worksheets:
-                lines = [f"### Sheet: {ws.title}"]
-                for row in ws.iter_rows(values_only=True):
-                    cells = [str(c) if c is not None else "" for c in row]
-                    if any(c.strip() for c in cells):
-                        lines.append("| " + " | ".join(cells) + " |")
-                if len(lines) > 1:
-                    parts.append("\n".join(lines))
-            wb.close()
-        else:
+        if ext in (".xlsx", ".xlsm"):
+            parts = _openpyxl_parts(file_bytes)
+        elif ext == ".xls":
             import xlrd
             wb = xlrd.open_workbook(file_contents=file_bytes)
             for sheet in wb.sheets():
@@ -1749,6 +1785,12 @@ def _load_spreadsheet_for_extract(file_bytes: bytes, ext: str) -> DocumentConten
                         lines.append("| " + " | ".join(cells) + " |")
                 if len(lines) > 1:
                     parts.append("\n".join(lines))
+        else:  # .xlsb — binary Excel; openpyxl may handle it, else render as images
+            try:
+                parts = _openpyxl_parts(file_bytes)
+            except Exception:
+                return _fitz_render_for_extract(file_bytes, 20)
+
         text = "\n\n".join(parts)
         if text.strip():
             return DocumentContent(text=text, page_count=1)
@@ -1858,6 +1900,23 @@ def _load_msg_for_extract(file_bytes: bytes) -> DocumentContent:
         return DocumentContent(text="\n\n".join(parts), page_count=1)
     except Exception as exc:
         return DocumentContent(text=f"[MSG error: {exc}]")
+
+
+def _load_html_for_extract(file_bytes: bytes) -> DocumentContent:
+    """Strip HTML tags and return plain text (BeautifulSoup → regex fallback)."""
+    import re
+    html_str = file_bytes.decode("utf-8", errors="replace")
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_str, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+    except Exception:
+        text = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", html_str, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+    return DocumentContent(text=text[:50000], page_count=1)
 
 
 def _fitz_render_for_extract(file_bytes: bytes, max_pages: int) -> DocumentContent:
