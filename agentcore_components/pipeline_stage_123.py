@@ -1421,6 +1421,46 @@ def _get_prompt_text(msg_input, default: str) -> str:
     return default
 
 
+# ── LLM rate-limit retry helpers ──────────────────────────────────────────────
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Return True for 429 / token-quota / rate-limit errors from any LLM provider."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "429", "rate limit", "rate_limit", "ratelimit",
+        "too many requests", "resource exhausted",
+        "quota exceeded", "token quota", "tokens exceeded",
+        "insufficient_quota", "token limit exceeded",
+        "requests per minute", "tokens per minute",
+    ))
+
+
+def _call_llm_with_retry(llm, messages: list, prompts: dict | None = None):
+    """Invoke the LLM with automatic retry + cooldown on rate-limit / token-quota errors.
+
+    Retry count and cooldown are read from the prompts dict so they can be set
+    from the controller (llm_max_retries, llm_retry_cooldown keys).
+    Cooldown is progressive: cooldown × (attempt+1) so each retry waits longer.
+    """
+    import time
+    max_retries = int((prompts or {}).get("llm_max_retries",  3))
+    cooldown_s  = int((prompts or {}).get("llm_retry_cooldown", 60))
+    for attempt in range(max_retries + 1):
+        try:
+            return llm.invoke(messages)
+        except Exception as exc:
+            if _is_rate_limit_error(exc) and attempt < max_retries:
+                wait = cooldown_s * (attempt + 1)  # 60s → 120s → 180s
+                logger.warning(
+                    "LLM rate-limit / token-quota (attempt {}/{}) — "
+                    "cooling down {}s before retry: {}",
+                    attempt + 1, max_retries, wait, exc,
+                )
+                time.sleep(wait)
+            else:
+                raise
+
+
 def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None = None) -> tuple:
     """Returns (doc_type: str, confidence: float)."""
     import os
@@ -1464,7 +1504,7 @@ def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None =
             )
             messages = [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
 
-        response = llm.invoke(messages)
+        response = _call_llm_with_retry(llm, messages, prompts)
         raw = (getattr(response, "content", None) or str(response)).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
@@ -2089,7 +2129,7 @@ def _call_extraction_llm(llm, ctx: RASContext, doc: DocumentContent, prompts: di
         messages.append(HumanMessage(content=content_parts))
     else:
         messages.append(HumanMessage(content=user_prompt))
-    response = llm.invoke(messages)
+    response = _call_llm_with_retry(llm, messages, prompts)
     return (getattr(response, "content", None) or str(response)).strip()
 
 
@@ -2707,6 +2747,7 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
 # ── Stage 5: run extraction for a PR ──────────────────────────────────────────
 
 def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict | None = None) -> int:
+    import os
     ctx = _build_ras_context(tgt_cs, pr_no)
     if ctx is None:
         logger.warning(f"[{pr_no}] No RAS context found — skipping extraction")
@@ -2720,9 +2761,13 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
         logger.warning(f"[{pr_no}] No Quotation attachments found — check classification")
         return 0
 
-    all_items: list[dict] = []
-    for src in sources:
-        import os
+    # Each source is: download blob → load doc → LLM extract → parse → align.
+    # This is I/O + LLM bound, so threads give real speedup when a PR has
+    # multiple quotation files. Keep n_workers low (default 1) to avoid
+    # multiplying LLM rate-limit pressure on top of parallel_workers.
+    n_workers = max(1, int((prompts or {}).get("ext_parallel_sources", 1)))
+
+    def _extract_one(src: dict) -> list[dict]:
         blob_path = src["blob_path"]
         filename  = os.path.basename(blob_path)
         try:
@@ -2731,19 +2776,30 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
             raw        = _call_extraction_llm(llm, ctx, doc, prompts)
             items      = _parse_extraction_response(raw, src, ctx)
             items      = _align_to_ras_line_items(items, ctx, src)
-            all_items.extend(items)
             logger.info(f"[{pr_no}] Extracted {len(items)} item(s) from {filename!r}")
+            return items
         except Exception as exc:
             logger.warning(f"[{pr_no}] Extraction failed for {filename!r}: {exc}")
-            continue
+            return []
+
+    if n_workers == 1:
+        all_items: list[dict] = []
+        for src in sources:
+            all_items.extend(_extract_one(src))
+    else:
+        import concurrent.futures
+        logger.info(f"[{pr_no}] Extracting {len(sources)} source(s) with {n_workers} parallel worker(s)")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            results = list(pool.map(_extract_one, sources))
+        all_items = [item for batch in results for item in batch]
 
     if not all_items:
         return 0
 
-    _apply_price_alignment_boost(all_items, ctx, prompts)  # boost conf when prices align with RAS (≤5%)
-    _canonicalize_supplier_names(all_items, ctx, prompts)  # global clustering + RAS-known canonical + recompute conf
-    _compute_quote_ranks(all_items)               # rank uses canonical groups
-    _select_best_quotes(all_items, ctx)           # select winner using refreshed conf
+    _apply_price_alignment_boost(all_items, ctx, prompts)
+    _canonicalize_supplier_names(all_items, ctx, prompts)
+    _compute_quote_ranks(all_items)
+    _select_best_quotes(all_items, ctx)
     saved = _save_extracted_items(tgt_cs, all_items)
     logger.info(f"[{pr_no}] {saved} item(s) written to quotation_extracted_items")
     return saved
@@ -3510,6 +3566,37 @@ class PipelineStage123Node(Node):
             advanced=True,
             info="SequenceMatcher ratio (0.0–1.0) above which two supplier names are merged into one canonical name.",
         ),
+        # ── LLM retry / rate-limit settings ──────────────────────────────────
+        IntInput(
+            name="llm_max_retries",
+            display_name="LLM Max Retries (Rate Limit)",
+            value=3,
+            advanced=True,
+            info="How many times to retry an LLM call after a 429 / token-quota error before failing the stage.",
+        ),
+        IntInput(
+            name="llm_retry_cooldown",
+            display_name="LLM Retry Cooldown (seconds)",
+            value=60,
+            advanced=True,
+            info=(
+                "Seconds to wait before the first retry. Each subsequent retry waits "
+                "cooldown × attempt (60s → 120s → 180s with default 3 retries)."
+            ),
+        ),
+        # ── Extraction parallelism ────────────────────────────────────────────
+        IntInput(
+            name="ext_parallel_sources",
+            display_name="Extraction Parallel Sources (Stage 5)",
+            value=1,
+            advanced=True,
+            info=(
+                "Number of quotation files extracted in parallel for a single PR. "
+                "1 = sequential (safe). Increase to 2-3 to speed up PRs with many "
+                "quotation files, but keep low to avoid multiplying LLM rate-limit "
+                "pressure on top of the parallel_workers setting."
+            ),
+        ),
     ]
 
     outputs = [
@@ -4090,6 +4177,13 @@ class PipelineStage123Node(Node):
             prompts["canonicalize_threshold"] = float(getattr(self, "canonicalize_threshold", None) or "0.82")
         except Exception:
             prompts["canonicalize_threshold"] = _CANONICALIZE_THRESHOLD
+        # ── LLM retry / rate-limit settings ──────────────────────────────────
+        llm_retries = getattr(self, "llm_max_retries", None)
+        if llm_retries is not None: prompts["llm_max_retries"]  = int(llm_retries)
+        llm_cool    = getattr(self, "llm_retry_cooldown", None)
+        if llm_cool is not None:    prompts["llm_retry_cooldown"] = int(llm_cool)
+        ext_par     = getattr(self, "ext_parallel_sources", None)
+        if ext_par is not None:     prompts["ext_parallel_sources"] = int(ext_par)
         return prompts
 
     def _run_stages_48(self, pr_no: str, tgt_cs: str, result: dict, prompts: dict) -> None:
