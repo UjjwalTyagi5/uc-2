@@ -2271,6 +2271,17 @@ def _record_exception(tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) ->
 
 # ── Embeddings + benchmark (Stage 6-7) ────────────────────────────────────────
 
+def _build_embed_text(row_dict: dict) -> str:
+    """Build the 12-field embedding text (identical order used by doc intel branch)."""
+    _FIELDS = [
+        "item_name", "item_description", "item_summary",
+        "item_level_1", "item_level_2", "item_level_3", "item_level_4",
+        "item_level_5", "item_level_6", "item_level_7", "item_level_8",
+        "commodity_tag",
+    ]
+    return " | ".join(str(row_dict[f]) for f in _FIELDS if row_dict.get(f))
+
+
 def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str) -> None:
     # Structural errors (import, DB connect, index creation) propagate — caller records exception.
     from agentcore.services.pinecone_service_client import ensure_index_via_service, ingest_via_service
@@ -2283,12 +2294,15 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
                    qi.[item_name], qi.[item_description], qi.[item_summary],
                    qi.[item_level_1], qi.[item_level_2], qi.[item_level_3],
                    qi.[item_level_4], qi.[item_level_5], qi.[item_level_6],
-                   qi.[item_level_7], qi.[item_level_8], qi.[commodity_tag]
+                   qi.[item_level_7], qi.[item_level_8], qi.[commodity_tag],
+                   prd.[C_DATETIME] AS [item_created_date]
               FROM [ras_procurement].[quotation_extracted_items] qi
               JOIN [ras_procurement].[attachment_classification] ac
                 ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
               JOIN [ras_procurement].[ras_tracker] rt
                 ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+              LEFT JOIN [ras_procurement].[purchase_req_detail] prd
+                ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
              WHERE rt.[purchase_req_no] = ?
                AND qi.[is_selected_quote] = 1
                AND qi.[purchase_dtl_id] IS NOT NULL
@@ -2306,27 +2320,22 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
     rows = list(seen_dtl.values())
     logger.info(f"[{pr_no}] Embedding {len(rows)} selected item(s) (deduped from {len(all_rows)} is_selected_quote=1 rows)")
 
-    _EMBED_FIELDS_ORDER = [
+    cols = [
+        "extracted_item_uuid_pk", "purchase_dtl_id",
         "item_name", "item_description", "item_summary",
         "item_level_1", "item_level_2", "item_level_3", "item_level_4",
         "item_level_5", "item_level_6", "item_level_7", "item_level_8",
-        "commodity_tag",
+        "commodity_tag", "item_created_date",
     ]
     for row in rows:
-        item_uuid, dtl_id, item_name, item_desc, item_summary, *rest = row
-        levels = rest[:8]
-        commodity_tag = rest[8] if len(rest) > 8 else None
-        field_vals = {
-            "item_name":        item_name,
-            "item_description": item_desc,
-            "item_summary":     item_summary,
-            "item_level_1":     levels[0], "item_level_2": levels[1],
-            "item_level_3":     levels[2], "item_level_4": levels[3],
-            "item_level_5":     levels[4], "item_level_6": levels[5],
-            "item_level_7":     levels[6], "item_level_8": levels[7],
-            "commodity_tag":    commodity_tag,
-        }
-        content = " | ".join(str(field_vals[f]) for f in _EMBED_FIELDS_ORDER if field_vals.get(f))
+        rd = dict(zip(cols, row))
+        dtl_id    = rd["purchase_dtl_id"]
+        item_uuid = rd["extracted_item_uuid_pk"]
+        created   = rd.get("item_created_date")
+        created_iso = (
+            created.isoformat() if created and hasattr(created, "isoformat") else str(created or "")
+        )
+        content = _build_embed_text(rd)
         if not content:
             continue
         try:
@@ -2334,21 +2343,127 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
             ingest_via_service(
                 index_name=pinecone_index,
                 namespace=pinecone_ns,
-                text_key="page_content",
+                text_key="text",
                 documents=[{
-                    "page_content":     content,
-                    "purchase_req_no":  pr_no,
-                    "purchase_dtl_id":  str(dtl_id or ""),
-                    "item_name":        str(item_name or ""),
-                    "commodity_tag":    str(commodity_tag or ""),
+                    "text":                   content,
+                    "purchase_req_no":        pr_no,
+                    "purchase_dtl_id":        int(dtl_id),
+                    "extracted_item_uuid_pk": str(item_uuid or ""),
+                    "commodity_tag":          str(rd.get("commodity_tag") or ""),
+                    "item_name":              str(rd.get("item_name") or ""),
+                    "item_created_date":      created_iso,
                 }],
                 embedding_vectors=[embedding],
                 vector_ids=[f"dtl_{dtl_id}"],
                 embedding_dimension=3072,
             )
-            logger.info(f"[{pr_no}] Upserted vector dtl_{dtl_id} (dtl_id={dtl_id})")
+            logger.info(f"[{pr_no}] Upserted vector dtl_{dtl_id} (item_created={created_iso})")
         except Exception as exc:
             logger.warning(f"[{pr_no}] Embedding failed for dtl_id {dtl_id}: {exc}")
+
+
+def _fetch_historical_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
+    """Fetch pricing rows from quotation_extracted_items for a list of purchase_dtl_id values."""
+    if not dtl_ids:
+        return []
+    placeholders = ", ".join(["?"] * len(dtl_ids))
+    sql = f"""
+        SELECT qi.[purchase_dtl_id], qi.[extracted_item_uuid_pk],
+               qi.[unit_price], qi.[total_price], qi.[quantity], qi.[unit],
+               qi.[currency], qi.[quotation_date], qi.[supplier_name], qi.[supplier_country],
+               qi.[unit_price_eur], qi.[total_price_eur],
+               rt.[purchase_req_no]
+          FROM [ras_procurement].[quotation_extracted_items] qi
+          JOIN [ras_procurement].[attachment_classification] ac
+            ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+          JOIN [ras_procurement].[ras_tracker] rt
+            ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+         WHERE qi.[purchase_dtl_id] IN ({placeholders})
+           AND qi.[is_selected_quote] = 1
+    """
+    cols = [
+        "purchase_dtl_id", "extracted_item_uuid_pk",
+        "unit_price", "total_price", "quantity", "unit",
+        "currency", "quotation_date", "supplier_name", "supplier_country",
+        "unit_price_eur", "total_price_eur", "purchase_req_no",
+    ]
+    conn = _connect(tgt_cs)
+    cur  = conn.cursor()
+    try:
+        cur.execute(sql, *dtl_ids)
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _compute_low_last(items: list[dict]) -> tuple:
+    """Return (low_item, last_item) — cheapest EUR price and most recent quotation_date."""
+    def _eur(it: dict):
+        return it.get("unit_price_eur") or it.get("unit_price")
+
+    priced = [it for it in items if _eur(it) is not None]
+    dated  = [it for it in items if it.get("quotation_date") is not None]
+    low_item  = min(priced, key=_eur) if priced else None
+    last_item = max(dated,  key=lambda it: it["quotation_date"]) if dated else None
+    return low_item, last_item
+
+
+def _format_bench_prompt(current: dict, historical: list[dict]) -> str:
+    """Build structured LLM prompt matching doc intel branch style."""
+    eur_unit = current.get("unit_price_eur")
+    raw_price = current.get("unit_price")
+    currency  = current.get("currency") or ""
+    if eur_unit is not None and currency.upper() != "EUR":
+        price_str = f"{eur_unit} EUR  (original: {raw_price} {currency})"
+    elif eur_unit is not None:
+        price_str = f"{eur_unit} EUR"
+    else:
+        price_str = f"{raw_price} {currency}"
+
+    category = " > ".join(
+        str(current[f]) for f in [
+            "item_level_1", "item_level_2", "item_level_3", "item_level_4",
+            "item_level_5", "item_level_6", "item_level_7", "item_level_8",
+        ] if current.get(f)
+    )
+    current_block = "\n".join([
+        f"- Item name        : {current.get('item_name') or 'N/A'}",
+        f"- Description      : {current.get('item_description') or 'N/A'}",
+        f"- Category         : {category or 'N/A'}",
+        f"- Commodity tag    : {current.get('commodity_tag') or 'N/A'}",
+        f"- Quantity         : {current.get('quantity')} {current.get('unit') or ''}",
+        f"- Quoted unit price: {price_str}",
+        f"- Supplier         : {current.get('supplier_name') or 'N/A'}",
+        f"- Quotation date   : {current.get('quotation_date') or 'N/A'}",
+    ])
+
+    if not historical:
+        hist_block = "No historical data available."
+    else:
+        header = "| # | Supplier | Date | Qty | Unit | Unit Price (EUR) | Orig. Currency |"
+        sep    = "|---|----------|------|-----|------|-----------------|----------------|"
+        rows_out = []
+        for i, it in enumerate(historical, 1):
+            eur_p = it.get("unit_price_eur")
+            raw_p = it.get("unit_price")
+            eur_label = str(eur_p) if eur_p is not None else (f"{raw_p} *" if raw_p is not None else "N/A")
+            rows_out.append(
+                f"| {i} | {it.get('supplier_name') or 'N/A'} "
+                f"| {it.get('quotation_date') or 'N/A'} "
+                f"| {it.get('quantity') or 'N/A'} "
+                f"| {it.get('unit') or 'N/A'} "
+                f"| {eur_label} "
+                f"| {it.get('currency') or 'N/A'} |"
+            )
+        hist_block = "\n".join([header, sep] + rows_out)
+
+    return (
+        f"Recommend a benchmark unit price for this item based on historical similar purchases.\n\n"
+        f"CURRENT ITEM:\n{current_block}\n\n"
+        f"HISTORICAL SIMILAR ITEMS:\n{hist_block}\n\n"
+        f"Return ONLY JSON (no markdown): "
+        f'{{ "bp_unit_price": <number in EUR or null>, "summary": "<2-3 sentences>" }}'
+    )
 
 
 def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str, top_k: int) -> None:
@@ -2360,67 +2475,129 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
     try:
         cur.execute("""
             SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id],
-                   qi.[item_name], qi.[item_description],
-                   qi.[unit_price], qi.[quantity]
+                   qi.[item_name], qi.[item_description], qi.[item_summary],
+                   qi.[item_level_1], qi.[item_level_2], qi.[item_level_3],
+                   qi.[item_level_4], qi.[item_level_5], qi.[item_level_6],
+                   qi.[item_level_7], qi.[item_level_8], qi.[commodity_tag],
+                   qi.[unit_price], qi.[total_price], qi.[quantity], qi.[unit],
+                   qi.[currency], qi.[quotation_date], qi.[supplier_name],
+                   qi.[unit_price_eur], qi.[total_price_eur],
+                   prd.[C_DATETIME] AS [item_created_date]
               FROM [ras_procurement].[quotation_extracted_items] qi
               JOIN [ras_procurement].[attachment_classification] ac
                 ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
               JOIN [ras_procurement].[ras_tracker] rt
                 ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+              LEFT JOIN [ras_procurement].[purchase_req_detail] prd
+                ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
              WHERE rt.[purchase_req_no] = ?
                AND qi.[is_selected_quote] = 1
                AND qi.[purchase_dtl_id] IS NOT NULL
         """, pr_no)
-        items = cur.fetchall()
+        all_rows = cur.fetchall()
     finally:
         conn.close()
+
+    bench_cols = [
+        "extracted_item_uuid_pk", "purchase_dtl_id",
+        "item_name", "item_description", "item_summary",
+        "item_level_1", "item_level_2", "item_level_3", "item_level_4",
+        "item_level_5", "item_level_6", "item_level_7", "item_level_8",
+        "commodity_tag",
+        "unit_price", "total_price", "quantity", "unit",
+        "currency", "quotation_date", "supplier_name",
+        "unit_price_eur", "total_price_eur", "item_created_date",
+    ]
+    # deduplicate by purchase_dtl_id
+    seen: dict = {}
+    for row in all_rows:
+        rd = dict(zip(bench_cols, row))
+        dtl_id = rd["purchase_dtl_id"]
+        if dtl_id not in seen:
+            seen[dtl_id] = rd
+    items = list(seen.values())
 
     conn2 = _connect(tgt_cs)
     cur2  = conn2.cursor()
     try:
-        for row in items:
-            item_uuid, dtl_id, name, desc, unit_price, qty = row
-            item_text = f"{name or ''} {desc or ''}".strip()
-            if not item_text: continue
+        for rd in items:
+            dtl_id    = rd["purchase_dtl_id"]
+            item_uuid = str(rd["extracted_item_uuid_pk"] or "")
+            qty       = rd.get("quantity") or Decimal("1")
+
+            # Build the same 12-field text used at embedding time
+            bench_text = _build_embed_text(rd)
+            if not bench_text:
+                continue
+
+            # Item created_date as ISO string for date filtering
+            created = rd.get("item_created_date")
+            created_iso = (
+                created.isoformat() if created and hasattr(created, "isoformat") else str(created or "")
+            )
+
             try:
-                embedding = embed_model.embed_query(item_text[:500])
+                embedding = embed_model.embed_query(bench_text)
                 raw_similar = search_via_service(
                     index_name=pinecone_index,
                     namespace=pinecone_ns,
-                    text_key="content",
-                    query=item_text[:500],
+                    text_key="text",
+                    query=bench_text,
                     query_embedding=embedding,
-                    number_of_results=top_k,
+                    number_of_results=top_k + 5,  # fetch extra to absorb filtered-out
                 )
-                # normalise to list — service may return list or {"results": [...]}
-                if isinstance(raw_similar, list):
-                    similar = raw_similar
-                elif isinstance(raw_similar, dict):
-                    similar = raw_similar.get("results", raw_similar.get("matches", []))
-                else:
-                    similar = []
-                # exclude vectors from the same PR (no server-side filter in sync API)
-                similar = [s for s in similar
-                           if (s.get("metadata") or {}).get("purchase_req_no") != pr_no]
             except Exception as exc:
-                logger.warning(f"[{pr_no}] Benchmark similarity failed dtl_id={dtl_id}: {exc}")
+                logger.warning(f"[{pr_no}] Benchmark similarity search failed dtl_id={dtl_id}: {exc}")
                 continue
-            if not similar: continue
-            bench_prompt = (
-                f"Recommend a benchmark unit price for this item based on historical similar purchases.\n"
-                f"Item: {item_text}\nCurrent unit price: {unit_price}\nQuantity: {qty}\n"
-                f"Historical similar items (top {min(3, len(similar))}):\n"
-                f"{json.dumps(similar[:3], indent=2)}\n\n"
-                f'Return ONLY JSON: {{"bp_unit_price": <number or null>, "summary": "<2-3 sentences>"}}'
+
+            # Normalise response to a list of match dicts
+            if isinstance(raw_similar, list):
+                matches = raw_similar
+            elif isinstance(raw_similar, dict):
+                matches = raw_similar.get("results", raw_similar.get("matches", []))
+            else:
+                matches = []
+
+            # Filter: exclude same PR, and only items created strictly before this item
+            filtered = []
+            for m in matches:
+                meta = m.get("metadata") or {}
+                if meta.get("purchase_req_no") == pr_no:
+                    continue
+                hist_date = meta.get("item_created_date", "")
+                if created_iso and hist_date and hist_date >= created_iso:
+                    continue
+                filtered.append(m)
+
+            similar_dtl_ids_raw = [
+                int(m["metadata"]["purchase_dtl_id"])
+                for m in filtered[:top_k]
+                if m.get("metadata", {}).get("purchase_dtl_id") is not None
+            ]
+            logger.info(
+                f"[{pr_no}] dtl_id={dtl_id}: {len(filtered)} Pinecone match(es) after filter "
+                f"→ dtl_ids={similar_dtl_ids_raw}"
             )
+
+            # Fetch full historical pricing from DB
+            historical = _fetch_historical_for_dtl_ids(tgt_cs, similar_dtl_ids_raw) if similar_dtl_ids_raw else []
+            low_item, last_item = _compute_low_last(historical)
+            low_uuid  = str(low_item["extracted_item_uuid_pk"])  if low_item  else None
+            last_uuid = str(last_item["extracted_item_uuid_pk"]) if last_item else None
+            similar_dtl_ids_json = json.dumps(similar_dtl_ids_raw) if similar_dtl_ids_raw else None
+
+            # LLM benchmark analysis
+            bench_prompt = _format_bench_prompt(rd, historical[:top_k])
+            bout = {}
             try:
                 resp = llm.invoke([HumanMessage(content=bench_prompt)])
                 raw  = (getattr(resp, "content", None) or str(resp)).strip()
                 raw  = re.sub(r"^```(?:json)?\s*", "", raw)
                 raw  = re.sub(r"\s*```$", "", raw)
                 bout = json.loads(raw)
-            except Exception:
-                bout = {}
+            except Exception as exc:
+                logger.warning(f"[{pr_no}] LLM benchmark parse failed dtl_id={dtl_id}: {exc}")
+
             bp_unit = bout.get("bp_unit_price")
             summary = bout.get("summary", "")
             try:
@@ -2428,22 +2605,41 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                 bp_total = round(float(bp_dec) * float(qty or 1), 2) if bp_dec is not None else None
             except Exception:
                 bp_dec = bp_total = None
+
             try:
                 cur2.execute("""
                     MERGE [ras_procurement].[benchmark_result] WITH (HOLDLOCK) AS target
                     USING (SELECT ? AS purchase_dtl_id) AS src
                        ON target.purchase_dtl_id = src.purchase_dtl_id
                     WHEN MATCHED THEN
-                        UPDATE SET extracted_item_uuid_fk=?, bp_unit_price=?, bp_total_price=?,
-                                   summary=?, updated_at=SYSUTCDATETIME()
+                        UPDATE SET
+                            extracted_item_uuid_fk = ?,
+                            bp_unit_price          = ?,
+                            bp_total_price         = ?,
+                            low_hist_item_fk       = ?,
+                            last_hist_item_fk      = ?,
+                            inflation_pct          = NULL,
+                            cpi_inflation_pct      = NULL,
+                            similar_dtl_ids        = ?,
+                            summary                = ?,
+                            updated_at             = SYSUTCDATETIME()
                     WHEN NOT MATCHED THEN
-                        INSERT (purchase_dtl_id, extracted_item_uuid_fk, bp_unit_price, bp_total_price, summary)
-                        VALUES (?, ?, ?, ?, ?);
-                """, dtl_id,
-                     item_uuid, bp_dec, bp_total, summary,
-                     dtl_id, item_uuid, bp_dec, bp_total, summary)
+                        INSERT (
+                            purchase_dtl_id, extracted_item_uuid_fk,
+                            bp_unit_price, bp_total_price,
+                            low_hist_item_fk, last_hist_item_fk,
+                            inflation_pct, cpi_inflation_pct,
+                            similar_dtl_ids, summary
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?);
+                """,
+                    dtl_id,
+                    item_uuid, bp_dec, bp_total, low_uuid, last_uuid, similar_dtl_ids_json, summary,
+                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, similar_dtl_ids_json, summary,
+                )
             except Exception as exc:
-                logger.warning(f"Benchmark write failed dtl_id={dtl_id}: {exc}")
+                logger.warning(f"[{pr_no}] Benchmark write failed dtl_id={dtl_id}: {exc}")
+
         conn2.commit()
     except Exception:
         try: conn2.rollback()
