@@ -1927,35 +1927,48 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
 # ── Supplier name canonicalization (mirrors doc intel Union-Find logic) ────────
 
 def _normalize_currency_code(code_or_name: str | None) -> str | None:
-    """Normalize currency string to ISO-4217 alpha-3 code.
+    """Normalize any currency string to ISO-4217 alpha-3 code using pycountry.
 
-    Priority: symbol map → pycountry alpha_3 exact → pycountry name match → uppercase if 3-char.
-    Gracefully degrades when pycountry is not installed.
+    Handles codes (USD), full names (US Dollar), and partial names via rapidfuzz.
+    No hardcoded map — works for any currency in the ISO-4217 standard.
+    Gracefully degrades to original value when pycountry is not installed.
     """
-    # Defined inside the function so it's always in scope in agentcore's exec context
-    _SYMBOL_MAP: dict = {
-        "₹": "INR", "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY",
-        "₩": "KRW", "₫": "VND", "฿": "THB", "Rp": "IDR", "RM": "MYR",
-        "S$": "SGD", "A$": "AUD", "C$": "CAD", "R": "ZAR",
-    }
     if not code_or_name:
         return code_or_name
     val = code_or_name.strip()
-    if val in _SYMBOL_MAP:
-        return _SYMBOL_MAP[val]
+    if not val:
+        return None
     upper = val.upper()
     try:
         import pycountry as _pc
+        # 1. Exact alpha-3 code match (most common — LLM usually returns ISO code)
         c = _pc.currencies.get(alpha_3=upper)
         if c:
             return c.alpha_3
+        # 2. Exact name match (e.g. "US Dollar", "Euro")
         val_lower = val.lower()
         for c in _pc.currencies:
             if c.name.lower() == val_lower:
                 return c.alpha_3
+        # 3. Fuzzy name match via rapidfuzz (catches partial names, typos)
+        try:
+            from rapidfuzz import process as _fuzz
+            all_names = [c.name for c in _pc.currencies]
+            result = _fuzz.extractOne(val_lower, [n.lower() for n in all_names], score_cutoff=85)
+            if result:
+                idx = [n.lower() for n in all_names].index(result[0])
+                return list(_pc.currencies)[idx].alpha_3
+        except ImportError:
+            pass
+        # 4. Looks like a 3-char code but not in pycountry — return uppercased
+        if len(upper) == 3 and upper.isalpha():
+            logger.warning(f"Currency code {upper!r} not found in ISO-4217 — passing through as-is")
+            return upper
     except ImportError:
-        pass
-    return upper if len(upper) == 3 else val
+        logger.warning("pycountry not installed — currency code not normalized (pip install pycountry)")
+        if len(upper) == 3 and upper.isalpha():
+            return upper
+    return val
 
 
 def _normalize_supplier_country(country_str: str | None) -> str | None:
