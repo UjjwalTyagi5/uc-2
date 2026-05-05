@@ -1105,6 +1105,9 @@ def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None =
 # ── Stage 4: run classification for a PR ──────────────────────────────────────
 
 def _run_classification(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict | None = None) -> None:
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
@@ -1131,35 +1134,50 @@ def _run_classification(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: d
     finally:
         conn.close()
 
-    # Classify parent attachments
-    for row in parent_rows:
+    # Each file: download blob + LLM call + single-row DB update — fully independent.
+    # All three operations use separate connections / different rows, so concurrent
+    # execution is safe. LangChain LLMs use httpx connection pooling (thread-safe).
+    # ProcessPoolExecutor is NOT used because llm/embed_model are not picklable.
+
+    def _classify_parent(row):
         att_pk, blob_path, att_id = str(row[0]), row[1], row[2]
         if not blob_path:
-            continue
+            return
         try:
-            file_bytes = _download_blob(blob_path, blob_cfg)
-            import os
-            filename   = os.path.basename(blob_path)
+            file_bytes     = _download_blob(blob_path, blob_cfg)
+            filename       = os.path.basename(blob_path)
             doc_type, conf = _classify_file(llm, file_bytes, filename, prompts)
             _update_parent_classification(tgt_cs, att_id, doc_type, conf)
             logger.info(f"[{pr_no}] Parent {filename!r}: {doc_type} (conf={conf:.2f})")
         except Exception as exc:
             logger.warning(f"[{pr_no}] Parent classification failed ({blob_path!r}): {exc}")
 
-    # Classify embedded files
-    for row in embedded_rows:
+    def _classify_embedded(row):
         emb_pk, blob_path, parent_pk = str(row[0]), row[1], str(row[2])
         if not blob_path:
-            continue
+            return
         try:
-            file_bytes = _download_blob(blob_path, blob_cfg)
-            import os
-            filename   = os.path.basename(blob_path)
+            file_bytes     = _download_blob(blob_path, blob_cfg)
+            filename       = os.path.basename(blob_path)
             doc_type, conf = _classify_file(llm, file_bytes, filename, prompts)
             _update_embedded_classification(tgt_cs, parent_pk, blob_path, doc_type, conf)
             logger.info(f"[{pr_no}] Embedded {filename!r}: {doc_type} (conf={conf:.2f})")
         except Exception as exc:
             logger.warning(f"[{pr_no}] Embedded classification failed ({blob_path!r}): {exc}")
+
+    tasks = (
+        [(_classify_parent,   r) for r in parent_rows] +
+        [(_classify_embedded, r) for r in embedded_rows]
+    )
+    if not tasks:
+        return
+
+    # Cap inner workers at 8 — each task is an LLM HTTP call (I/O-bound, not CPU).
+    # With N outer PR workers, peak threads = N × 8; all blocked on network I/O.
+    with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as inner_pool:
+        futures = [inner_pool.submit(fn, row) for fn, row in tasks]
+        for f in as_completed(futures):
+            f.result()  # exceptions already caught inside fn; this just awaits all
 
 
 def _update_parent_classification(tgt_cs: str, att_id: str, doc_type: str, conf: float) -> None:
