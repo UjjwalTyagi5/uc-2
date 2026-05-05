@@ -151,6 +151,9 @@ dependencies = [
     "xlrd>=2.0.0,<3.0.0",
     # Azure Document Intelligence (new SDK) — prebuilt-read OCR for scanned docs
     "azure-ai-documentintelligence>=1.0.0,<2.0.0",
+    # --- Procurement pipeline — currency/country normalization ---
+    "pycountry>=23.12.11",
+    "rapidfuzz>=3.0.0,<4.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
