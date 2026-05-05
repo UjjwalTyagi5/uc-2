@@ -555,7 +555,7 @@ class PipelineStage123Node(Node):
             #   • old format: extracted_item_uuid_pk (used by pre-dtl_ code)
             #   • new format: dtl_{purchase_dtl_id}   (current code, stable per line item)
             cur.execute("""
-                SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id]
+                SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id], qi.[is_selected_quote]
                   FROM [ras_procurement].[quotation_extracted_items] qi
                   JOIN [ras_procurement].[attachment_classification] ac
                     ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
@@ -563,12 +563,16 @@ class PipelineStage123Node(Node):
                     ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
                  WHERE rt.[purchase_req_no] = ?
             """, pr_no)
-            rows        = cur.fetchall()
-            old_ids     = [str(r[0]) for r in rows if r[0]]
-            new_ids     = list({f"dtl_{r[1]}" for r in rows if r[1]})
+            rows = cur.fetchall()
+            # Old format: all UUIDs (pre-dtl_ code may have embedded any row)
+            old_ids = [str(r[0]) for r in rows if r[0]]
+            # New format: only is_selected_quote=1 rows (current code only embeds these)
+            new_ids = list({f"dtl_{r[1]}" for r in rows if r[1] and r[2]})
             pinecone_ids = list(set(old_ids + new_ids))
+            selected_count = sum(1 for r in rows if r[2])
             self.log(
-                f"[{pr_no}] Pinecone cleanup: {len(rows)} extracted item row(s) in DB → "
+                f"[{pr_no}] Pinecone cleanup: {len(rows)} total rows, "
+                f"{selected_count} is_selected_quote=1 → "
                 f"{len(old_ids)} UUID IDs + {len(new_ids)} dtl_ IDs = {len(pinecone_ids)} vector(s) to delete"
             )
 
