@@ -1442,6 +1442,10 @@ def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None =
     file_type = _EXT_TO_TYPE.get(ext, "unknown")
     text_content, image_b64, meta_str = _extract_for_classification(file_bytes, filename)
 
+    cls_max = (prompts or {}).get("cls_max_chars")
+    if cls_max and text_content and len(text_content) > cls_max:
+        text_content = text_content[:cls_max]
+
     try:
         if image_b64:
             user_prompt = user_image_tmpl.format(
@@ -1967,6 +1971,10 @@ def _build_extraction_user_prompt(ctx: RASContext, doc: DocumentContent, prompts
     else:
         doc_content_str = doc.text or "[No content extracted]"
 
+    ext_max = (prompts or {}).get("ext_max_chars")
+    if ext_max and doc_content_str and len(doc_content_str) > ext_max:
+        doc_content_str = doc_content_str[:ext_max]
+
     user_tmpl = (prompts or {}).get("ext_user", EXTRACTION_USER_TEMPLATE)
     return user_tmpl.format(
         purchase_req_no=_f(ctx.purchase_req_no),
@@ -2032,7 +2040,7 @@ _SELECTED_THRESHOLD     = Decimal("0.70")  # min overall score to mark as select
 _PRICE_MAX_BOOST        = Decimal("0.10")  # max confidence boost from price alignment
 _CANONICALIZE_THRESHOLD = 0.82             # SequenceMatcher ratio to cluster two supplier names
 
-def _compute_supplier_match(supplier: Optional[str], ctx: RASContext) -> tuple:
+def _compute_supplier_match(supplier: Optional[str], ctx: RASContext, thresholds: dict | None = None) -> tuple:
     if not supplier:
         return False, Decimal("0")
     known: set[str] = set()
@@ -2051,7 +2059,8 @@ def _compute_supplier_match(supplier: Optional[str], ctx: RASContext) -> tuple:
         else:
             best = max(best, SequenceMatcher(None, ext, nl).ratio())
     conf = Decimal(str(round(best, 4)))
-    return conf >= _SELECTED_THRESHOLD, conf
+    threshold = (thresholds or {}).get("selected_threshold", _SELECTED_THRESHOLD)
+    return conf >= threshold, conf
 
 
 # ── Extraction response parsing ────────────────────────────────────────────────
@@ -2429,8 +2438,8 @@ def _name_geo_tokens(cleaned: str) -> frozenset:
     return frozenset(w for w in _re.findall(r'\b\w+\b', cleaned.lower()) if w in _GEO)
 
 
-def _apply_price_alignment_boost(items: list[dict], ctx: RASContext) -> None:
-    """Boost supplier_match_conf by up to 0.10 when extracted prices align with RAS prices.
+def _apply_price_alignment_boost(items: list[dict], ctx: RASContext, thresholds: dict | None = None) -> None:
+    """Boost supplier_match_conf by up to price_max_boost when extracted prices align with RAS prices.
 
     If ≥50% of matched line items have a unit_price within _PRICE_TOLERANCE (5%) of the
     RAS line price, all items in this PR get a proportional boost. Matches doc-intel branch
@@ -2458,7 +2467,8 @@ def _apply_price_alignment_boost(items: list[dict], ctx: RASContext) -> None:
                     pass
     if comparable == 0 or matches / comparable < 0.5:
         return
-    boost = Decimal(str(round((matches / comparable) * float(_PRICE_MAX_BOOST), 4)))
+    max_boost = (thresholds or {}).get("price_max_boost", _PRICE_MAX_BOOST)
+    boost = Decimal(str(round((matches / comparable) * float(max_boost), 4)))
     for item in items:
         conf = item.get("supplier_match_conf")
         if conf is not None:
@@ -2471,7 +2481,7 @@ def _apply_price_alignment_boost(items: list[dict], ctx: RASContext) -> None:
     logger.debug(f"Price alignment boost +{boost} applied ({matches}/{comparable} items within {int(_PRICE_TOLERANCE*100)}%)")
 
 
-def _canonicalize_supplier_names(items: list[dict], ctx) -> None:
+def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None = None) -> None:
     """Union-Find supplier name canonicalization — aligned with doc-intel branch.
 
     Clusters ALL unique supplier names globally across the full PR (not per-DTL),
@@ -2529,7 +2539,7 @@ def _canonicalize_supplier_names(items: list[dict], ctx) -> None:
                 _union(a, b)
             elif a_clean in b_clean or b_clean in a_clean:
                 _union(a, b)
-            elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _CANONICALIZE_THRESHOLD:
+            elif SequenceMatcher(None, a_clean, b_clean).ratio() >= (thresholds or {}).get("canonicalize_threshold", _CANONICALIZE_THRESHOLD):
                 _union(a, b)
             elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
                 _union(a, b)
@@ -2553,7 +2563,7 @@ def _canonicalize_supplier_names(items: list[dict], ctx) -> None:
         if canon != orig:
             item["supplier_name"] = canon
             changed += 1
-            _, new_conf = _compute_supplier_match(canon, ctx)
+            _, new_conf = _compute_supplier_match(canon, ctx, thresholds)
             item["supplier_match_conf"] = Decimal(str(round(float(new_conf), 4)))
     if changed:
         logger.info(f"Supplier canonicalization: {changed} name(s) updated across PR")
@@ -2671,8 +2681,8 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
     if not all_items:
         return 0
 
-    _apply_price_alignment_boost(all_items, ctx)  # boost conf when prices align with RAS (≤5%)
-    _canonicalize_supplier_names(all_items, ctx)  # global clustering + RAS-known canonical + recompute conf
+    _apply_price_alignment_boost(all_items, ctx, prompts)  # boost conf when prices align with RAS (≤5%)
+    _canonicalize_supplier_names(all_items, ctx, prompts)  # global clustering + RAS-known canonical + recompute conf
     _compute_quote_ranks(all_items)               # rank uses canonical groups
     _select_best_quotes(all_items, ctx)           # select winner using refreshed conf
     saved = _save_extracted_items(tgt_cs, all_items)
@@ -3404,7 +3414,43 @@ class PipelineStage123Node(Node):
         IntInput(name="batch_limit",       display_name="Max PRs per Run (0 = all)", value=0,     advanced=True,
                  info="0 = process all pending PRs. Set to N (e.g. 50) to cap at N PRs per run. Ignored when PR Number Filter is set."),
         IntInput(name="parallel_workers",  display_name="Parallel Workers",          value=4,     advanced=True),
-        IntInput(name="max_content_chars", display_name="Max Characters per File",   value=80000, advanced=True),
+        IntInput(name="max_content_chars", display_name="Max Chars per File (Stage 2)", value=80000, advanced=True),
+        # ── Stage 4-7 tuning knobs ────────────────────────────────────────────
+        IntInput(
+            name="cls_max_chars",
+            display_name="Max Chars — Classification Input (Stage 4)",
+            value=20000,
+            advanced=True,
+            info="Truncate extracted text before sending to the classification LLM. 0 = no limit.",
+        ),
+        IntInput(
+            name="ext_max_chars",
+            display_name="Max Chars — Extraction Document (Stage 5)",
+            value=50000,
+            advanced=True,
+            info="Truncate document content before sending to the extraction LLM. 0 = no limit.",
+        ),
+        MessageTextInput(
+            name="selected_threshold",
+            display_name="Selected Quote Min Score (Stage 7)",
+            value="0.70",
+            advanced=True,
+            info="Minimum supplier_match_conf (0.0–1.0) for a quote to be eligible for selection.",
+        ),
+        MessageTextInput(
+            name="price_max_boost",
+            display_name="Price Alignment Max Boost (Stage 7)",
+            value="0.10",
+            advanced=True,
+            info="Maximum conf boost (0.0–1.0) applied when extracted prices align with RAS prices.",
+        ),
+        MessageTextInput(
+            name="canonicalize_threshold",
+            display_name="Supplier Canonicalize Threshold (Stage 7)",
+            value="0.82",
+            advanced=True,
+            info="SequenceMatcher ratio (0.0–1.0) above which two supplier names are merged into one canonical name.",
+        ),
     ]
 
     outputs = [
@@ -3952,8 +3998,9 @@ class PipelineStage123Node(Node):
     # ── Full-pipeline continuation (stages 4-8) ──────────────────────────
 
     def _build_prompts(self) -> dict:
-        """Build prompt overrides dict from wired Prompt Template inputs.
-        Returns an empty dict if no templates are wired (uses built-in defaults)."""
+        """Build prompt overrides and tuning-knob dict from component inputs.
+        Prompt keys: cls_system, cls_user_text, cls_user_image, ext_system, ext_user, ext_taxonomy.
+        Threshold keys: cls_max_chars, ext_max_chars, selected_threshold, price_max_boost, canonicalize_threshold."""
         prompts: dict = {}
         _p = getattr(self, "cls_system_prompt",    None)
         if _p: prompts["cls_system"]    = _get_prompt_text(_p, CLASSIFICATION_SYSTEM_PROMPT)
@@ -3967,6 +4014,23 @@ class PipelineStage123Node(Node):
         if _p: prompts["ext_user"]      = _get_prompt_text(_p, EXTRACTION_USER_TEMPLATE)
         _p = getattr(self, "ext_item_taxonomy",    None)
         if _p: prompts["ext_taxonomy"]  = _get_prompt_text(_p, ITEM_TAXONOMY)
+        # ── Tuning knobs ──────────────────────────────────────────────────
+        cls_max = getattr(self, "cls_max_chars", None)
+        if cls_max: prompts["cls_max_chars"] = int(cls_max)
+        ext_max = getattr(self, "ext_max_chars", None)
+        if ext_max: prompts["ext_max_chars"] = int(ext_max)
+        try:
+            prompts["selected_threshold"] = Decimal(str(float(getattr(self, "selected_threshold", None) or "0.70")))
+        except Exception:
+            prompts["selected_threshold"] = _SELECTED_THRESHOLD
+        try:
+            prompts["price_max_boost"] = Decimal(str(float(getattr(self, "price_max_boost", None) or "0.10")))
+        except Exception:
+            prompts["price_max_boost"] = _PRICE_MAX_BOOST
+        try:
+            prompts["canonicalize_threshold"] = float(getattr(self, "canonicalize_threshold", None) or "0.82")
+        except Exception:
+            prompts["canonicalize_threshold"] = _CANONICALIZE_THRESHOLD
         return prompts
 
     def _run_stages_48(self, pr_no: str, tgt_cs: str, result: dict, prompts: dict) -> None:
