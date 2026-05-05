@@ -2336,14 +2336,17 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
                 namespace=pinecone_ns,
                 text_key="page_content",
                 documents=[{
-                    "page_content": content,
-                    "purchase_req_no": pr_no,
-                    "purchase_dtl_id": str(dtl_id or ""),
+                    "page_content":     content,
+                    "purchase_req_no":  pr_no,
+                    "purchase_dtl_id":  str(dtl_id or ""),
+                    "item_name":        str(item_name or ""),
+                    "commodity_tag":    str(commodity_tag or ""),
                 }],
                 embedding_vectors=[embedding],
                 vector_ids=[f"dtl_{dtl_id}"],
                 embedding_dimension=3072,
             )
+            logger.info(f"[{pr_no}] Upserted vector dtl_{dtl_id} (dtl_id={dtl_id})")
         except Exception as exc:
             logger.warning(f"[{pr_no}] Embedding failed for dtl_id {dtl_id}: {exc}")
 

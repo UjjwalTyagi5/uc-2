@@ -545,14 +545,17 @@ class PipelineStage123Node(Node):
             return
         self.log(f"[{pr_no}] Existing PR detected — cleaning prior data before reprocessing")
 
-        # Single connection for all DB cleanup work (collect UUIDs + delete tables)
+        # Single connection for all DB cleanup work (collect IDs + delete tables)
         conn = self._connect(tgt_cs)
         cur  = conn.cursor()
-        pinecone_uuids: list[str] = []
+        pinecone_ids: list[str] = []
         try:
-            # Collect Pinecone vector UUIDs FIRST, before deleting quotation_extracted_items
+            # Collect Pinecone vector IDs FIRST, before deleting quotation_extracted_items.
+            # We build BOTH formats so stale vectors from any run are cleaned:
+            #   • old format: extracted_item_uuid_pk (used by pre-dtl_ code)
+            #   • new format: dtl_{purchase_dtl_id}   (current code, stable per line item)
             cur.execute("""
-                SELECT qi.[extracted_item_uuid_pk]
+                SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id]
                   FROM [ras_procurement].[quotation_extracted_items] qi
                   JOIN [ras_procurement].[attachment_classification] ac
                     ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
@@ -560,8 +563,14 @@ class PipelineStage123Node(Node):
                     ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
                  WHERE rt.[purchase_req_no] = ?
             """, pr_no)
-            pinecone_uuids = [str(r[0]) for r in cur.fetchall()]
-            self.log(f"[{pr_no}] Pinecone cleanup: found {len(pinecone_uuids)} vector UUID(s) in DB for this PR")
+            rows        = cur.fetchall()
+            old_ids     = [str(r[0]) for r in rows if r[0]]
+            new_ids     = list({f"dtl_{r[1]}" for r in rows if r[1]})
+            pinecone_ids = list(set(old_ids + new_ids))
+            self.log(
+                f"[{pr_no}] Pinecone cleanup: {len(rows)} extracted item row(s) in DB → "
+                f"{len(old_ids)} UUID IDs + {len(new_ids)} dtl_ IDs = {len(pinecone_ids)} vector(s) to delete"
+            )
 
             # 1. Null FK back-references in benchmark_result
             cur.execute("""
@@ -622,34 +631,34 @@ class PipelineStage123Node(Node):
             conn.close()
 
         # Delete stale Pinecone vectors (non-fatal)
-        if pinecone_uuids:
+        if pinecone_ids:
             pinecone_index = (getattr(self, "pinecone_index", None) or "").strip()
             pinecone_ns    = (getattr(self, "pinecone_namespace", None) or "").strip()
             if pinecone_index and pinecone_ns:
                 try:
                     from agentcore.services.pinecone_service_client import delete_vectors_via_service
-                    preview = pinecone_uuids[:5]
-                    more    = len(pinecone_uuids) - 5
+                    preview = pinecone_ids[:5]
+                    more    = len(pinecone_ids) - 5
                     self.log(
-                        f"[{pr_no}] Sending {len(pinecone_uuids)} UUID(s) to Pinecone delete "
+                        f"[{pr_no}] Sending {len(pinecone_ids)} ID(s) to Pinecone delete "
                         f"(index={pinecone_index!r}, namespace={pinecone_ns!r}) — "
                         f"first 5: {preview}" + (f" … +{more} more" if more > 0 else "")
                     )
                     delete_vectors_via_service(
                         index_name=pinecone_index, namespace=pinecone_ns,
-                        vector_ids=pinecone_uuids,
+                        vector_ids=pinecone_ids,
                     )
-                    self.log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_uuids)} vector(s) removed")
+                    self.log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_ids)} ID(s) sent for removal")
                 except Exception as exc:
                     self.log(f"[{pr_no}] Warning — Pinecone cleanup failed (non-fatal): {exc}")
             else:
                 self.log(
                     f"[{pr_no}] Warning — pinecone_index or pinecone_namespace not set; "
-                    f"{len(pinecone_uuids)} vector(s) were NOT deleted from Pinecone. "
+                    f"{len(pinecone_ids)} vector(s) were NOT deleted from Pinecone. "
                     f"Check the 'Pinecone Index' and 'Pinecone Namespace' inputs on the component."
                 )
         else:
-            self.log(f"[{pr_no}] No Pinecone vector UUIDs found in DB for this PR — skipping Pinecone delete")
+            self.log(f"[{pr_no}] No Pinecone vectors found in DB for this PR — skipping Pinecone delete")
 
         # Delete Azure Blob folder (non-fatal)
         try:
