@@ -4006,7 +4006,7 @@ class PipelineStage123Node(Node):
             self.log(f"[{pr_no}] Stage 7 — benchmark done")
 
             # Stage 8 — Complete
-            _adv(tgt_cs, pr_no, _STAGE_COMPLETE)
+            _advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
             _set_last_processed_at(tgt_cs, pr_no)
             self.log(f"[{pr_no}] Stage 8 — pipeline complete")
             result["status"] = "complete"
