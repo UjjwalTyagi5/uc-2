@@ -2028,7 +2028,9 @@ def _call_extraction_llm(llm, ctx: RASContext, doc: DocumentContent, prompts: di
 
 # ── Supplier matching ──────────────────────────────────────────────────────────
 
-_SELECTED_THRESHOLD = Decimal("0.70")
+_SELECTED_THRESHOLD     = Decimal("0.70")  # min overall score to mark as selected quote
+_PRICE_MAX_BOOST        = Decimal("0.10")  # max confidence boost from price alignment
+_CANONICALIZE_THRESHOLD = 0.82             # SequenceMatcher ratio to cluster two supplier names
 
 def _compute_supplier_match(supplier: Optional[str], ctx: RASContext) -> tuple:
     if not supplier:
