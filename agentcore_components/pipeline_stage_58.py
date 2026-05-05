@@ -2343,9 +2343,9 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
             ingest_via_service(
                 index_name=pinecone_index,
                 namespace=pinecone_ns,
-                text_key="text",
+                text_key="page_content",
                 documents=[{
-                    "text":                   content,
+                    "page_content":           content,
                     "purchase_req_no":        pr_no,
                     "purchase_dtl_id":        int(dtl_id),
                     "extracted_item_uuid_pk": str(item_uuid or ""),
@@ -2541,7 +2541,7 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                 raw_similar = search_via_service(
                     index_name=pinecone_index,
                     namespace=pinecone_ns,
-                    text_key="text",
+                    text_key="page_content",
                     query=bench_text,
                     query_embedding=embedding,
                     number_of_results=top_k + 5,  # fetch extra to absorb filtered-out
