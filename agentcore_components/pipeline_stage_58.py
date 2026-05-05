@@ -1682,10 +1682,10 @@ def _parse_extraction_response(raw: str, source: dict, ctx: RASContext) -> list:
     header_fields = {
         "supplier_name":      h_supplier,
         "supplier_address":   header.get("supplier_address") or None,
-        "supplier_country":   header.get("supplier_country") or None,
+        "supplier_country":   _normalize_supplier_country(header.get("supplier_country") or None),
         "quotation_ref_no":   header.get("quotation_ref_no") or None,
         "quotation_date":     header.get("quotation_date"),
-        "currency":           header.get("currency") or None,
+        "currency":           _normalize_currency_code(header.get("currency") or None),
         "validity_date":      header.get("validity_date"),
         "validity_days":      header.get("validity_days"),
         "payment_terms":      header.get("payment_terms") or None,
@@ -1929,10 +1929,82 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
 import re as _re_supplier
 
 _CANONICALIZE_THRESHOLD = 0.82
+
+# Mirrors doc intel branch — geo tokens used to prevent merging different country branches
 _GEO_TOKENS: frozenset = frozenset({
     "india", "china", "japan", "usa", "us", "uk", "germany", "france",
-    "singapore", "malaysia", "korea", "italy", "spain", "brazil", "australia",
+    "italy", "korea", "taiwan", "singapore", "malaysia", "thailand",
+    "vietnam", "indonesia", "australia", "canada", "brazil", "mexico",
+    "uae", "dubai", "europe", "asia", "americas", "shanghai", "beijing",
+    "mumbai", "delhi",
 })
+
+# Currency symbol → ISO-4217 alpha-3 map (covers symbols the LLM may return verbatim)
+_CURRENCY_SYMBOL_MAP: dict = {
+    "₹": "INR", "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY",
+    "₩": "KRW", "₫": "VND", "฿": "THB", "Rp": "IDR", "RM": "MYR",
+    "S$": "SGD", "A$": "AUD", "C$": "CAD", "R": "ZAR",
+}
+
+
+def _normalize_currency_code(code_or_name: str | None) -> str | None:
+    """Normalize currency string to ISO-4217 alpha-3 code.
+
+    Priority: symbol map → pycountry alpha_3 exact → pycountry name match → uppercase if 3-char.
+    Gracefully degrades when pycountry is not installed.
+    """
+    if not code_or_name:
+        return code_or_name
+    val = code_or_name.strip()
+    if val in _CURRENCY_SYMBOL_MAP:
+        return _CURRENCY_SYMBOL_MAP[val]
+    upper = val.upper()
+    try:
+        import pycountry as _pc
+        c = _pc.currencies.get(alpha_3=upper)
+        if c:
+            return c.alpha_3
+        val_lower = val.lower()
+        for c in _pc.currencies:
+            if c.name.lower() == val_lower:
+                return c.alpha_3
+    except ImportError:
+        pass
+    return upper if len(upper) == 3 else val
+
+
+def _normalize_supplier_country(country_str: str | None) -> str | None:
+    """Normalize free-text country name to ISO 3166-1 alpha-2 code using pycountry.
+
+    Tries exact name/code match first, then rapidfuzz fuzzy match (threshold 75).
+    Falls back to original string when pycountry is not installed or no match found.
+    """
+    if not country_str:
+        return country_str
+    text_lower = country_str.strip().lower()
+    try:
+        import pycountry as _pc
+        for c in _pc.countries:
+            if text_lower in (
+                c.name.lower(),
+                getattr(c, "official_name", "").lower(),
+                c.alpha_2.lower(),
+                c.alpha_3.lower(),
+            ):
+                return c.alpha_2
+        try:
+            from rapidfuzz import process as _fuzz
+            all_names = [c.name for c in _pc.countries]
+            result = _fuzz.extractOne(text_lower, [n.lower() for n in all_names])
+            if result and result[1] > 75:
+                matched = _pc.countries.get(name=all_names[[n.lower() for n in all_names].index(result[0])])
+                if matched:
+                    return matched.alpha_2
+        except ImportError:
+            pass
+    except ImportError:
+        logger.warning("pycountry not installed — supplier_country not normalized (pip install pycountry rapidfuzz)")
+    return country_str
 
 
 def _strip_contact_suffix(name: str) -> str:
@@ -1943,15 +2015,15 @@ def _strip_contact_suffix(name: str) -> str:
 
 
 def _is_acronym_of(short: str, long_name: str) -> bool:
+    """True if short is all-caps (≤ 6 chars) and matches the word initials of long_name."""
     if not short.isupper() or len(short) > 6:
         return False
-    words = [w for w in _re_supplier.split(r'\W+', long_name) if w]
-    initials = "".join(w[0].upper() for w in words if w)
-    return initials == short
+    initials = "".join(m[0].upper() for m in _re_supplier.findall(r'\b[A-Za-z]', long_name))
+    return short == initials[:len(short)]
 
 
 def _name_geo_tokens(cleaned: str) -> frozenset:
-    return frozenset(w for w in _re_supplier.split(r'\W+', cleaned.lower()) if w in _GEO_TOKENS)
+    return frozenset(w for w in _re_supplier.findall(r'\b\w+\b', cleaned.lower()) if w in _GEO_TOKENS)
 
 
 def _canonicalize_supplier_names(items: list[dict]) -> None:
