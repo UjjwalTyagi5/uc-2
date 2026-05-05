@@ -1887,7 +1887,7 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
             # look up source currency id
             cur.execute(
                 "SELECT [CUR_ID] FROM [ras_procurement].[currency_mst] "
-                "WHERE UPPER([CURRENCY_CODE]) = UPPER(?)",
+                "WHERE UPPER([CURRENCY]) = UPPER(?)",
                 currency_code,
             )
             row = cur.fetchone()
@@ -1901,10 +1901,10 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
             cur.execute(
                 "SELECT TOP 1 [CONVERSION_RATE] "
                 "FROM [ras_procurement].[EXCHANGE_RATE] "
-                "WHERE [FROM_CUR_ID] = ? AND [TO_CUR_ID] = ? "
+                "WHERE [CUR_ID] = ? AND [BASE_CUR_ID] = ? "
                 "  AND [STATUS_ID] = 10 "
-                "  AND [EFFECTIVE_FROM_DATE] <= ? AND [EFFECTIVE_TO_DATE] >= ? "
-                "ORDER BY [EFFECTIVE_FROM_DATE] DESC",
+                "  AND [FROM_DATE] <= ? AND [TO_DATE] >= ? "
+                "ORDER BY [FROM_DATE] DESC",
                 src_cur_id, _EUR_CUR_ID, date_val, date_val,
             )
             rate_row = cur.fetchone()
@@ -1922,6 +1922,107 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
     except Exception as exc:
         logger.warning(f"Currency conversion failed currency={currency_code!r} date={ref_date}: {exc}")
         return None
+
+
+# ── Supplier name canonicalization (mirrors doc intel Union-Find logic) ────────
+
+import re as _re_supplier
+
+_CANONICALIZE_THRESHOLD = 0.82
+_GEO_TOKENS: frozenset = frozenset({
+    "india", "china", "japan", "usa", "us", "uk", "germany", "france",
+    "singapore", "malaysia", "korea", "italy", "spain", "brazil", "australia",
+})
+
+
+def _strip_contact_suffix(name: str) -> str:
+    return _re_supplier.sub(
+        r'\s*[-–]\s*(contact|email|ph|phone|tel|mob)[:\s].*$',
+        '', name, flags=_re_supplier.IGNORECASE,
+    ).strip()
+
+
+def _is_acronym_of(short: str, long_name: str) -> bool:
+    if not short.isupper() or len(short) > 6:
+        return False
+    words = [w for w in _re_supplier.split(r'\W+', long_name) if w]
+    initials = "".join(w[0].upper() for w in words if w)
+    return initials == short
+
+
+def _name_geo_tokens(cleaned: str) -> frozenset:
+    return frozenset(w for w in _re_supplier.split(r'\W+', cleaned.lower()) if w in _GEO_TOKENS)
+
+
+def _canonicalize_supplier_names(items: list[dict]) -> None:
+    """In-memory Union-Find supplier name canonicalization — same rules as doc intel branch.
+
+    Groups items by purchase_dtl_id, clusters name variants using four merge
+    rules (exact match, substring, fuzzy ratio ≥ 0.82, acronym), with a
+    geo-token guard that prevents merging different country branches.
+    Mutates supplier_name in-place for non-canonical rows.
+    """
+    from difflib import SequenceMatcher
+    from collections import defaultdict
+
+    by_dtl: dict[int, list[dict]] = defaultdict(list)
+    for item in items:
+        dtl_id = item.get("purchase_dtl_id")
+        if dtl_id is not None and item.get("supplier_name"):
+            by_dtl[int(dtl_id)].append(item)
+
+    for dtl_id, dtl_items in by_dtl.items():
+        raw_names = list({i["supplier_name"] for i in dtl_items})
+        if len(raw_names) < 2:
+            continue
+
+        uf: dict[str, str] = {n: n for n in raw_names}
+
+        def _find(x: str) -> str:
+            while uf[x] != x:
+                uf[x] = uf[uf[x]]
+                x = uf[x]
+            return x
+
+        def _union(a: str, b: str) -> None:
+            uf[_find(a)] = _find(b)
+
+        for i, a in enumerate(raw_names):
+            a_clean = _strip_contact_suffix(a).lower()
+            a_geo   = _name_geo_tokens(a_clean)
+            for b in raw_names[i + 1:]:
+                b_clean = _strip_contact_suffix(b).lower()
+                b_geo   = _name_geo_tokens(b_clean)
+                if a_geo and b_geo and a_geo != b_geo:
+                    continue
+                if a_clean == b_clean:
+                    _union(a, b)
+                elif a_clean in b_clean or b_clean in a_clean:
+                    _union(a, b)
+                elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _CANONICALIZE_THRESHOLD:
+                    _union(a, b)
+                elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
+                    _union(a, b)
+
+        clusters: dict[str, list[str]] = defaultdict(list)
+        for n in raw_names:
+            clusters[_find(n)].append(n)
+
+        canonical_map: dict[str, str] = {}
+        for members in clusters.values():
+            canonical = min(members, key=len)
+            for m in members:
+                canonical_map[m] = canonical
+
+        changed = 0
+        for item in dtl_items:
+            orig = item.get("supplier_name", "")
+            canon = canonical_map.get(orig, orig)
+            if canon != orig:
+                item["supplier_name"] = canon
+                changed += 1
+        if changed:
+            logger.info(f"Supplier canonicalization DTL {dtl_id}: {changed} name(s) updated")
 
 
 # ── DB writer: extracted items ─────────────────────────────────────────────────
@@ -2038,6 +2139,7 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
 
     _compute_quote_ranks(all_items)
     _select_best_quotes(all_items, ctx)
+    _canonicalize_supplier_names(all_items)
     saved = _save_extracted_items(tgt_cs, all_items)
     logger.info(f"[{pr_no}] {saved} item(s) written to quotation_extracted_items")
     return saved
@@ -2096,23 +2198,56 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
     cur  = conn.cursor()
     try:
         cur.execute("""
-            SELECT qi.[extracted_item_uuid_pk], qi.[item_description], qi.[item_name],
-                   qi.[attachment_classify_fk], qi.[purchase_dtl_id]
+            SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id],
+                   qi.[item_name], qi.[item_description], qi.[item_summary],
+                   qi.[item_level_1], qi.[item_level_2], qi.[item_level_3],
+                   qi.[item_level_4], qi.[item_level_5], qi.[item_level_6],
+                   qi.[item_level_7], qi.[item_level_8], qi.[commodity_tag]
               FROM [ras_procurement].[quotation_extracted_items] qi
               JOIN [ras_procurement].[attachment_classification] ac
                 ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
               JOIN [ras_procurement].[ras_tracker] rt
                 ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
              WHERE rt.[purchase_req_no] = ?
-               AND ac.[doc_type] = 'Quotation'
+               AND qi.[is_selected_quote] = 1
+               AND qi.[purchase_dtl_id] IS NOT NULL
         """, pr_no)
-        rows = cur.fetchall()
+        all_rows = cur.fetchall()
     finally:
         conn.close()
+
+    # deduplicate by purchase_dtl_id — first row wins (same as doc intel branch)
+    seen_dtl: dict = {}
+    for row in all_rows:
+        dtl_id = row[1]
+        if dtl_id not in seen_dtl:
+            seen_dtl[dtl_id] = row
+    rows = list(seen_dtl.values())
+    logger.info(f"[{pr_no}] Embedding {len(rows)} selected item(s) (deduped from {len(all_rows)} is_selected_quote=1 rows)")
+
+    _EMBED_FIELDS_ORDER = [
+        "item_name", "item_description", "item_summary",
+        "item_level_1", "item_level_2", "item_level_3", "item_level_4",
+        "item_level_5", "item_level_6", "item_level_7", "item_level_8",
+        "commodity_tag",
+    ]
     for row in rows:
-        item_uuid, desc, name, classify_fk, dtl_id = row
-        content = f"{name or ''} {desc or ''}".strip()[:8000]
-        if not content: continue
+        item_uuid, dtl_id, item_name, item_desc, item_summary, *rest = row
+        levels = rest[:8]
+        commodity_tag = rest[8] if len(rest) > 8 else None
+        field_vals = {
+            "item_name":        item_name,
+            "item_description": item_desc,
+            "item_summary":     item_summary,
+            "item_level_1":     levels[0], "item_level_2": levels[1],
+            "item_level_3":     levels[2], "item_level_4": levels[3],
+            "item_level_5":     levels[4], "item_level_6": levels[5],
+            "item_level_7":     levels[6], "item_level_8": levels[7],
+            "commodity_tag":    commodity_tag,
+        }
+        content = " | ".join(str(field_vals[f]) for f in _EMBED_FIELDS_ORDER if field_vals.get(f))
+        if not content:
+            continue
         try:
             embedding = embed_model.embed_query(content)
             ingest_via_service(
@@ -2125,11 +2260,11 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
                     "purchase_dtl_id": str(dtl_id or ""),
                 }],
                 embedding_vectors=[embedding],
-                vector_ids=[str(item_uuid)],
+                vector_ids=[f"dtl_{dtl_id}"],
                 embedding_dimension=3072,
             )
         except Exception as exc:
-            logger.warning(f"[{pr_no}] Embedding failed for item {item_uuid}: {exc}")
+            logger.warning(f"[{pr_no}] Embedding failed for dtl_id {dtl_id}: {exc}")
 
 
 def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str, top_k: int) -> None:
