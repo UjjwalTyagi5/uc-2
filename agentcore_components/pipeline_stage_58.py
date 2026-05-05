@@ -2040,7 +2040,8 @@ def _canonicalize_supplier_names(items: list[dict]) -> None:
     Groups items by purchase_dtl_id, clusters name variants using four merge
     rules (exact match, substring, fuzzy ratio ≥ 0.82, acronym), with a
     geo-token guard that prevents merging different country branches.
-    Mutates supplier_name in-place for non-canonical rows.
+    Mutates supplier_name in-place and updates supplier_match_conf to the
+    minimum of the original match confidence and the canonicalization similarity.
     """
     from difflib import SequenceMatcher
     from collections import defaultdict
@@ -2097,11 +2098,22 @@ def _canonicalize_supplier_names(items: list[dict]) -> None:
 
         changed = 0
         for item in dtl_items:
-            orig = item.get("supplier_name", "")
+            orig  = item.get("supplier_name", "") or ""
             canon = canonical_map.get(orig, orig)
             if canon != orig:
                 item["supplier_name"] = canon
                 changed += 1
+            # Canonicalization confidence: similarity between original and canonical name.
+            # Items whose name was unchanged get 1.0; merged items get the ratio.
+            canon_conf = SequenceMatcher(
+                None, _strip_contact_suffix(orig).lower(), _strip_contact_suffix(canon).lower()
+            ).ratio()
+            # Blend with existing supplier_match_conf (take the more conservative value).
+            try:
+                orig_conf = float(item.get("supplier_match_conf") or 0.0)
+            except Exception:
+                orig_conf = 0.0
+            item["supplier_match_conf"] = Decimal(str(round(min(orig_conf, canon_conf), 4)))
         if changed:
             logger.info(f"Supplier canonicalization DTL {dtl_id}: {changed} name(s) updated")
 
@@ -2218,9 +2230,9 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
     if not all_items:
         return 0
 
-    _compute_quote_ranks(all_items)
-    _select_best_quotes(all_items, ctx)
-    _canonicalize_supplier_names(all_items)
+    _canonicalize_supplier_names(all_items)   # normalize names first
+    _compute_quote_ranks(all_items)            # rank uses canonical groups
+    _select_best_quotes(all_items, ctx)        # select winner using updated conf
     saved = _save_extracted_items(tgt_cs, all_items)
     logger.info(f"[{pr_no}] {saved} item(s) written to quotation_extracted_items")
     return saved
@@ -2345,13 +2357,15 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
                 namespace=pinecone_ns,
                 text_key="page_content",
                 documents=[{
-                    "page_content":           content,
-                    "purchase_req_no":        pr_no,
-                    "purchase_dtl_id":        int(dtl_id),
-                    "extracted_item_uuid_pk": str(item_uuid or ""),
-                    "commodity_tag":          str(rd.get("commodity_tag") or ""),
-                    "item_name":              str(rd.get("item_name") or ""),
-                    "item_created_date":      created_iso,
+                    "page_content": content,
+                    "metadata": {
+                        "purchase_req_no":        pr_no,
+                        "purchase_dtl_id":        int(dtl_id),
+                        "extracted_item_uuid_pk": str(item_uuid or ""),
+                        "commodity_tag":          str(rd.get("commodity_tag") or ""),
+                        "item_name":              str(rd.get("item_name") or ""),
+                        "item_created_date":      created_iso,
+                    },
                 }],
                 embedding_vectors=[embedding],
                 vector_ids=[f"dtl_{dtl_id}"],
@@ -2464,6 +2478,90 @@ def _format_bench_prompt(current: dict, historical: list[dict]) -> str:
         f"Return ONLY JSON (no markdown): "
         f'{{ "bp_unit_price": <number in EUR or null>, "summary": "<2-3 sentences>" }}'
     )
+
+
+def _compute_cpi_pct(country_str: str | None, start_year: int, end_year: int):
+    """Cumulative CPI inflation % via World Bank API (FP.CPI.TOTL.ZG).
+
+    Mirrors utils/cpi_inflation.py from the doc intel branch.
+    Returns float or None on any failure.
+    """
+    if not country_str or start_year >= end_year:
+        return None
+    try:
+        import httpx as _httpx
+        import pycountry as _pc
+        from rapidfuzz import process as _fuzz
+        # Resolve country name → ISO alpha-2
+        text = country_str.strip().lower()
+        alpha2 = None
+        for c in _pc.countries:
+            if text in (c.name.lower(), getattr(c, "official_name", "").lower(),
+                        c.alpha_2.lower(), c.alpha_3.lower()):
+                alpha2 = c.alpha_2
+                break
+        if alpha2 is None:
+            names = [c.name for c in _pc.countries]
+            res = _fuzz.extractOne(text, names)
+            if res and res[1] > 75:
+                matched = _pc.countries.get(name=res[0])
+                if matched:
+                    alpha2 = matched.alpha_2
+        if alpha2 is None:
+            logger.info(f"CPI: could not resolve country {country_str!r}")
+            return None
+        # Fetch World Bank annual rates
+        url = f"https://api.worldbank.org/v2/country/{alpha2}/indicator/FP.CPI.TOTL.ZG"
+        resp = _httpx.get(url, params={"date": f"{start_year}:{end_year}", "format": "json", "per_page": 100}, timeout=30.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if len(data) < 2 or not data[1]:
+            return None
+        rates = {int(e["date"]): float(e["value"]) for e in data[1] if e.get("value") is not None}
+        if not rates:
+            return None
+        factor = 1.0
+        for yr in range(start_year + 1, end_year + 1):
+            if yr in rates:
+                factor *= (1 + rates[yr] / 100)
+        return round((factor - 1) * 100, 4)
+    except Exception as exc:
+        logger.info(f"CPI: failed for {country_str!r} {start_year}-{end_year}: {exc}")
+        return None
+
+
+def _estimate_inflation_via_llm(llm, item_name: str | None, category: str | None,
+                                 supplier_country: str | None, ref_year: int | None,
+                                 current_year: int | None) -> float | None:
+    """Ask LLM for estimated cumulative inflation % for an item category in a country.
+
+    Returns float or None. Does NOT derive inflation from historical price delta.
+    """
+    if not supplier_country or not ref_year or not current_year or current_year <= ref_year:
+        return None
+    try:
+        from langchain_core.messages import HumanMessage as _HM
+        import json as _json, re as _re
+        years = current_year - ref_year
+        prompt = (
+            f"I am buying the following item from {supplier_country}:\n"
+            f"  Item     : {item_name or 'N/A'}\n"
+            f"  Category : {category or 'N/A'}\n\n"
+            f"What is the estimated cumulative inflation rate (%) for this type of item "
+            f"in {supplier_country} from {ref_year} to {current_year} ({years} year(s))?\n\n"
+            f"Base your estimate on macroeconomic inflation trends for this category in that country. "
+            f"Do NOT derive the rate from any historical price data.\n"
+            f'Respond ONLY with JSON: {{ "inflation_pct": <number or null> }}'
+        )
+        resp = llm.invoke([_HM(content=prompt)])
+        raw  = (getattr(resp, "content", None) or str(resp)).strip()
+        raw  = _re.sub(r"^```(?:json)?\s*", "", raw)
+        raw  = _re.sub(r"\s*```$",          "", raw).strip()
+        val  = _json.loads(raw).get("inflation_pct")
+        return float(val) if val is not None else None
+    except Exception as exc:
+        logger.info(f"LLM inflation estimate failed ({supplier_country} {ref_year}-{current_year}): {exc}")
+        return None
 
 
 def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str, top_k: int) -> None:
@@ -2586,6 +2684,32 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
             last_uuid = str(last_item["extracted_item_uuid_pk"]) if last_item else None
             similar_dtl_ids_json = json.dumps(similar_dtl_ids_raw) if similar_dtl_ids_raw else None
 
+            # Inflation estimates (non-fatal — both return None on failure)
+            supplier_country = (low_item.get("supplier_country") if low_item else None) or rd.get("supplier_country")
+            ref_dt       = low_item.get("quotation_date") if low_item else None
+            ref_year     = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
+            current_year = created.year if created and hasattr(created, "year") else None
+            item_category = " > ".join(
+                str(rd[f]) for f in ["item_level_1", "item_level_2", "item_level_3"] if rd.get(f)
+            )
+            infl_dec = cpi_dec = None
+            if ref_year and current_year and ref_year < current_year:
+                infl_raw = _estimate_inflation_via_llm(
+                    llm, rd.get("item_name"), item_category or None,
+                    supplier_country, ref_year, current_year,
+                )
+                if infl_raw is not None:
+                    try: infl_dec = Decimal(str(infl_raw))
+                    except Exception: pass
+                cpi_raw = _compute_cpi_pct(supplier_country, ref_year, current_year)
+                if cpi_raw is not None:
+                    try: cpi_dec = Decimal(str(cpi_raw))
+                    except Exception: pass
+                logger.info(
+                    f"[{pr_no}] dtl_id={dtl_id}: inflation_pct={infl_dec} "
+                    f"cpi_pct={cpi_dec} (country={supplier_country!r} {ref_year}-{current_year})"
+                )
+
             # LLM benchmark analysis
             bench_prompt = _format_bench_prompt(rd, historical[:top_k])
             bout = {}
@@ -2618,8 +2742,8 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                             bp_total_price         = ?,
                             low_hist_item_fk       = ?,
                             last_hist_item_fk      = ?,
-                            inflation_pct          = NULL,
-                            cpi_inflation_pct      = NULL,
+                            inflation_pct          = ?,
+                            cpi_inflation_pct      = ?,
                             similar_dtl_ids        = ?,
                             summary                = ?,
                             updated_at             = SYSUTCDATETIME()
@@ -2631,11 +2755,11 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                             inflation_pct, cpi_inflation_pct,
                             similar_dtl_ids, summary
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?);
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                     dtl_id,
-                    item_uuid, bp_dec, bp_total, low_uuid, last_uuid, similar_dtl_ids_json, summary,
-                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, similar_dtl_ids_json, summary,
+                    item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary,
+                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary,
                 )
             except Exception as exc:
                 logger.warning(f"[{pr_no}] Benchmark write failed dtl_id={dtl_id}: {exc}")
