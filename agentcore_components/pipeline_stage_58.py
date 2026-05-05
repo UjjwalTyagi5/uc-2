@@ -2271,6 +2271,25 @@ def _advance_tracker(tgt_cs: str, pr_no: str, stage_id: int) -> None:
         conn.close()
 
 
+def _set_last_processed_at(tgt_cs: str, pr_no: str) -> None:
+    """Stamp last_processed_at = SYSUTCDATETIME() so SourceChangeDetector
+    can detect future on-prem source changes for this PR."""
+    conn = _connect(tgt_cs)
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE [ras_procurement].[ras_tracker]
+               SET last_processed_at = SYSUTCDATETIME(),
+                   updated_at        = SYSUTCDATETIME()
+             WHERE purchase_req_no   = ?
+        """, pr_no)
+        conn.commit()
+    except Exception as exc:
+        logger.warning(f"set_last_processed_at failed PR={pr_no!r}: {exc}")
+    finally:
+        conn.close()
+
+
 def _record_exception(tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) -> None:
     try:
         conn = _connect(tgt_cs)
@@ -2994,6 +3013,7 @@ class PipelineStage4567Node(Node):
                 self.log(f"[{pr_no}] Stage 7 — benchmark done")
 
                 _advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
+                _set_last_processed_at(tgt_cs, pr_no)
                 self.log(f"[{pr_no}] Stage 8 — complete")
                 return (pr_no, "ok", n_items)
 

@@ -975,6 +975,54 @@ class PipelineStage123Node(Node):
     def _upload_blob(self, raw: bytes, blob_path: str) -> None:
         self._container_client().get_blob_client(blob_path).upload_blob(raw, overwrite=True)
 
+    # ── Source-change detection ───────────────────────────────────────────
+
+    def _detect_and_requeue_changed_prs(self, tgt_cs: str) -> int:
+        """Re-queue completed PRs whose on-prem source data changed since the
+        pipeline last processed them.
+
+        Compares purchase_req_mst.U_DATETIME (bumped by on-prem DB triggers
+        whenever purchase_req_detail or purchase_attachments rows change) against
+        ras_tracker.last_processed_at (stamped at Stage 8 completion).
+
+        Re-queued PRs have current_stage_fk reset to 1 so _fetch_pending_prs
+        picks them up on this run. Non-fatal — a failure is logged and skipped.
+        """
+        try:
+            conn = self._connect(tgt_cs)
+            cur  = conn.cursor()
+            try:
+                cur.execute("""
+                    SELECT prm.PURCHASE_REQ_NO
+                      FROM [ras_procurement].[purchase_req_mst] prm
+                      JOIN [ras_procurement].[ras_tracker] rt
+                        ON rt.purchase_req_no = prm.PURCHASE_REQ_NO
+                     WHERE rt.current_stage_fk  = 8
+                       AND rt.last_processed_at IS NOT NULL
+                       AND prm.U_DATETIME        > rt.last_processed_at
+                       AND UPPER(prm.PURCHASEFINALAPPROVALSTATUS)
+                               IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
+                """)
+                changed = [row[0] for row in cur.fetchall()]
+                if not changed:
+                    return 0
+                for pr_no in changed:
+                    cur.execute("""
+                        UPDATE [ras_procurement].[ras_tracker]
+                           SET current_stage_fk = 1,
+                               retry_count      = COALESCE(retry_count, 0) + 1,
+                               updated_at       = SYSUTCDATETIME()
+                         WHERE purchase_req_no  = ?
+                    """, pr_no)
+                conn.commit()
+                self.log(f"Source-change detection: re-queued {len(changed)} PR(s) — {changed}")
+                return len(changed)
+            finally:
+                conn.close()
+        except Exception as exc:
+            self.log(f"Warning — source-change detection failed (non-fatal): {exc}")
+            return 0
+
     # ── Full-pipeline continuation (stages 4-8) ──────────────────────────
 
     def _run_stages_48(self, pr_no: str, tgt_cs: str, result: dict) -> None:
@@ -992,6 +1040,7 @@ class PipelineStage123Node(Node):
                     _run_classification, _run_extraction,
                     _run_embeddings, _run_benchmark,
                     _advance_tracker as _adv,
+                    _set_last_processed_at,
                     _STAGE_CLASSIFICATION, _STAGE_EXTRACTION,
                     _STAGE_EMBEDDINGS, _STAGE_PRICE_BENCHMARK, _STAGE_COMPLETE,
                 )
@@ -1000,6 +1049,7 @@ class PipelineStage123Node(Node):
                     _run_classification, _run_extraction,
                     _run_embeddings, _run_benchmark,
                     _advance_tracker as _adv,
+                    _set_last_processed_at,
                     _STAGE_CLASSIFICATION, _STAGE_EXTRACTION,
                     _STAGE_EMBEDDINGS, _STAGE_PRICE_BENCHMARK, _STAGE_COMPLETE,
                 )
@@ -1044,6 +1094,7 @@ class PipelineStage123Node(Node):
 
             # Stage 8 — Complete
             _adv(tgt_cs, pr_no, _STAGE_COMPLETE)
+            _set_last_processed_at(tgt_cs, pr_no)
             self.log(f"[{pr_no}] Stage 8 — pipeline complete")
             result["status"] = "complete"
 
@@ -1209,6 +1260,13 @@ class PipelineStage123Node(Node):
         src_cs    = self._conn_str(self.source_connection)
         tgt_cs    = self._conn_str(self.target_connection)
         pr_filter = (self.pr_no_filter or "").strip()
+
+        # Detect completed PRs whose on-prem source data changed (U_DATETIME >
+        # last_processed_at) and reset them to stage 1 so they are re-processed
+        # in this run. Non-fatal — skipped silently on failure.
+        if not pr_filter:
+            self._detect_and_requeue_changed_prs(tgt_cs)
+
         pr_list   = self._fetch_pending_prs(tgt_cs)
 
         if not pr_list:
