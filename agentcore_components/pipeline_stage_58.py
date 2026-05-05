@@ -2034,14 +2034,16 @@ def _name_geo_tokens(cleaned: str) -> frozenset:
     return frozenset(w for w in _re.findall(r'\b\w+\b', cleaned.lower()) if w in _GEO)
 
 
-def _canonicalize_supplier_names(items: list[dict]) -> None:
+def _canonicalize_supplier_names(items: list[dict], ctx) -> None:
     """In-memory Union-Find supplier name canonicalization — same rules as doc intel branch.
 
     Groups items by purchase_dtl_id, clusters name variants using four merge
     rules (exact match, substring, fuzzy ratio ≥ 0.82, acronym), with a
     geo-token guard that prevents merging different country branches.
-    Mutates supplier_name in-place and updates supplier_match_conf to the
-    minimum of the original match confidence and the canonicalization similarity.
+    Mutates supplier_name in-place. For items whose name changed, supplier_match_conf
+    is RECOMPUTED against known RAS suppliers using the canonical name (doc intel branch
+    approach: canonical name often matches the RAS supplier better than the raw variant).
+    Items whose name was unchanged keep their existing supplier_match_conf.
     """
     from difflib import SequenceMatcher
     from collections import defaultdict
@@ -2103,19 +2105,14 @@ def _canonicalize_supplier_names(items: list[dict]) -> None:
             if canon != orig:
                 item["supplier_name"] = canon
                 changed += 1
-            # Canonicalization confidence: similarity between original and canonical name.
-            # Items whose name was unchanged get 1.0; merged items get the ratio.
-            canon_conf = SequenceMatcher(
-                None, _strip_contact_suffix(orig).lower(), _strip_contact_suffix(canon).lower()
-            ).ratio()
-            # Blend with existing supplier_match_conf (take the more conservative value).
-            try:
-                orig_conf = float(item.get("supplier_match_conf") or 0.0)
-            except Exception:
-                orig_conf = 0.0
-            item["supplier_match_conf"] = Decimal(str(round(min(orig_conf, canon_conf), 4)))
+                # Recompute supplier_match_conf against known RAS suppliers using the
+                # canonical name. The canonical form is typically shorter / cleaner
+                # and often scores higher against the RAS supplier list than the raw variant.
+                _, new_conf = _compute_supplier_match(canon, ctx)
+                item["supplier_match_conf"] = Decimal(str(round(float(new_conf), 4)))
+            # Items whose name was unchanged keep their existing supplier_match_conf.
         if changed:
-            logger.info(f"Supplier canonicalization DTL {dtl_id}: {changed} name(s) updated")
+            logger.info(f"Supplier canonicalization DTL {dtl_id}: {changed} name(s) updated, conf recomputed")
 
 
 # ── DB writer: extracted items ─────────────────────────────────────────────────
@@ -2230,9 +2227,9 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
     if not all_items:
         return 0
 
-    _canonicalize_supplier_names(all_items)   # normalize names first
-    _compute_quote_ranks(all_items)            # rank uses canonical groups
-    _select_best_quotes(all_items, ctx)        # select winner using updated conf
+    _canonicalize_supplier_names(all_items, ctx)  # normalize names + recompute conf against RAS
+    _compute_quote_ranks(all_items)               # rank uses canonical groups
+    _select_best_quotes(all_items, ctx)           # select winner using refreshed conf
     saved = _save_extracted_items(tgt_cs, all_items)
     logger.info(f"[{pr_no}] {saved} item(s) written to quotation_extracted_items")
     return saved
@@ -2781,19 +2778,22 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
 def _fetch_pending_prs(tgt_cs: str, pr_filter: str, batch_limit: int) -> list:
     if pr_filter:
         return [pr_filter]
+    _WHERE = """
+        FROM [ras_procurement].[purchase_req_mst] prm
+        JOIN [ras_procurement].[ras_tracker] rt
+          ON prm.PURCHASE_REQ_NO = rt.purchase_req_no
+       WHERE rt.current_stage_fk = 3
+         AND UPPER(prm.PURCHASEFINALAPPROVALSTATUS)
+                 IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
+       ORDER BY prm.C_DATETIME ASC
+    """
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
-        cur.execute("""
-            SELECT TOP (?) prm.PURCHASE_REQ_NO
-              FROM [ras_procurement].[purchase_req_mst] prm
-              JOIN [ras_procurement].[ras_tracker] rt
-                ON prm.PURCHASE_REQ_NO = rt.purchase_req_no
-             WHERE rt.current_stage_fk = 3
-               AND UPPER(prm.PURCHASEFINALAPPROVALSTATUS)
-                       IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
-             ORDER BY prm.C_DATETIME ASC
-        """, batch_limit)
+        if batch_limit > 0:
+            cur.execute(f"SELECT TOP (?) prm.PURCHASE_REQ_NO {_WHERE}", batch_limit)
+        else:
+            cur.execute(f"SELECT prm.PURCHASE_REQ_NO {_WHERE}")
         return [row[0] for row in cur.fetchall()]
     finally:
         conn.close()
@@ -2898,7 +2898,8 @@ class PipelineStage4567Node(Node):
             advanced=True,
             info="Leave blank to process all PRs at stage 3. Enter one PR to restrict.",
         ),
-        IntInput(name="batch_limit",      display_name="Max PRs per Run",             value=50,  advanced=True),
+        IntInput(name="batch_limit",      display_name="Max PRs per Run (0 = all)",   value=0,
+                 info="0 = process all pending PRs at stage 3. Set to N to cap at N per run. Ignored when PR Number Filter is set."),
         MessageTextInput(name="pinecone_index",    display_name="Pinecone Index Name",  value="ras-quotations", advanced=True),
         MessageTextInput(name="pinecone_namespace", display_name="Pinecone Namespace",  value="procurement",    advanced=True),
         IntInput(name="pinecone_top_k",   display_name="Benchmark Similarity Top-K",   value=5,  advanced=True),

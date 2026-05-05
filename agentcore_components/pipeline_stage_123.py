@@ -454,7 +454,8 @@ class PipelineStage123Node(Node):
             advanced=True,
             info="Pinecone namespace used by Stage 4-8. Old embedding vectors are deleted here on PR retry.",
         ),
-        IntInput(name="batch_limit",       display_name="Max PRs per Run",          value=50,    advanced=True),
+        IntInput(name="batch_limit",       display_name="Max PRs per Run (0 = all)", value=0,     advanced=True,
+                 info="0 = process all pending PRs. Set to N (e.g. 50) to cap at N PRs per run. Ignored when PR Number Filter is set."),
         IntInput(name="parallel_workers",  display_name="Parallel Workers",          value=4,     advanced=True),
         IntInput(name="max_content_chars", display_name="Max Characters per File",   value=80000, advanced=True),
     ]
@@ -506,24 +507,29 @@ class PipelineStage123Node(Node):
         pr_filter = (self.pr_no_filter or "").strip()
         if pr_filter:
             return [pr_filter]
-        conn = self._connect(tgt_cs)
-        cur  = conn.cursor()
+        limit = int(self.batch_limit)
+        conn  = self._connect(tgt_cs)
+        cur   = conn.cursor()
+        # Stage 1-3 only owns stages 1 and 2.  PRs already at stage 3+ have
+        # completed Stage 1-3 and belong to Stage 4-8 — do NOT re-pick them.
+        # Only pick: new PRs (no tracker row), reset PRs (NULL stage), or PRs
+        # stuck mid-Stage-1-3 (stages 1 or 2).
+        _WHERE = """
+            FROM [ras_procurement].[purchase_req_mst] prm
+            LEFT JOIN [ras_procurement].[ras_tracker] rt
+              ON prm.PURCHASE_REQ_NO = rt.purchase_req_no
+           WHERE (rt.purchase_req_no IS NULL
+                  OR rt.current_stage_fk IS NULL
+                  OR rt.current_stage_fk IN (1, 2))
+             AND UPPER(prm.PURCHASEFINALAPPROVALSTATUS)
+                     IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
+           ORDER BY prm.C_DATETIME ASC
+        """
         try:
-            cur.execute(
-                """
-                SELECT TOP (?) prm.PURCHASE_REQ_NO
-                  FROM [ras_procurement].[purchase_req_mst] prm
-                  LEFT JOIN [ras_procurement].[ras_tracker] rt
-                    ON prm.PURCHASE_REQ_NO = rt.purchase_req_no
-                 WHERE (rt.purchase_req_no IS NULL
-                        OR rt.current_stage_fk IS NULL
-                        OR rt.current_stage_fk NOT IN (8, 90, 91, 99))
-                   AND UPPER(prm.PURCHASEFINALAPPROVALSTATUS)
-                           IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
-                 ORDER BY prm.C_DATETIME ASC
-                """,
-                int(self.batch_limit),
-            )
+            if limit > 0:
+                cur.execute(f"SELECT TOP (?) prm.PURCHASE_REQ_NO {_WHERE}", limit)
+            else:
+                cur.execute(f"SELECT prm.PURCHASE_REQ_NO {_WHERE}")
             return [row[0] for row in cur.fetchall()]
         finally:
             conn.close()
@@ -564,16 +570,17 @@ class PipelineStage123Node(Node):
                  WHERE rt.[purchase_req_no] = ?
             """, pr_no)
             rows = cur.fetchall()
-            # Old format: all UUIDs (pre-dtl_ code may have embedded any row)
-            old_ids = [str(r[0]) for r in rows if r[0]]
+            selected_count = sum(1 for r in rows if r[2])
             # New format: only is_selected_quote=1 rows (current code only embeds these)
             new_ids = list({f"dtl_{r[1]}" for r in rows if r[1] and r[2]})
+            # Old format: only is_selected_quote=1 UUIDs (legacy vectors only existed for selected rows too)
+            old_ids = [str(r[0]) for r in rows if r[0] and r[2]]
             pinecone_ids = list(set(old_ids + new_ids))
-            selected_count = sum(1 for r in rows if r[2])
             self.log(
-                f"[{pr_no}] Pinecone cleanup: {len(rows)} total rows, "
-                f"{selected_count} is_selected_quote=1 → "
-                f"{len(old_ids)} UUID IDs + {len(new_ids)} dtl_ IDs = {len(pinecone_ids)} vector(s) to delete"
+                f"[{pr_no}] Pinecone cleanup: {len(rows)} extracted rows, "
+                f"{selected_count} is_selected_quote=1 — "
+                f"deleting {len(pinecone_ids)} vector(s): "
+                f"{len(new_ids)} dtl_ ID(s) + {len(old_ids)} legacy UUID(s)"
             )
 
             # 1. Null FK back-references in benchmark_result
