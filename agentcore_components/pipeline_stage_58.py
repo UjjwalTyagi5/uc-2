@@ -1939,25 +1939,23 @@ _GEO_TOKENS: frozenset = frozenset({
     "mumbai", "delhi",
 })
 
-# Currency symbol → ISO-4217 alpha-3 map (covers symbols the LLM may return verbatim)
-_CURRENCY_SYMBOL_MAP: dict = {
-    "₹": "INR", "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY",
-    "₩": "KRW", "₫": "VND", "฿": "THB", "Rp": "IDR", "RM": "MYR",
-    "S$": "SGD", "A$": "AUD", "C$": "CAD", "R": "ZAR",
-}
-
-
 def _normalize_currency_code(code_or_name: str | None) -> str | None:
     """Normalize currency string to ISO-4217 alpha-3 code.
 
     Priority: symbol map → pycountry alpha_3 exact → pycountry name match → uppercase if 3-char.
     Gracefully degrades when pycountry is not installed.
     """
+    # Defined inside the function so it's always in scope in agentcore's exec context
+    _SYMBOL_MAP: dict = {
+        "₹": "INR", "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY",
+        "₩": "KRW", "₫": "VND", "฿": "THB", "Rp": "IDR", "RM": "MYR",
+        "S$": "SGD", "A$": "AUD", "C$": "CAD", "R": "ZAR",
+    }
     if not code_or_name:
         return code_or_name
     val = code_or_name.strip()
-    if val in _CURRENCY_SYMBOL_MAP:
-        return _CURRENCY_SYMBOL_MAP[val]
+    if val in _SYMBOL_MAP:
+        return _SYMBOL_MAP[val]
     upper = val.upper()
     try:
         import pycountry as _pc
