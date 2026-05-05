@@ -2862,14 +2862,32 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
 
 # ── Fetch pending PRs ──────────────────────────────────────────────────────────
 
+def _get_pr_current_stage(tgt_cs: str, pr_no: str) -> int:
+    """Return the current_stage_fk for a PR, or 0 if not found."""
+    conn = _connect(tgt_cs)
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT current_stage_fk FROM [ras_procurement].[ras_tracker] WHERE purchase_req_no = ?",
+            pr_no,
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        conn.close()
+
+
 def _fetch_pending_prs(tgt_cs: str, pr_filter: str, batch_limit: int) -> list:
     if pr_filter:
         return [pr_filter]
+    # Pick up PRs at any stage that needs stages 4-8 work:
+    #   stage 3 = just finished Stage 1-3, ready for classification
+    #   stages 4-7 = partially processed (e.g. failed mid-run), need to resume
     _WHERE = """
         FROM [ras_procurement].[purchase_req_mst] prm
         JOIN [ras_procurement].[ras_tracker] rt
           ON prm.PURCHASE_REQ_NO = rt.purchase_req_no
-       WHERE rt.current_stage_fk = 3
+       WHERE rt.current_stage_fk IN (3, 4, 5, 6, 7)
          AND UPPER(prm.PURCHASEFINALAPPROVALSTATUS)
                  IN ('APPROVED BY ALL', 'APPROVED BY ALL EXCEPTION')
        ORDER BY prm.C_DATETIME ASC
@@ -3030,41 +3048,71 @@ class PipelineStage4567Node(Node):
         if _p: prompts["ext_taxonomy"]  = _get_prompt_text(_p, ITEM_TAXONOMY)
 
         if not pr_list:
-            return Message(text="No PRs at stage 3 to process.")
+            return Message(text=(
+                "No pending PRs for stages 4-8. "
+                "Either Stage 1-3 has not run yet, all PRs are already complete (stage 8), "
+                "or no approved PRs exist in the tracker."
+            ))
 
         workers = max(1, int(self.parallel_workers))
         self.log(f"Processing {len(pr_list)} PR(s) with {workers} parallel worker(s)…")
 
         def _process_pr_48(pr_no: str) -> tuple[str, str, int]:
-            """Returns (pr_no, 'ok'|'err', n_items_or_0)."""
+            """Returns (pr_no, 'ok'|'err', n_items_or_0).
+
+            Resumes from the current DB stage so a PR that already finished
+            classification (stage 4) skips straight to extraction (stage 5),
+            and so on.  This handles both normal flow (PR at stage 3 after
+            Stage 1-3) and partial-failure recovery (PR at stages 4-7).
+            """
+            db_stage = _get_pr_current_stage(tgt_cs, pr_no)
             current_stage = _STAGE_CLASSIFICATION
+            n_items = 0
             try:
-                self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
-                _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
-                _advance_tracker(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
-                self.log(f"[{pr_no}] Stage 4 — classification complete")
+                # Stage 4 — Classification (skip if already done)
+                if db_stage < _STAGE_CLASSIFICATION:
+                    self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
+                    _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
+                    _advance_tracker(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
+                    self.log(f"[{pr_no}] Stage 4 — classification complete")
+                else:
+                    self.log(f"[{pr_no}] Stage 4 — already done (db_stage={db_stage}), skipping")
 
+                # Stage 5 — Extraction (skip if already done)
                 current_stage = _STAGE_EXTRACTION
-                self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
-                n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
-                _advance_tracker(tgt_cs, pr_no, _STAGE_EXTRACTION)
-                self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
+                if db_stage < _STAGE_EXTRACTION:
+                    self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
+                    n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
+                    _advance_tracker(tgt_cs, pr_no, _STAGE_EXTRACTION)
+                    self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
+                else:
+                    self.log(f"[{pr_no}] Stage 5 — already done (db_stage={db_stage}), skipping")
 
+                # Stage 6 — Embeddings (skip if already done)
                 current_stage = _STAGE_EMBEDDINGS
-                _run_embeddings(tgt_cs, pr_no, self.embed_model,
-                                self.pinecone_index, self.pinecone_namespace)
-                _advance_tracker(tgt_cs, pr_no, _STAGE_EMBEDDINGS)
-                self.log(f"[{pr_no}] Stage 6 — embeddings done")
+                if db_stage < _STAGE_EMBEDDINGS:
+                    _run_embeddings(tgt_cs, pr_no, self.embed_model,
+                                    self.pinecone_index, self.pinecone_namespace)
+                    _advance_tracker(tgt_cs, pr_no, _STAGE_EMBEDDINGS)
+                    self.log(f"[{pr_no}] Stage 6 — embeddings done")
+                else:
+                    self.log(f"[{pr_no}] Stage 6 — already done (db_stage={db_stage}), skipping")
 
+                # Stage 7 — Benchmark (skip if already done)
                 current_stage = _STAGE_PRICE_BENCHMARK
-                _run_benchmark(self.llm, tgt_cs, pr_no, self.embed_model,
-                               self.pinecone_index, self.pinecone_namespace, int(self.pinecone_top_k))
-                _advance_tracker(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
-                self.log(f"[{pr_no}] Stage 7 — benchmark done")
+                if db_stage < _STAGE_PRICE_BENCHMARK:
+                    _run_benchmark(self.llm, tgt_cs, pr_no, self.embed_model,
+                                   self.pinecone_index, self.pinecone_namespace, int(self.pinecone_top_k))
+                    _advance_tracker(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
+                    self.log(f"[{pr_no}] Stage 7 — benchmark done")
+                else:
+                    self.log(f"[{pr_no}] Stage 7 — already done (db_stage={db_stage}), skipping")
 
-                _advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
-                _set_last_processed_at(tgt_cs, pr_no)
-                self.log(f"[{pr_no}] Stage 8 — complete")
+                # Stage 8 — Complete
+                if db_stage < _STAGE_COMPLETE:
+                    _advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
+                    _set_last_processed_at(tgt_cs, pr_no)
+                    self.log(f"[{pr_no}] Stage 8 — pipeline complete")
                 return (pr_no, "ok", n_items)
 
             except Exception as exc:
