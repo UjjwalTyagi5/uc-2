@@ -1926,19 +1926,6 @@ def _convert_to_eur(tgt_cs: str, amount, currency_code: str | None, ref_date) ->
 
 # ── Supplier name canonicalization (mirrors doc intel Union-Find logic) ────────
 
-import re as _re_supplier
-
-_CANONICALIZE_THRESHOLD = 0.82
-
-# Mirrors doc intel branch — geo tokens used to prevent merging different country branches
-_GEO_TOKENS: frozenset = frozenset({
-    "india", "china", "japan", "usa", "us", "uk", "germany", "france",
-    "italy", "korea", "taiwan", "singapore", "malaysia", "thailand",
-    "vietnam", "indonesia", "australia", "canada", "brazil", "mexico",
-    "uae", "dubai", "europe", "asia", "americas", "shanghai", "beijing",
-    "mumbai", "delhi",
-})
-
 def _normalize_currency_code(code_or_name: str | None) -> str | None:
     """Normalize currency string to ISO-4217 alpha-3 code.
 
@@ -2006,9 +1993,10 @@ def _normalize_supplier_country(country_str: str | None) -> str | None:
 
 
 def _strip_contact_suffix(name: str) -> str:
-    return _re_supplier.sub(
+    import re as _re
+    return _re.sub(
         r'\s*[-–]\s*(contact|email|ph|phone|tel|mob)[:\s].*$',
-        '', name, flags=_re_supplier.IGNORECASE,
+        '', name, flags=_re.IGNORECASE,
     ).strip()
 
 
@@ -2016,12 +2004,21 @@ def _is_acronym_of(short: str, long_name: str) -> bool:
     """True if short is all-caps (≤ 6 chars) and matches the word initials of long_name."""
     if not short.isupper() or len(short) > 6:
         return False
-    initials = "".join(m[0].upper() for m in _re_supplier.findall(r'\b[A-Za-z]', long_name))
+    import re as _re
+    initials = "".join(m[0].upper() for m in _re.findall(r'\b[A-Za-z]', long_name))
     return short == initials[:len(short)]
 
 
 def _name_geo_tokens(cleaned: str) -> frozenset:
-    return frozenset(w for w in _re_supplier.findall(r'\b\w+\b', cleaned.lower()) if w in _GEO_TOKENS)
+    import re as _re
+    _GEO = frozenset({
+        "india", "china", "japan", "usa", "us", "uk", "germany", "france",
+        "italy", "korea", "taiwan", "singapore", "malaysia", "thailand",
+        "vietnam", "indonesia", "australia", "canada", "brazil", "mexico",
+        "uae", "dubai", "europe", "asia", "americas", "shanghai", "beijing",
+        "mumbai", "delhi",
+    })
+    return frozenset(w for w in _re.findall(r'\b\w+\b', cleaned.lower()) if w in _GEO)
 
 
 def _canonicalize_supplier_names(items: list[dict]) -> None:
@@ -2034,6 +2031,7 @@ def _canonicalize_supplier_names(items: list[dict]) -> None:
     """
     from difflib import SequenceMatcher
     from collections import defaultdict
+    _THRESHOLD = 0.82  # inline to avoid module-level scoping issues in agentcore exec
 
     by_dtl: dict[int, list[dict]] = defaultdict(list)
     for item in items:
@@ -2069,7 +2067,7 @@ def _canonicalize_supplier_names(items: list[dict]) -> None:
                     _union(a, b)
                 elif a_clean in b_clean or b_clean in a_clean:
                     _union(a, b)
-                elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _CANONICALIZE_THRESHOLD:
+                elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _THRESHOLD:
                     _union(a, b)
                 elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
                     _union(a, b)
