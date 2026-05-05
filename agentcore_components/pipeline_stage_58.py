@@ -2363,7 +2363,6 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
                         "purchase_dtl_id":        int(dtl_id),
                         "extracted_item_uuid_pk": str(item_uuid or ""),
                         "commodity_tag":          str(rd.get("commodity_tag") or ""),
-                        "item_name":              str(rd.get("item_name") or ""),
                         "item_created_date":      created_iso,
                     },
                 }],
@@ -2642,7 +2641,7 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                     text_key="page_content",
                     query=bench_text,
                     query_embedding=embedding,
-                    number_of_results=top_k + 5,  # fetch extra to absorb filtered-out
+                    number_of_results=top_k * 3,  # fetch extra to absorb score + date filtered-out
                 )
             except Exception as exc:
                 logger.warning(f"[{pr_no}] Benchmark similarity search failed dtl_id={dtl_id}: {exc}")
@@ -2656,9 +2655,13 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
             else:
                 matches = []
 
-            # Filter: exclude same PR, and only items created strictly before this item
+            # Filter: minimum similarity score, exclude same PR, only items from older PRs
+            _MIN_SCORE = 0.70
             filtered = []
             for m in matches:
+                score = float(m.get("score", 0.0))
+                if score < _MIN_SCORE:
+                    continue
                 meta = m.get("metadata") or {}
                 if meta.get("purchase_req_no") == pr_no:
                     continue
