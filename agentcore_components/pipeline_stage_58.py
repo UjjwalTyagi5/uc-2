@@ -2052,85 +2052,134 @@ def _name_geo_tokens(cleaned: str) -> frozenset:
     return frozenset(w for w in _re.findall(r'\b\w+\b', cleaned.lower()) if w in _GEO)
 
 
-def _canonicalize_supplier_names(items: list[dict], ctx) -> None:
-    """In-memory Union-Find supplier name canonicalization — same rules as doc intel branch.
+def _apply_price_alignment_boost(items: list[dict], ctx: RASContext) -> None:
+    """Boost supplier_match_conf by up to 0.10 when extracted prices align with RAS prices.
 
-    Groups items by purchase_dtl_id, clusters name variants using four merge
-    rules (exact match, substring, fuzzy ratio ≥ 0.82, acronym), with a
-    geo-token guard that prevents merging different country branches.
-    Mutates supplier_name in-place. For items whose name changed, supplier_match_conf
-    is RECOMPUTED against known RAS suppliers using the canonical name (doc intel branch
-    approach: canonical name often matches the RAS supplier better than the raw variant).
-    Items whose name was unchanged keep their existing supplier_match_conf.
+    If ≥50% of matched line items have a unit_price within _PRICE_TOLERANCE (5%) of the
+    RAS line price, all items in this PR get a proportional boost. Matches doc-intel branch
+    _apply_price_alignment_boost logic, adapted for dict items.
+    """
+    dtl_price: dict = {
+        li.purchase_dtl_id: li.unit_price
+        for li in ctx.line_items
+        if li.unit_price is not None and li.unit_price > 0
+    }
+    if not dtl_price:
+        return
+    matches = comparable = 0
+    for item in items:
+        dtl_id = item.get("purchase_dtl_id")
+        if dtl_id in dtl_price:
+            unit_price = item.get("unit_price")
+            if unit_price is not None:
+                comparable += 1
+                try:
+                    ras_p = dtl_price[dtl_id]
+                    if abs(Decimal(str(unit_price)) - ras_p) / ras_p <= _PRICE_TOLERANCE:
+                        matches += 1
+                except Exception:
+                    pass
+    if comparable == 0 or matches / comparable < 0.5:
+        return
+    boost = Decimal(str(round((matches / comparable) * float(_PRICE_MAX_BOOST), 4)))
+    for item in items:
+        conf = item.get("supplier_match_conf")
+        if conf is not None:
+            try:
+                item["supplier_match_conf"] = min(
+                    Decimal("1.0"), Decimal(str(conf)) + boost
+                )
+            except Exception:
+                pass
+    logger.debug(f"Price alignment boost +{boost} applied ({matches}/{comparable} items within {int(_PRICE_TOLERANCE*100)}%)")
+
+
+def _canonicalize_supplier_names(items: list[dict], ctx) -> None:
+    """Union-Find supplier name canonicalization — aligned with doc-intel branch.
+
+    Clusters ALL unique supplier names globally across the full PR (not per-DTL),
+    using four merge rules: exact, substring, SequenceMatcher ratio ≥ 0.82, acronym.
+    Geo-token guard prevents merging different country branches.
+
+    Canonical preference: RAS-known name first (matches doc-intel), then shortest.
+    For items whose name changed, supplier_match_conf is recomputed against RAS suppliers.
     """
     from difflib import SequenceMatcher
     from collections import defaultdict
-    _THRESHOLD = 0.82  # inline to avoid module-level scoping issues in agentcore exec
 
-    by_dtl: dict[int, list[dict]] = defaultdict(list)
+    # Build RAS-known name set for canonical preference (doc-intel branch logic)
+    ras_known: set[str] = set()
+    if getattr(ctx, "supplier_name", None):
+        ras_known.add(ctx.supplier_name.strip().lower())
+    if getattr(ctx, "parent_supplier", None):
+        ras_known.add(ctx.parent_supplier.strip().lower())
+    for li in getattr(ctx, "line_items", []):
+        if getattr(li, "supplier_name", None):
+            ras_known.add(li.supplier_name.strip().lower())
+
+    # Collect ALL unique names globally (doc-intel clusters across full PR, not per-DTL)
+    raw_names: list[str] = []
+    seen: set[str] = set()
     for item in items:
-        dtl_id = item.get("purchase_dtl_id")
-        if dtl_id is not None and item.get("supplier_name"):
-            by_dtl[int(dtl_id)].append(item)
+        n = (item.get("supplier_name") or "").strip()
+        if n and n not in seen:
+            raw_names.append(n)
+            seen.add(n)
 
-    for dtl_id, dtl_items in by_dtl.items():
-        raw_names = list({i["supplier_name"] for i in dtl_items})
-        if len(raw_names) < 2:
-            continue
+    if len(raw_names) < 2:
+        return
 
-        uf: dict[str, str] = {n: n for n in raw_names}
+    uf: dict[str, str] = {n: n for n in raw_names}
 
-        def _find(x: str) -> str:
-            while uf[x] != x:
-                uf[x] = uf[uf[x]]
-                x = uf[x]
-            return x
+    def _find(x: str) -> str:
+        while uf[x] != x:
+            uf[x] = uf[uf[x]]
+            x = uf[x]
+        return x
 
-        def _union(a: str, b: str) -> None:
-            uf[_find(a)] = _find(b)
+    def _union(a: str, b: str) -> None:
+        uf[_find(a)] = _find(b)
 
-        for i, a in enumerate(raw_names):
-            a_clean = _strip_contact_suffix(a).lower()
-            a_geo   = _name_geo_tokens(a_clean)
-            for b in raw_names[i + 1:]:
-                b_clean = _strip_contact_suffix(b).lower()
-                b_geo   = _name_geo_tokens(b_clean)
-                if a_geo and b_geo and a_geo != b_geo:
-                    continue
-                if a_clean == b_clean:
-                    _union(a, b)
-                elif a_clean in b_clean or b_clean in a_clean:
-                    _union(a, b)
-                elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _THRESHOLD:
-                    _union(a, b)
-                elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
-                    _union(a, b)
+    for i, a in enumerate(raw_names):
+        a_clean = _strip_contact_suffix(a).lower()
+        a_geo   = _name_geo_tokens(a_clean)
+        for b in raw_names[i + 1:]:
+            b_clean = _strip_contact_suffix(b).lower()
+            b_geo   = _name_geo_tokens(b_clean)
+            if a_geo and b_geo and a_geo != b_geo:
+                continue
+            if a_clean == b_clean:
+                _union(a, b)
+            elif a_clean in b_clean or b_clean in a_clean:
+                _union(a, b)
+            elif SequenceMatcher(None, a_clean, b_clean).ratio() >= _CANONICALIZE_THRESHOLD:
+                _union(a, b)
+            elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
+                _union(a, b)
 
-        clusters: dict[str, list[str]] = defaultdict(list)
-        for n in raw_names:
-            clusters[_find(n)].append(n)
+    clusters: dict[str, list[str]] = defaultdict(list)
+    for n in raw_names:
+        clusters[_find(n)].append(n)
 
-        canonical_map: dict[str, str] = {}
-        for members in clusters.values():
-            canonical = min(members, key=len)
-            for m in members:
-                canonical_map[m] = canonical
+    canonical_map: dict[str, str] = {}
+    for members in clusters.values():
+        # Prefer RAS-known name as canonical (doc-intel branch), then shortest
+        ras_match = next((m for m in members if m.lower() in ras_known), None)
+        canonical = ras_match if ras_match else min(members, key=len)
+        for m in members:
+            canonical_map[m] = canonical
 
-        changed = 0
-        for item in dtl_items:
-            orig  = item.get("supplier_name", "") or ""
-            canon = canonical_map.get(orig, orig)
-            if canon != orig:
-                item["supplier_name"] = canon
-                changed += 1
-                # Recompute supplier_match_conf against known RAS suppliers using the
-                # canonical name. The canonical form is typically shorter / cleaner
-                # and often scores higher against the RAS supplier list than the raw variant.
-                _, new_conf = _compute_supplier_match(canon, ctx)
-                item["supplier_match_conf"] = Decimal(str(round(float(new_conf), 4)))
-            # Items whose name was unchanged keep their existing supplier_match_conf.
-        if changed:
-            logger.info(f"Supplier canonicalization DTL {dtl_id}: {changed} name(s) updated, conf recomputed")
+    changed = 0
+    for item in items:
+        orig  = (item.get("supplier_name") or "").strip()
+        canon = canonical_map.get(orig, orig)
+        if canon != orig:
+            item["supplier_name"] = canon
+            changed += 1
+            _, new_conf = _compute_supplier_match(canon, ctx)
+            item["supplier_match_conf"] = Decimal(str(round(float(new_conf), 4)))
+    if changed:
+        logger.info(f"Supplier canonicalization: {changed} name(s) updated across PR")
 
 
 # ── DB writer: extracted items ─────────────────────────────────────────────────
@@ -2245,7 +2294,8 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
     if not all_items:
         return 0
 
-    _canonicalize_supplier_names(all_items, ctx)  # normalize names + recompute conf against RAS
+    _apply_price_alignment_boost(all_items, ctx)  # boost conf when prices align with RAS (≤5%)
+    _canonicalize_supplier_names(all_items, ctx)  # global clustering + RAS-known canonical + recompute conf
     _compute_quote_ranks(all_items)               # rank uses canonical groups
     _select_best_quotes(all_items, ctx)           # select winner using refreshed conf
     saved = _save_extracted_items(tgt_cs, all_items)
