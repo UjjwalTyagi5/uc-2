@@ -406,8 +406,14 @@ def _get_blob_config_by_name(connector_name: str) -> dict:
 # ── Main component ────────────────────────────────────────────────────────
 
 class PipelineStage123Node(Node):
-    display_name = "Pipeline Stage 1-3"
-    description  = "Stage 1: Ingestion. Stage 2: Embedded doc extraction + text extract. Stage 3: Azure Blob upload."
+    display_name = "Full Pipeline (Stages 1-8)"
+    description  = (
+        "Runs the complete procurement pipeline end-to-end per PR in parallel workers: "
+        "Stage 1 (Ingestion) → Stage 2 (Embed Doc Extraction) → Stage 3 (Blob Upload) → "
+        "Stage 4 (Classification) → Stage 5 (Extraction) → Stage 6 (Embeddings) → "
+        "Stage 7 (Price Benchmark) → Stage 8 (Complete). "
+        "Wire Prompt Template nodes to the optional prompt inputs to override defaults."
+    )
     icon = "Database"
     name = "PipelineStage123Node"
 
@@ -440,26 +446,65 @@ class PipelineStage123Node(Node):
                 "Enter one PURCHASE_REQ_NO to force a full reprocess from scratch."
             ),
         ),
-        # ── Full-pipeline inputs (wire these to run stages 4-8 in the same worker) ──
+        # ── Stages 4-8 inputs ────────────────────────────────────────────────
         HandleInput(
             name="llm",
-            display_name="LLM — for Stages 4-8 (optional)",
+            display_name="LLM (GPT-4o or GPT-4o-mini)",
             input_types=["LanguageModel"],
-            required=False,
-            info=(
-                "Connect an LLM node to run the full pipeline (stages 1-8) per PR "
-                "within the same parallel worker. When wired, each worker processes "
-                "one PR end-to-end without waiting for other PRs to finish Stage 1-3. "
-                "Leave disconnected to run stages 1-3 only."
-            ),
+            info="LLM used for Stage 4 (classification) and Stage 5 (extraction).",
         ),
         HandleInput(
             name="embed_model",
-            display_name="Embeddings Model — for Stage 6 (optional)",
+            display_name="Embeddings Model",
             input_types=["Embeddings"],
-            required=False,
-            info="Required together with LLM to run stages 4-8 inline.",
+            info="Embeddings model used for Stage 6 (vector embeddings) and Stage 7 (benchmark search).",
         ),
+        # ── Prompt template overrides (optional) ─────────────────────────────
+        # Leave disconnected to use the default prompts baked into this component.
+        # Wire a Prompt Template node to any of these to override the built-in prompts.
+        HandleInput(
+            name="cls_system_prompt",
+            display_name="[Classification] System Prompt",
+            input_types=["Message"],
+            required=False,
+            info="Override the classification system prompt. Connect a Prompt Template node.",
+        ),
+        HandleInput(
+            name="cls_user_text_prompt",
+            display_name="[Classification] User Prompt — Text/Tabular Files",
+            input_types=["Message"],
+            required=False,
+            info="Override the user prompt for text/Excel/Word/PDF files. Must keep {filename}, {file_type}, {extra_metadata}, {extracted_content} placeholders.",
+        ),
+        HandleInput(
+            name="cls_user_image_prompt",
+            display_name="[Classification] User Prompt — Image/Scanned Files",
+            input_types=["Message"],
+            required=False,
+            info="Override the user prompt sent with base64 image content. Must keep {filename}, {file_type}, {extra_metadata} placeholders.",
+        ),
+        HandleInput(
+            name="ext_system_prompt",
+            display_name="[Extraction] System Prompt",
+            input_types=["Message"],
+            required=False,
+            info="Override the extraction system prompt. Connect a Prompt Template node.",
+        ),
+        HandleInput(
+            name="ext_user_template",
+            display_name="[Extraction] User Prompt Template",
+            input_types=["Message"],
+            required=False,
+            info="Override the extraction user template. Must keep all {field} placeholders from the RAS context and {document_content}.",
+        ),
+        HandleInput(
+            name="ext_item_taxonomy",
+            display_name="[Extraction] Item Taxonomy",
+            input_types=["Message"],
+            required=False,
+            info="Override the item taxonomy guidelines injected into {item_taxonomy} of the extraction user template.",
+        ),
+        # ── Advanced settings ─────────────────────────────────────────────────
         MessageTextInput(
             name="pinecone_index",
             display_name="Pinecone Index Name",
@@ -1025,11 +1070,45 @@ class PipelineStage123Node(Node):
 
     # ── Full-pipeline continuation (stages 4-8) ──────────────────────────
 
-    def _run_stages_48(self, pr_no: str, tgt_cs: str, result: dict) -> None:
+    def _build_prompts(self) -> dict:
+        """Build prompt overrides dict from wired Prompt Template inputs.
+        Returns an empty dict if no templates are wired (uses built-in defaults)."""
+        try:
+            try:
+                from agentcore_components.pipeline_stage_58 import (
+                    _get_prompt_text,
+                    CLASSIFICATION_SYSTEM_PROMPT, _CLASSIFY_USER_TEXT, _CLASSIFY_USER_IMAGE,
+                    EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE, ITEM_TAXONOMY,
+                )
+            except ImportError:
+                from pipeline_stage_58 import (  # type: ignore[import]
+                    _get_prompt_text,
+                    CLASSIFICATION_SYSTEM_PROMPT, _CLASSIFY_USER_TEXT, _CLASSIFY_USER_IMAGE,
+                    EXTRACTION_SYSTEM_PROMPT, EXTRACTION_USER_TEMPLATE, ITEM_TAXONOMY,
+                )
+        except Exception:
+            return {}
+
+        prompts: dict = {}
+        _p = getattr(self, "cls_system_prompt",    None)
+        if _p: prompts["cls_system"]    = _get_prompt_text(_p, CLASSIFICATION_SYSTEM_PROMPT)
+        _p = getattr(self, "cls_user_text_prompt", None)
+        if _p: prompts["cls_user_text"] = _get_prompt_text(_p, _CLASSIFY_USER_TEXT)
+        _p = getattr(self, "cls_user_image_prompt", None)
+        if _p: prompts["cls_user_image"] = _get_prompt_text(_p, _CLASSIFY_USER_IMAGE)
+        _p = getattr(self, "ext_system_prompt",    None)
+        if _p: prompts["ext_system"]    = _get_prompt_text(_p, EXTRACTION_SYSTEM_PROMPT)
+        _p = getattr(self, "ext_user_template",    None)
+        if _p: prompts["ext_user"]      = _get_prompt_text(_p, EXTRACTION_USER_TEMPLATE)
+        _p = getattr(self, "ext_item_taxonomy",    None)
+        if _p: prompts["ext_taxonomy"]  = _get_prompt_text(_p, ITEM_TAXONOMY)
+        return prompts
+
+    def _run_stages_48(self, pr_no: str, tgt_cs: str, result: dict, prompts: dict) -> None:
         """Run stages 4-8 for a PR that has already completed stages 1-3.
 
         Imports processing functions from pipeline_stage_58 at call time so
-        Stage 1-3 can still load independently if Stage 4-8 is absent.
+        this component can still load independently if pipeline_stage_58 is absent.
         Exceptions are caught here, recorded to ras_pipeline_exceptions, and
         reflected in result["status"] / result["error"] — they do NOT propagate
         to the outer _process_pr try/except so stages 1-3 are not re-rolled back.
@@ -1060,21 +1139,20 @@ class PipelineStage123Node(Node):
             return
 
         blob_cfg      = self._blob_cfg()
-        prompts: dict = {}  # use Stage 4-8 default prompts
         current_stage = _STAGE_CLASSIFICATION
         top_k         = int(getattr(self, "pinecone_top_k", 5))
 
         try:
             # Stage 4 — Classification
             self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
-            _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
+            _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)  # type: ignore[arg-type]
             _adv(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
             self.log(f"[{pr_no}] Stage 4 — classification complete")
 
             # Stage 5 — Extraction
             current_stage = _STAGE_EXTRACTION
             self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
-            n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
+            n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)  # type: ignore[arg-type]
             _adv(tgt_cs, pr_no, _STAGE_EXTRACTION)
             self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
 
@@ -1234,14 +1312,10 @@ class PipelineStage123Node(Node):
             result["files"]  = file_data
             result["status"] = "success"
 
-            # ── Full-pipeline mode: continue to stages 4-8 in this same worker ──
-            # Triggered when both llm and embed_model inputs are wired.
+            # ── Continue to stages 4-8 in this same worker ──────────────────
             # Each parallel worker processes one PR end-to-end (stages 1→8)
             # without waiting for other PRs to finish Stage 1-3 first.
-            _llm = getattr(self, "llm", None)
-            _emb = getattr(self, "embed_model", None)
-            if _llm is not None and _emb is not None:
-                self._run_stages_48(pr_no, tgt_cs, result)
+            self._run_stages_48(pr_no, tgt_cs, result, self._build_prompts())
 
         except Exception as exc:
             logger.opt(exception=True).error("[{}] Stage 1-3 failed at stage {}: {}", pr_no, current_stage, exc)
