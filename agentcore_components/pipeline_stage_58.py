@@ -2900,6 +2900,8 @@ class PipelineStage4567Node(Node):
         ),
         IntInput(name="batch_limit",      display_name="Max PRs per Run (0 = all)",   value=0,
                  info="0 = process all pending PRs at stage 3. Set to N to cap at N per run. Ignored when PR Number Filter is set."),
+        IntInput(name="parallel_workers", display_name="Parallel Workers",            value=4,
+                 info="Number of PRs to process concurrently. Matches the parallel_workers setting on Stage 1-3."),
         MessageTextInput(name="pinecone_index",    display_name="Pinecone Index Name",  value="ras-quotations", advanced=True),
         MessageTextInput(name="pinecone_namespace", display_name="Pinecone Namespace",  value="procurement",    advanced=True),
         IntInput(name="pinecone_top_k",   display_name="Benchmark Similarity Top-K",   value=5,  advanced=True),
@@ -2943,50 +2945,59 @@ class PipelineStage4567Node(Node):
         if not pr_list:
             return Message(text="No PRs at stage 3 to process.")
 
-        self.log(f"Processing {len(pr_list)} PR(s)…")
-        ok_lines: list[str] = []
-        err_lines: list[str] = []
+        workers = max(1, int(self.parallel_workers))
+        self.log(f"Processing {len(pr_list)} PR(s) with {workers} parallel worker(s)…")
 
-        for pr_no in pr_list:
+        def _process_pr_48(pr_no: str) -> tuple[str, str, int]:
+            """Returns (pr_no, 'ok'|'err', n_items_or_0)."""
             current_stage = _STAGE_CLASSIFICATION
             try:
-                # Stage 4 — Classification
                 self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
                 _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
                 _advance_tracker(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
                 self.log(f"[{pr_no}] Stage 4 — classification complete")
 
-                # Stage 5 — Extraction
                 current_stage = _STAGE_EXTRACTION
                 self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
                 n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
                 _advance_tracker(tgt_cs, pr_no, _STAGE_EXTRACTION)
                 self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
 
-                # Stage 6 — Embeddings
                 current_stage = _STAGE_EMBEDDINGS
                 _run_embeddings(tgt_cs, pr_no, self.embed_model,
                                 self.pinecone_index, self.pinecone_namespace)
                 _advance_tracker(tgt_cs, pr_no, _STAGE_EMBEDDINGS)
                 self.log(f"[{pr_no}] Stage 6 — embeddings done")
 
-                # Stage 7 — Benchmark
                 current_stage = _STAGE_PRICE_BENCHMARK
                 _run_benchmark(self.llm, tgt_cs, pr_no, self.embed_model,
                                self.pinecone_index, self.pinecone_namespace, int(self.pinecone_top_k))
                 _advance_tracker(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
                 self.log(f"[{pr_no}] Stage 7 — benchmark done")
 
-                # Stage 8 — Complete
                 _advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
                 self.log(f"[{pr_no}] Stage 8 — complete")
-
-                ok_lines.append(f"  OK  {pr_no}: {n_items} item(s)")
+                return (pr_no, "ok", n_items)
 
             except Exception as exc:
-                logger.opt(exception=True).error("[{}] Stage 4-8 failed at stage {}: {}", pr_no, current_stage, exc)
+                logger.opt(exception=True).error(
+                    "[{}] Stage 4-8 failed at stage {}: {}", pr_no, current_stage, exc
+                )
                 _record_exception(tgt_cs, pr_no, current_stage, str(exc))
-                err_lines.append(f"  ERR {pr_no}: {exc}")
+                return (pr_no, "err", str(exc))
+
+        import concurrent.futures
+        ok_lines:  list[str] = []
+        err_lines: list[str] = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_pr_48, pr): pr for pr in pr_list}
+            for f in concurrent.futures.as_completed(futures):
+                pr_no, status, payload = f.result()
+                if status == "ok":
+                    ok_lines.append(f"  OK  {pr_no}: {payload} item(s)")
+                else:
+                    err_lines.append(f"  ERR {pr_no}: {payload}")
 
         summary = f"Pipeline Stage 4-8 complete — {len(ok_lines)} OK, {len(err_lines)} errors\n"
         return Message(text=summary + "\n".join(ok_lines + err_lines))

@@ -440,20 +440,41 @@ class PipelineStage123Node(Node):
                 "Enter one PURCHASE_REQ_NO to force a full reprocess from scratch."
             ),
         ),
+        # ── Full-pipeline inputs (wire these to run stages 4-8 in the same worker) ──
+        HandleInput(
+            name="llm",
+            display_name="LLM — for Stages 4-8 (optional)",
+            input_types=["LanguageModel"],
+            required=False,
+            info=(
+                "Connect an LLM node to run the full pipeline (stages 1-8) per PR "
+                "within the same parallel worker. When wired, each worker processes "
+                "one PR end-to-end without waiting for other PRs to finish Stage 1-3. "
+                "Leave disconnected to run stages 1-3 only."
+            ),
+        ),
+        HandleInput(
+            name="embed_model",
+            display_name="Embeddings Model — for Stage 6 (optional)",
+            input_types=["Embeddings"],
+            required=False,
+            info="Required together with LLM to run stages 4-8 inline.",
+        ),
         MessageTextInput(
             name="pinecone_index",
-            display_name="Pinecone Index Name (for retry cleanup)",
+            display_name="Pinecone Index Name",
             value="ras-quotations",
             advanced=True,
-            info="Pinecone index used by Stage 4-8. Old embedding vectors are deleted here on PR retry.",
+            info="Pinecone index used for embeddings (Stage 6) and retry cleanup.",
         ),
         MessageTextInput(
             name="pinecone_namespace",
-            display_name="Pinecone Namespace (for retry cleanup)",
+            display_name="Pinecone Namespace",
             value="procurement",
             advanced=True,
-            info="Pinecone namespace used by Stage 4-8. Old embedding vectors are deleted here on PR retry.",
+            info="Pinecone namespace used for embeddings (Stage 6) and retry cleanup.",
         ),
+        IntInput(name="pinecone_top_k",    display_name="Benchmark Top-K (Stage 7)", value=5,     advanced=True),
         IntInput(name="batch_limit",       display_name="Max PRs per Run (0 = all)", value=0,     advanced=True,
                  info="0 = process all pending PRs. Set to N (e.g. 50) to cap at N PRs per run. Ignored when PR Number Filter is set."),
         IntInput(name="parallel_workers",  display_name="Parallel Workers",          value=4,     advanced=True),
@@ -954,6 +975,85 @@ class PipelineStage123Node(Node):
     def _upload_blob(self, raw: bytes, blob_path: str) -> None:
         self._container_client().get_blob_client(blob_path).upload_blob(raw, overwrite=True)
 
+    # ── Full-pipeline continuation (stages 4-8) ──────────────────────────
+
+    def _run_stages_48(self, pr_no: str, tgt_cs: str, result: dict) -> None:
+        """Run stages 4-8 for a PR that has already completed stages 1-3.
+
+        Imports processing functions from pipeline_stage_58 at call time so
+        Stage 1-3 can still load independently if Stage 4-8 is absent.
+        Exceptions are caught here, recorded to ras_pipeline_exceptions, and
+        reflected in result["status"] / result["error"] — they do NOT propagate
+        to the outer _process_pr try/except so stages 1-3 are not re-rolled back.
+        """
+        try:
+            try:
+                from agentcore_components.pipeline_stage_58 import (
+                    _run_classification, _run_extraction,
+                    _run_embeddings, _run_benchmark,
+                    _advance_tracker as _adv,
+                    _STAGE_CLASSIFICATION, _STAGE_EXTRACTION,
+                    _STAGE_EMBEDDINGS, _STAGE_PRICE_BENCHMARK, _STAGE_COMPLETE,
+                )
+            except ImportError:
+                from pipeline_stage_58 import (  # type: ignore[import]
+                    _run_classification, _run_extraction,
+                    _run_embeddings, _run_benchmark,
+                    _advance_tracker as _adv,
+                    _STAGE_CLASSIFICATION, _STAGE_EXTRACTION,
+                    _STAGE_EMBEDDINGS, _STAGE_PRICE_BENCHMARK, _STAGE_COMPLETE,
+                )
+        except Exception as imp_exc:
+            result["status"] = "success_stage3_only"
+            result["error"]  = f"Stage 4-8 import failed — stages 1-3 are saved: {imp_exc}"
+            self.log(f"[{pr_no}] Warning — could not import Stage 4-8 functions: {imp_exc}")
+            return
+
+        blob_cfg      = self._blob_cfg()
+        prompts: dict = {}  # use Stage 4-8 default prompts
+        current_stage = _STAGE_CLASSIFICATION
+        top_k         = int(getattr(self, "pinecone_top_k", 5))
+
+        try:
+            # Stage 4 — Classification
+            self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
+            _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
+            _adv(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
+            self.log(f"[{pr_no}] Stage 4 — classification complete")
+
+            # Stage 5 — Extraction
+            current_stage = _STAGE_EXTRACTION
+            self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
+            n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
+            _adv(tgt_cs, pr_no, _STAGE_EXTRACTION)
+            self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
+
+            # Stage 6 — Embeddings
+            current_stage = _STAGE_EMBEDDINGS
+            _run_embeddings(tgt_cs, pr_no, self.embed_model,
+                            self.pinecone_index, self.pinecone_namespace)
+            _adv(tgt_cs, pr_no, _STAGE_EMBEDDINGS)
+            self.log(f"[{pr_no}] Stage 6 — embeddings done")
+
+            # Stage 7 — Benchmark
+            current_stage = _STAGE_PRICE_BENCHMARK
+            _run_benchmark(self.llm, tgt_cs, pr_no, self.embed_model,
+                           self.pinecone_index, self.pinecone_namespace, top_k)
+            _adv(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
+            self.log(f"[{pr_no}] Stage 7 — benchmark done")
+
+            # Stage 8 — Complete
+            _adv(tgt_cs, pr_no, _STAGE_COMPLETE)
+            self.log(f"[{pr_no}] Stage 8 — pipeline complete")
+            result["status"] = "complete"
+
+        except Exception as exc:
+            logger.opt(exception=True).error(
+                "[{}] Stage 4-8 failed at stage {}: {}", pr_no, current_stage, exc
+            )
+            result["error"] = str(exc)
+            self._record_exception(tgt_cs, pr_no, current_stage, str(exc))
+
     # ── Process single PR ─────────────────────────────────────────────────
 
     def _process_pr(self, pr_no: str, src_cs: str, tgt_cs: str) -> dict:
@@ -1082,6 +1182,15 @@ class PipelineStage123Node(Node):
 
             result["files"]  = file_data
             result["status"] = "success"
+
+            # ── Full-pipeline mode: continue to stages 4-8 in this same worker ──
+            # Triggered when both llm and embed_model inputs are wired.
+            # Each parallel worker processes one PR end-to-end (stages 1→8)
+            # without waiting for other PRs to finish Stage 1-3 first.
+            _llm = getattr(self, "llm", None)
+            _emb = getattr(self, "embed_model", None)
+            if _llm is not None and _emb is not None:
+                self._run_stages_48(pr_no, tgt_cs, result)
 
         except Exception as exc:
             logger.opt(exception=True).error("[{}] Stage 1-3 failed at stage {}: {}", pr_no, current_stage, exc)
