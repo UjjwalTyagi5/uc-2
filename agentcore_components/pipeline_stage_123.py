@@ -4740,13 +4740,14 @@ class PipelineStage123Node(Node):
         result        = {"pr_no": pr_no, "files": [], "status": "failed", "error": ""}
         current_stage = _STAGE_INGESTION
         work_dir      = tempfile.mkdtemp()
-        self.log(f"[{pr_no}] Worker started")
+        self.log(f"[{pr_no}] Worker started — work_dir={work_dir}")
         try:
             # ── Cleanup at start — only for PRs that already have prior data ──
             # Checked before stage 1: new PR → skipped; existing PR → blobs +
             # Pinecone vectors + quotation_extracted_items + benchmark_result deleted.
             # Explicit handling so cleanup failures are recorded with a clear message
             # before any stage tracker row exists.
+            self.log(f"[{pr_no}] Pre-run cleanup check…")
             try:
                 self._cleanup_for_pr(tgt_cs, pr_no)
             except Exception as cleanup_exc:
@@ -4762,30 +4763,44 @@ class PipelineStage123Node(Node):
 
             # Stage 1 — INGESTION
             current_stage = _STAGE_INGESTION
+            self.log(f"[{pr_no}] Stage 1 — INGESTION starting…")
             self._advance_tracker(tgt_cs, pr_no, _STAGE_INGESTION)
-            self.log(f"[{pr_no}] Stage 1 — ingested")
 
             ras_uuid    = self._get_tracker_uuid(tgt_cs, pr_no)
+            self.log(f"[{pr_no}] Stage 1 — tracker uuid={ras_uuid}, fetching on-prem attachments…")
             attachments = self._fetch_attachments(src_cs, tgt_cs, pr_no)
+            total_bytes = sum(len(a.get("content", b"")) for a in attachments)
+            self.log(
+                f"[{pr_no}] Stage 1 — fetched {len(attachments)} attachment(s) "
+                f"({total_bytes / 1024:.1f} KB total)"
+            )
 
             # BI dashboard sync: read on-prem view → refresh Azure row.
             # Non-fatal — log and continue if it fails.
+            self.log(f"[{pr_no}] Stage 1 — syncing BI dashboard row…")
             try:
                 self._sync_bi_dashboard(src_cs, tgt_cs, pr_no)
             except Exception as _bi_exc:
                 self.log(f"[{pr_no}] Warning — BI dashboard sync failed (non-fatal): {_bi_exc}")
 
             if not attachments:
-                self.log(f"[{pr_no}] No attachments — skipping")
+                self.log(f"[{pr_no}] No attachments — skipping (PR has no on-prem files)")
                 result["status"] = "skipped"
                 return result
+
+            self.log(f"[{pr_no}] Stage 1 — INGESTION complete")
 
             safe_pr  = pr_no.replace("/", "_")
             extractor = FileExtractor()
             all_files = []   # dicts: filename, content, blob_path, att_id, is_embedded
 
+            self.log(
+                f"[{pr_no}] Stage 2 — EMBED_DOC_EXTRACTION starting "
+                f"({len(attachments)} parent attachment(s) to scan for embeds)…"
+            )
+
             failed_atts: list[str] = []
-            for att in attachments:
+            for att_idx, att in enumerate(attachments, 1):
                 att_id   = att["attachment_id"]
                 att_dir  = os.path.join(work_dir, att_id)
                 emb_dir  = os.path.join(att_dir, "extracted")
@@ -4797,6 +4812,14 @@ class PipelineStage123Node(Node):
                     parent_path = os.path.join(att_dir, att["filename"])
                     with open(parent_path, "wb") as fh:
                         fh.write(att["content"])
+
+                    parent_size_kb = len(att["content"]) / 1024
+                    parent_ext     = os.path.splitext(att["filename"])[1].lower() or "<no-ext>"
+                    self.log(
+                        f"[{pr_no}] [{att_idx}/{len(attachments)}] [{att_id}] "
+                        f"{att['filename']} ({parent_size_kb:.1f} KB, {parent_ext}) "
+                        f"— scanning for embedded docs"
+                    )
 
                     # If the parent attachment is itself an archive
                     # (.zip / .rar / .7z / .tar / .tar.gz / .tgz / .tar.bz2),
@@ -4886,13 +4909,42 @@ class PipelineStage123Node(Node):
 
             # Stage 2 — EMBED_DOC_EXTRACTION
             current_stage = _STAGE_EMBED_DOC
+            parent_count   = sum(1 for f in all_files if not f["is_embedded"])
+            embedded_count = sum(1 for f in all_files if f["is_embedded"])
             self._advance_tracker(tgt_cs, pr_no, _STAGE_EMBED_DOC)
-            self.log(f"[{pr_no}] Stage 2 — {len(all_files)} file(s) ready (parent + embedded)")
+            self.log(
+                f"[{pr_no}] Stage 2 — EMBED_DOC_EXTRACTION complete "
+                f"({parent_count} parent + {embedded_count} embedded = {len(all_files)} total file(s))"
+            )
+
+            # Stage 3 — BLOB_UPLOAD
+            current_stage = _STAGE_BLOB_UPLOAD
+            self.log(f"[{pr_no}] Stage 3 — BLOB_UPLOAD starting ({len(all_files)} file(s) → Azure Blob)…")
 
             # Upload all files to blob + build text batch
             file_data = []
-            for f_info in all_files:
-                self._upload_blob(f_info["content"], f_info["blob_path"])
+            uploaded_bytes = 0
+            for upload_idx, f_info in enumerate(all_files, 1):
+                f_size = len(f_info["content"])
+                try:
+                    self._upload_blob(f_info["content"], f_info["blob_path"])
+                    uploaded_bytes += f_size
+                except Exception as upload_exc:
+                    logger.opt(exception=True).error(
+                        "[{}] Blob upload failed for {!r}: {}",
+                        pr_no, f_info["blob_path"], upload_exc,
+                    )
+                    raise
+                # Per-file log only every 10 files (or for big files) to avoid noise
+                # on PRs with many small embeds. Always log first/last.
+                if (upload_idx % 10 == 0
+                        or upload_idx == 1
+                        or upload_idx == len(all_files)
+                        or f_size > 1_000_000):
+                    self.log(
+                        f"[{pr_no}] Stage 3 — uploaded {upload_idx}/{len(all_files)}: "
+                        f"{f_info['filename']} ({f_size / 1024:.1f} KB)"
+                    )
                 text      = self._extract_text(f_info["filename"], f_info["content"])
                 file_type = _detect_file_type(f_info["filename"])
                 extra     = _build_extra_metadata(f_info["filename"], f_info["content"], text)
@@ -4909,10 +4961,11 @@ class PipelineStage123Node(Node):
                     "blob":        f_info["blob_path"],
                 })
 
-            # Stage 3 — BLOB_UPLOAD
-            current_stage = _STAGE_BLOB_UPLOAD
             self._advance_tracker(tgt_cs, pr_no, _STAGE_BLOB_UPLOAD)
-            self.log(f"[{pr_no}] Stage 3 — {len(file_data)} file(s) uploaded to blob")
+            self.log(
+                f"[{pr_no}] Stage 3 — BLOB_UPLOAD complete "
+                f"({len(file_data)} file(s), {uploaded_bytes / 1024:.1f} KB total)"
+            )
 
             result["files"]  = file_data
             result["status"] = "success"
