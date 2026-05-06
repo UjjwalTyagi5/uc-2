@@ -4338,6 +4338,64 @@ class PipelineStage123Node(Node):
 
         return None
 
+    def _batch_reset_for_reprocess(self, tgt_cs: str, pr_nos: list[str]) -> int:
+        """Reset many tracker rows at once for a forced reprocess.
+
+        Equivalent to looping _reset_for_reprocess(pr) for each PR but in
+        2 statements per chunk instead of 2 round-trips per PR. Speeds up
+        Excel-driven runs by O(N) DB calls.
+
+        Steps per chunk (single transaction):
+          1. DELETE ras_pipeline_exceptions for any tracker row in this set
+          2. UPDATE ras_tracker SET current_stage_fk=NULL, retry_count+=1
+
+        Returns number of PRs whose tracker row was actually updated. PRs
+        without a tracker row are silently skipped (UPDATE rowcount=0)
+        and processed as brand-new in _process_pr.
+        """
+        if not pr_nos:
+            return 0
+        BATCH = 500
+        total_updated = 0
+        conn = self._connect(tgt_cs)
+        cur  = conn.cursor()
+        try:
+            for i in range(0, len(pr_nos), BATCH):
+                chunk = pr_nos[i : i + BATCH]
+                placeholders = ",".join(["?"] * len(chunk))
+                cur.execute(
+                    f"""
+                    DELETE FROM [ras_procurement].[ras_pipeline_exceptions]
+                     WHERE ras_tracker_id IN (
+                         SELECT ras_uuid_pk
+                           FROM [ras_procurement].[ras_tracker]
+                          WHERE purchase_req_no IN ({placeholders})
+                     )
+                    """,
+                    *chunk,
+                )
+                cur.execute(
+                    f"""
+                    UPDATE [ras_procurement].[ras_tracker]
+                       SET current_stage_fk = NULL,
+                           retry_count      = COALESCE(retry_count, 0) + 1,
+                           updated_at       = SYSUTCDATETIME()
+                     WHERE purchase_req_no IN ({placeholders})
+                    """,
+                    *chunk,
+                )
+                total_updated += cur.rowcount
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+        return total_updated
+
     def _fetch_current_stages(self, tgt_cs: str, pr_nos: list[str]) -> dict[str, int | None]:
         """Return {pr_no → current_stage_fk} for the given PRs.
 
@@ -5010,12 +5068,43 @@ class PipelineStage123Node(Node):
 
     # ── Process single PR ─────────────────────────────────────────────────
 
-    def _process_pr(self, pr_no: str, src_cs: str, tgt_cs: str) -> dict:
+    def _process_pr(
+        self,
+        pr_no: str,
+        src_cs: str,
+        tgt_cs: str,
+        *,
+        skip_if_complete: bool = False,
+    ) -> dict:
         import os, shutil, tempfile
         result        = {"pr_no": pr_no, "files": [], "status": "failed", "error": ""}
         current_stage = _STAGE_INGESTION
         work_dir      = tempfile.mkdtemp()
         self.log(f"[{pr_no}] Worker started — work_dir={work_dir}")
+
+        # Excel mode: each worker first checks the tracker and short-circuits
+        # if the PR is already at stage 8 (COMPLETE) so we do not redo work.
+        # This DB read happens on the worker's own connection, so N PRs run
+        # the check in *parallel* — no serial pre-pass needed before the pool.
+        if skip_if_complete:
+            try:
+                stage_now = _get_pr_current_stage(tgt_cs, pr_no)
+            except Exception as exc:
+                # Failure to check stage is non-fatal — we proceed with full
+                # processing rather than skipping a PR we shouldn't have.
+                self.log(
+                    f"[{pr_no}] Stage check failed (will process anyway): {exc}"
+                )
+                stage_now = -1
+            if stage_now == _STAGE_COMPLETE:
+                self.log(
+                    f"[{pr_no}] Already at stage {_STAGE_COMPLETE} (COMPLETE) "
+                    f"— skipping (no cleanup, no reprocess)"
+                )
+                result["status"] = "already_complete"
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return result
+
         try:
             # ── Cleanup at start — only for PRs that already have prior data ──
             # Checked before stage 1: new PR → skipped; existing PR → blobs +
@@ -5318,61 +5407,21 @@ class PipelineStage123Node(Node):
             self._cached_pr_numbers = []
             return msg
 
-        skipped_complete: list[str] = []
         if pr_filter:
+            # Single-PR mode = explicit force reprocess regardless of state.
             # Reset tracker from exception/any stage back to NULL so _process_pr
             # picks it up cleanly. Actual data cleanup (blobs, Pinecone, DB tables)
             # happens inside _process_pr at the start via _cleanup_for_pr.
             self._reset_for_reprocess(tgt_cs, pr_filter)
             self.log(f"Single-PR reprocess: {pr_filter!r} — tracker reset, cleanup will run at processing start")
         elif run_mode == "excel":
-            # Skip PRs already at COMPLETE (stage 8) — no need to redo work
-            # that finished successfully. Anything else (stage 1-7, 99, or
-            # missing tracker row) gets force-reset so _process_pr +
-            # _cleanup_for_pr can re-run end-to-end from a clean slate.
-            current_stages = self._fetch_current_stages(tgt_cs, pr_list)
-            to_run: list[str] = []
-            for pr in pr_list:
-                stage_now = current_stages.get(pr)
-                if stage_now == _STAGE_COMPLETE:
-                    skipped_complete.append(pr)
-                    continue
-                to_run.append(pr)
-
-            if skipped_complete:
-                preview = skipped_complete[:5]
-                more = len(skipped_complete) - 5
-                self.log(
-                    f"Excel — skipping {len(skipped_complete)} PR(s) already at "
-                    f"COMPLETE (stage {_STAGE_COMPLETE}): {preview}"
-                    + (f" … +{more} more" if more > 0 else "")
-                )
-
-            for pr in to_run:
-                try:
-                    self._reset_for_reprocess(tgt_cs, pr)
-                except Exception as exc:
-                    self.log(f"[{pr}] Warning — tracker reset failed (will still attempt processing): {exc}")
-            pr_list = to_run
+            # Excel mode = workers self-filter inside _process_pr via
+            # skip_if_complete=True. No serial pre-pass: stage-8 check
+            # runs on each worker's own DB connection in parallel.
             self.log(
-                f"Excel-driven reprocess: {len(pr_list)} PR(s) reset, "
-                f"{len(skipped_complete)} skipped — "
-                f"cleanup runs at processing start for each"
+                f"Excel-driven run: {len(pr_list)} PR(s) queued — "
+                f"each worker will skip if already at stage {_STAGE_COMPLETE}"
             )
-
-        if not pr_list:
-            text = (
-                f"[Excel — all {len(skipped_complete)} PR(s) already at COMPLETE; nothing to do]"
-                if run_mode == "excel" and skipped_complete
-                else "[No pending PRs to process]"
-            )
-            msg = Message(text=text)
-            self._cached_result = msg
-            # Skipped PRs are NOT included — get_processed_prs reflects work
-            # done in *this* run, and a downstream Stage 4-8 component should
-            # not re-touch a PR that already finished in a prior run.
-            self._cached_pr_numbers = []
-            return msg
 
         workers = max(1, int(self.parallel_workers))
         self.log(
@@ -5386,10 +5435,21 @@ class PipelineStage123Node(Node):
         self._blob_cfg()
         self._container_client()
 
+        # Worker-side skip is only enabled for Excel mode. Single-PR mode is
+        # an explicit force reprocess (must run regardless of stage), and the
+        # pending-batch flow already filters stage 8 out at fetch time.
+        skip_if_complete = (run_mode == "excel")
+
         import concurrent.futures
         results: list[dict] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(self._process_pr, pr, src_cs, tgt_cs): pr for pr in pr_list}
+            futures = {
+                pool.submit(
+                    self._process_pr, pr, src_cs, tgt_cs,
+                    skip_if_complete=skip_if_complete,
+                ): pr
+                for pr in pr_list
+            }
             for f in concurrent.futures.as_completed(futures):
                 results.append(f.result())
 
@@ -5414,17 +5474,16 @@ class PipelineStage123Node(Node):
                     f"============================================================\n\n"
                 )
 
-        # Summary log — one line per status bucket. Includes any PRs that were
-        # skipped pre-execution (Excel mode, stage 8 skip).
+        # Summary log — one line per status bucket. The "already_complete"
+        # bucket is populated by workers that found their PR at stage 8 and
+        # short-circuited (Excel mode). All buckets come from results since
+        # there is no longer a serial pre-pass.
         status_counts: dict[str, int] = {}
         for r in results:
             s = r.get("status", "failed")
             status_counts[s] = status_counts.get(s, 0) + 1
-        if skipped_complete:
-            status_counts["already_complete"] = len(skipped_complete)
         summary_parts = [f"{v} {k}" for k, v in sorted(status_counts.items())]
-        total_handled = len(results) + len(skipped_complete)
-        self.log(f"Run complete — {total_handled} PR(s): {', '.join(summary_parts)}")
+        self.log(f"Run complete — {len(results)} PR(s): {', '.join(summary_parts)}")
         for r in results:
             if r.get("error"):
                 self.log(f"  [{r['pr_no']}] {r['status']}: {r['error']}")
