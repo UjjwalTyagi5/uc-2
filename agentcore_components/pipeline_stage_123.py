@@ -93,6 +93,8 @@ FILE_SIGNATURES = [
     (b"Rar!\x1A\x07",       ".rar"),
     (b"\xFF\xD8\xFF",       ".jpg"),
     (b"\x89PNG\r\n\x1A\n",  ".png"),
+    (b"II*\x00",            ".tif"),  # TIFF little-endian
+    (b"MM\x00*",            ".tif"),  # TIFF big-endian
 ]
 
 
@@ -142,12 +144,56 @@ class FileExtractor:
                 best = (pos, ext)
         return best if best else (None, None)
 
+    def _classify_zip(self, path: str) -> str:
+        """If a saved .zip is actually an Office Open XML file, return the
+        correct extension (.xlsx / .docx / .pptx). Mirrors doc-intel's
+        embed_doc_extraction.extractor._classify_zip — without it, an XLSX
+        payload extracted from an OLE container ends up on disk as `.zip`,
+        which the classifier (limited to _SUPPORTED_CLASSIFY_EXTS) treats
+        as 'Others' and any embedded Quotation is lost.
+        """
+        import zipfile
+        try:
+            with zipfile.ZipFile(path, "r") as z:
+                names = set(z.namelist())
+                if "[Content_Types].xml" in names:
+                    if any(n.startswith("xl/")   for n in names): return ".xlsx"
+                    if any(n.startswith("word/") for n in names): return ".docx"
+                    if any(n.startswith("ppt/")  for n in names): return ".pptx"
+        except Exception:
+            pass
+        return ".zip"
+
+    def _maybe_fix_zip_extension(self, target: str) -> str:
+        """If `target` ends in .zip but is actually OOXML, rename and return new path."""
+        import os
+        if not target.lower().endswith(".zip"):
+            return target
+        correct = self._classify_zip(target)
+        if correct == ".zip":
+            return target
+        new_path = self.unique_path(
+            os.path.dirname(target),
+            os.path.splitext(os.path.basename(target))[0] + correct,
+        )
+        try:
+            os.replace(target, new_path)
+            logger.debug("Reclassified .zip → {}: {}", correct, os.path.basename(new_path))
+            return new_path
+        except Exception as exc:
+            logger.warning("Could not rename {} → {}: {}", target, new_path, exc)
+            return target
+
     def _save_file(self, data: bytes, filename: str, out: str) -> str:
         import os, shutil
         target = self.unique_path(out, self.with_prefix(filename))
         with open(target, "wb") as f:
             f.write(data)
         self.extracted_count += 1
+        # Fix OOXML-misclassified-as-.zip BEFORE archive expansion so the
+        # file isn't extracted as a plain ZIP archive when it's actually an
+        # XLSX/DOCX/PPTX worth classifying directly.
+        target = self._maybe_fix_zip_extension(target)
         if target.lower().endswith(ARCHIVE_EXTENSIONS):
             self.extract_archive(target, out)
         return target
@@ -230,6 +276,9 @@ class FileExtractor:
                                 dst = self.unique_path(out, self.with_prefix(fn))
                                 shutil.copy2(src, dst)
                                 self.extracted_count += 1
+                                # OOXML embeddings often come as .zip-stamped
+                                # bytes that are really nested xlsx/docx/pptx.
+                                dst = self._maybe_fix_zip_extension(dst)
                                 if dst.lower().endswith(ARCHIVE_EXTENSIONS):
                                     self.extract_archive(dst, out)
             return True
@@ -266,6 +315,11 @@ class FileExtractor:
                     with open(target, "wb") as f:
                         f.write(payload)
                     self.extracted_count += 1
+                    # Reclassify .zip → .xlsx/.docx/.pptx if the payload was
+                    # actually an OOXML doc; then expand if it remains a zip.
+                    target = self._maybe_fix_zip_extension(target)
+                    if target.lower().endswith(ARCHIVE_EXTENSIONS):
+                        self.extract_archive(target, out)
                 except Exception:
                     pass
             ole.close()
@@ -301,6 +355,10 @@ class FileExtractor:
                     with open(target, "wb") as f:
                         f.write(payload)
                     self.extracted_count += 1
+                    # Same OOXML-misclassified-as-.zip fix as in _extract_from_bin.
+                    target = self._maybe_fix_zip_extension(target)
+                    if target.lower().endswith(ARCHIVE_EXTENSIONS):
+                        self.extract_archive(target, out)
                 except Exception:
                     pass
             ole.close()
@@ -4723,9 +4781,40 @@ class PipelineStage123Node(Node):
                     with open(parent_path, "wb") as fh:
                         fh.write(att["content"])
 
-                    # Run embedded extraction
+                    # If the parent attachment is itself an archive
+                    # (.zip / .rar / .7z / .tar / .tar.gz / .tgz / .tar.bz2),
+                    # expand its contents directly into emb_dir so each inner
+                    # file becomes a separately-classifiable embedded record.
+                    # Without this, a zipped quotation is invisible to Stage 4
+                    # (the .zip itself is not in _SUPPORTED_CLASSIFY_EXTS).
+                    # Mirrors doc-intel pipeline.stages.embed_doc_extraction
+                    # pass-1 archive expansion, adapted to the AgentCore flow:
+                    # the original archive bytes still serve as the parent
+                    # blob, but its contents flow through as embedded files.
                     extractor.parent_prefix = os.path.splitext(att["filename"])[0]
-                    extractor.process_file(parent_path, emb_dir)
+                    if att["filename"].lower().endswith(ARCHIVE_EXTENSIONS):
+                        self.log(
+                            f"[{pr_no}] [{att_id}] expanding archive "
+                            f"{att['filename']!r} into embedded set"
+                        )
+                        extractor.extract_archive(parent_path, emb_dir)
+                        # extract_archive deletes the archive on disk; rewrite
+                        # it so the parent blob upload still has the bytes.
+                        with open(parent_path, "wb") as fh:
+                            fh.write(att["content"])
+                        # Then process every newly extracted file that itself
+                        # is a supported parent (xlsx/docx/pdf/etc.) for any
+                        # nested embeds — matches doc-intel pass-2.
+                        for inner_name in sorted(os.listdir(emb_dir)):
+                            inner_path = os.path.join(emb_dir, inner_name)
+                            if not os.path.isfile(inner_path):
+                                continue
+                            if inner_name.lower().endswith(SUPPORTED_PARENTS):
+                                extractor.parent_prefix = os.path.splitext(inner_name)[0]
+                                extractor.process_file(inner_path, emb_dir)
+                    else:
+                        # Standard parent — extract embedded media/docs.
+                        extractor.process_file(parent_path, emb_dir)
 
                     # Collect embedded file contents
                     embedded = []
