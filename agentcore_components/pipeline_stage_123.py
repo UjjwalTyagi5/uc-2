@@ -4322,6 +4322,38 @@ class PipelineStage123Node(Node):
 
         return None
 
+    def _fetch_current_stages(self, tgt_cs: str, pr_nos: list[str]) -> dict[str, int | None]:
+        """Return {pr_no → current_stage_fk} for the given PRs.
+
+        Missing tracker rows are mapped to None. Used by Excel-driven runs to
+        skip PRs that already reached COMPLETE (stage 8) without re-fetching
+        them per worker.
+        """
+        if not pr_nos:
+            return {}
+        # SQL Server caps IN(...) at ~2100 placeholders; chunk in batches of
+        # 500 to be well under that limit.
+        result: dict[str, int | None] = {pr: None for pr in pr_nos}
+        BATCH = 500
+        conn = self._connect(tgt_cs)
+        cur  = conn.cursor()
+        try:
+            for i in range(0, len(pr_nos), BATCH):
+                chunk = pr_nos[i : i + BATCH]
+                placeholders = ",".join(["?"] * len(chunk))
+                cur.execute(
+                    f"SELECT purchase_req_no, current_stage_fk "
+                    f"FROM [ras_procurement].[ras_tracker] "
+                    f"WHERE purchase_req_no IN ({placeholders})",
+                    *chunk,
+                )
+                for row in cur.fetchall():
+                    pr, stage = row[0], row[1]
+                    result[pr] = int(stage) if stage is not None else None
+        finally:
+            conn.close()
+        return result
+
     def _fetch_pending_prs(self, tgt_cs: str) -> list[str]:
         pr_filter = (self.pr_no_filter or "").strip()
         if pr_filter:
@@ -5270,6 +5302,7 @@ class PipelineStage123Node(Node):
             self._cached_pr_numbers = []
             return msg
 
+        skipped_complete: list[str] = []
         if pr_filter:
             # Reset tracker from exception/any stage back to NULL so _process_pr
             # picks it up cleanly. Actual data cleanup (blobs, Pinecone, DB tables)
@@ -5277,20 +5310,53 @@ class PipelineStage123Node(Node):
             self._reset_for_reprocess(tgt_cs, pr_filter)
             self.log(f"Single-PR reprocess: {pr_filter!r} — tracker reset, cleanup will run at processing start")
         elif run_mode == "excel":
-            # Each Excel-supplied PR is force-reprocessed from scratch (matches
-            # doc-intel run_pipeline_from_excel.py behaviour). Reset every
-            # tracker row up-front so _process_pr / _cleanup_for_pr picks them
-            # up cleanly regardless of their previous state (COMPLETE,
-            # EXCEPTION, mid-stage).
+            # Skip PRs already at COMPLETE (stage 8) — no need to redo work
+            # that finished successfully. Anything else (stage 1-7, 99, or
+            # missing tracker row) gets force-reset so _process_pr +
+            # _cleanup_for_pr can re-run end-to-end from a clean slate.
+            current_stages = self._fetch_current_stages(tgt_cs, pr_list)
+            to_run: list[str] = []
             for pr in pr_list:
+                stage_now = current_stages.get(pr)
+                if stage_now == _STAGE_COMPLETE:
+                    skipped_complete.append(pr)
+                    continue
+                to_run.append(pr)
+
+            if skipped_complete:
+                preview = skipped_complete[:5]
+                more = len(skipped_complete) - 5
+                self.log(
+                    f"Excel — skipping {len(skipped_complete)} PR(s) already at "
+                    f"COMPLETE (stage {_STAGE_COMPLETE}): {preview}"
+                    + (f" … +{more} more" if more > 0 else "")
+                )
+
+            for pr in to_run:
                 try:
                     self._reset_for_reprocess(tgt_cs, pr)
                 except Exception as exc:
                     self.log(f"[{pr}] Warning — tracker reset failed (will still attempt processing): {exc}")
+            pr_list = to_run
             self.log(
-                f"Excel-driven reprocess: {len(pr_list)} PR(s) reset — "
+                f"Excel-driven reprocess: {len(pr_list)} PR(s) reset, "
+                f"{len(skipped_complete)} skipped — "
                 f"cleanup runs at processing start for each"
             )
+
+        if not pr_list:
+            text = (
+                f"[Excel — all {len(skipped_complete)} PR(s) already at COMPLETE; nothing to do]"
+                if run_mode == "excel" and skipped_complete
+                else "[No pending PRs to process]"
+            )
+            msg = Message(text=text)
+            self._cached_result = msg
+            # Skipped PRs are NOT included — get_processed_prs reflects work
+            # done in *this* run, and a downstream Stage 4-8 component should
+            # not re-touch a PR that already finished in a prior run.
+            self._cached_pr_numbers = []
+            return msg
 
         workers = max(1, int(self.parallel_workers))
         self.log(
@@ -5332,13 +5398,17 @@ class PipelineStage123Node(Node):
                     f"============================================================\n\n"
                 )
 
-        # Summary log — one line per status bucket
+        # Summary log — one line per status bucket. Includes any PRs that were
+        # skipped pre-execution (Excel mode, stage 8 skip).
         status_counts: dict[str, int] = {}
         for r in results:
             s = r.get("status", "failed")
             status_counts[s] = status_counts.get(s, 0) + 1
+        if skipped_complete:
+            status_counts["already_complete"] = len(skipped_complete)
         summary_parts = [f"{v} {k}" for k, v in sorted(status_counts.items())]
-        self.log(f"Run complete — {len(results)} PR(s): {', '.join(summary_parts)}")
+        total_handled = len(results) + len(skipped_complete)
+        self.log(f"Run complete — {total_handled} PR(s): {', '.join(summary_parts)}")
         for r in results:
             if r.get("error"):
                 self.log(f"  [{r['pr_no']}] {r['status']}: {r['error']}")
