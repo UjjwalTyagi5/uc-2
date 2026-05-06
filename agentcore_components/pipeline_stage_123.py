@@ -3830,6 +3830,98 @@ def _fetch_pending_prs(tgt_cs: str, pr_filter: str, batch_limit: int) -> list:
         conn.close()
 
 
+# ── Excel-driven PR list (mirrors doc-intel run_pipeline_from_excel.py) ──
+
+_AUTO_DETECT_PR_COLUMNS = {
+    "purchase_req_no", "purchase req no",
+    "pr_no", "pr no", "pr number",
+    "ras_no", "ras no", "ras number",
+}
+
+
+def _parse_pr_list_from_excel_bytes(
+    excel_bytes: bytes,
+    column: str | None = None,
+    sheet: str | None = None,
+) -> list[str]:
+    """Parse purchase requisition numbers out of an .xlsx blob.
+
+    Mirrors doc-intel run_pipeline_from_excel.py._read_pr_nos_from_excel,
+    adapted to read from in-memory bytes (Azure Blob / wired Data input)
+    instead of a local file path.
+
+    Column selection:
+      1. explicit `column` arg → exact case-insensitive header match
+      2. auto-detect from PURCHASE_REQ_NO / PR_NO / RAS_NO / "PR Number" etc.
+      3. fall back to the first column
+
+    Returns deduplicated, non-empty PR numbers in the order they appear.
+    """
+    import io as _io
+    from openpyxl import load_workbook
+
+    wb = load_workbook(_io.BytesIO(excel_bytes), read_only=True, data_only=True)
+    try:
+        sheet_name = (sheet or "").strip()
+        if sheet_name:
+            if sheet_name not in wb.sheetnames:
+                raise ValueError(
+                    f"Sheet {sheet_name!r} not found. Available: {wb.sheetnames}"
+                )
+            ws = wb[sheet_name]
+        else:
+            ws = wb.active
+
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return []
+
+        headers = [
+            str(h).strip() if h is not None else ""
+            for h in rows[0]
+        ]
+
+        col_idx: int | None = None
+        col_arg = (column or "").strip()
+        if col_arg:
+            for i, h in enumerate(headers):
+                if h.lower() == col_arg.lower():
+                    col_idx = i
+                    break
+            if col_idx is None:
+                raise ValueError(
+                    f"Column {col_arg!r} not found. Headers: {headers}"
+                )
+        else:
+            for i, h in enumerate(headers):
+                if h.lower() in _AUTO_DETECT_PR_COLUMNS:
+                    col_idx = i
+                    logger.info("Excel PR list — auto-detected column {!r}", h)
+                    break
+            if col_idx is None:
+                col_idx = 0
+                logger.info(
+                    "Excel PR list — no recognised PR column header; using first column {!r}",
+                    headers[0] if headers else "<empty>",
+                )
+
+        seen: set[str] = set()
+        pr_nos: list[str] = []
+        for row in rows[1:]:
+            if col_idx >= len(row):
+                continue
+            val = row[col_idx]
+            if val is None:
+                continue
+            pr_no = str(val).strip()
+            if pr_no and pr_no not in seen:
+                seen.add(pr_no)
+                pr_nos.append(pr_no)
+        return pr_nos
+    finally:
+        wb.close()
+
+
 # ── Main Component ─────────────────────────────────────────────────────────────
 
 
@@ -3875,6 +3967,62 @@ class PipelineStage123Node(Node):
                 "Leave blank to process all pending approved PRs. "
                 "Enter one PURCHASE_REQ_NO to force a full reprocess from scratch."
             ),
+        ),
+        # ── Excel-driven PR list (mirrors doc-intel run_pipeline_from_excel.py) ──
+        # Use ANY ONE of:
+        #   - PR Number Filter            → single PR, full reprocess
+        #   - Excel Blob Path             → download Excel from the configured
+        #                                   Blob Connector container, parse PR list
+        #   - PR List Data (HandleInput)  → wire any component (Blob Reader,
+        #                                   Knowledge Base, etc.) that outputs
+        #                                   either raw bytes or a list under
+        #                                   data["pr_numbers"]
+        # If none are set, the component falls back to fetching pending PRs
+        # from ras_tracker (the standard batch flow).
+        MessageTextInput(
+            name="pr_excel_blob_path",
+            display_name="PR List Excel — Blob Path (optional)",
+            value="",
+            advanced=True,
+            info=(
+                "Blob path inside the configured Blob Connector container "
+                "pointing to an .xlsx with a PURCHASE_REQ_NO column "
+                "(e.g. procurement/pr_lists/2026-04.xlsx). Each PR is "
+                "force-reprocessed from scratch like the single-PR filter."
+            ),
+        ),
+        HandleInput(
+            name="pr_list_data",
+            display_name="PR List Data (optional)",
+            input_types=["Data"],
+            required=False,
+            info=(
+                "Wire a Blob Reader / Knowledge Base / file-loader component "
+                "that outputs Data here. Accepted shapes: "
+                "(a) data['pr_numbers'] = [list of PURCHASE_REQ_NO strings] — "
+                "consumed directly; or "
+                "(b) data['content'] / data['bytes'] / data['file_bytes'] = "
+                "raw .xlsx bytes — parsed inline."
+            ),
+        ),
+        MessageTextInput(
+            name="pr_excel_column",
+            display_name="PR List Excel — Column Name (optional)",
+            value="",
+            advanced=True,
+            info=(
+                "Header of the column holding PURCHASE_REQ_NO values. "
+                "Auto-detected from common names "
+                "(PURCHASE_REQ_NO / PR_NO / RAS_NO / PR Number) "
+                "if blank, else falls back to the first column."
+            ),
+        ),
+        MessageTextInput(
+            name="pr_excel_sheet",
+            display_name="PR List Excel — Sheet Name (optional)",
+            value="",
+            advanced=True,
+            info="Worksheet to read. Defaults to the first sheet.",
         ),
         # ── Stages 4-8 inputs ────────────────────────────────────────────────
         HandleInput(
@@ -4094,6 +4242,85 @@ class PipelineStage123Node(Node):
         return self._blob_config_cache
 
     # ── Fetch pending PRs ─────────────────────────────────────────────────
+
+    def _resolve_excel_pr_list(self) -> list[str] | None:
+        """Try the three Excel-driven input sources, in priority order.
+
+        Returns
+        -------
+        None
+            No Excel-driven input wired/configured — caller falls back to
+            _fetch_pending_prs.
+        list[str]
+            Deduplicated PURCHASE_REQ_NO values to force-reprocess. Empty
+            list means an Excel WAS provided but contained zero rows; the
+            caller treats that as "nothing to do".
+        """
+        # Source 1: HandleInput Data wired from a Blob Reader / KB / loader.
+        # Accepted shapes — checked in order:
+        #   data["pr_numbers"]  → already-parsed list, no Excel parsing needed
+        #   data["content"] / ["bytes"] / ["file_bytes"]  → raw .xlsx bytes
+        data_in = getattr(self, "pr_list_data", None)
+        if data_in is not None:
+            payload = getattr(data_in, "data", None) or {}
+            if isinstance(payload, dict):
+                pr_list = payload.get("pr_numbers") or payload.get("pr_nos")
+                if isinstance(pr_list, list) and pr_list:
+                    cleaned = [str(p).strip() for p in pr_list if str(p).strip()]
+                    self.log(
+                        f"Excel PR list — using {len(cleaned)} PR(s) from "
+                        f"wired Data.pr_numbers (no parsing needed)"
+                    )
+                    return cleaned
+                for key in ("content", "bytes", "file_bytes"):
+                    raw = payload.get(key)
+                    if raw:
+                        if isinstance(raw, str):
+                            try:
+                                import base64 as _b64
+                                raw = _b64.b64decode(raw)
+                            except Exception:
+                                raw = raw.encode("latin-1", errors="ignore")
+                        try:
+                            pr_nos = _parse_pr_list_from_excel_bytes(
+                                bytes(raw),
+                                column=(self.pr_excel_column or None),
+                                sheet=(self.pr_excel_sheet or None),
+                            )
+                            self.log(
+                                f"Excel PR list — parsed {len(pr_nos)} PR(s) "
+                                f"from wired Data.{key}"
+                            )
+                            return pr_nos
+                        except Exception as exc:
+                            logger.opt(exception=True).error(
+                                "Failed to parse Excel from wired Data.{}: {}", key, exc,
+                            )
+                            raise
+
+        # Source 2: blob path under the configured Blob Connector container.
+        blob_path = (getattr(self, "pr_excel_blob_path", None) or "").strip()
+        if blob_path:
+            self.log(f"Excel PR list — downloading from blob: {blob_path!r}")
+            try:
+                blob_cfg    = self._blob_cfg()
+                excel_bytes = _download_blob(blob_path, blob_cfg)
+                pr_nos = _parse_pr_list_from_excel_bytes(
+                    excel_bytes,
+                    column=(self.pr_excel_column or None),
+                    sheet=(self.pr_excel_sheet or None),
+                )
+                self.log(
+                    f"Excel PR list — parsed {len(pr_nos)} PR(s) from {blob_path!r}"
+                )
+                return pr_nos
+            except Exception as exc:
+                logger.opt(exception=True).error(
+                    "Failed to download/parse Excel from blob {!r}: {}", blob_path, exc,
+                )
+                raise
+
+        return None
 
     def _fetch_pending_prs(self, tgt_cs: str) -> list[str]:
         pr_filter = (self.pr_no_filter or "").strip()
@@ -5000,16 +5227,45 @@ class PipelineStage123Node(Node):
         tgt_cs    = self._conn_str(self.target_connection)
         pr_filter = (self.pr_no_filter or "").strip()
 
+        # Source resolution order:
+        #   1. pr_no_filter           → single PR, force reprocess
+        #   2. pr_list_data /         → Excel-driven (wired Data input or
+        #      pr_excel_blob_path        blob path), each PR force-reprocessed
+        #   3. _fetch_pending_prs     → standard batch from ras_tracker
+        excel_pr_list: list[str] | None = None
+        if not pr_filter:
+            try:
+                excel_pr_list = self._resolve_excel_pr_list()
+            except Exception as exc:
+                msg_text = f"[Excel PR list could not be read: {exc}]"
+                self.log(msg_text)
+                msg = Message(text=msg_text)
+                self._cached_result = msg
+                self._cached_pr_numbers = []
+                return msg
+
         # Detect completed PRs whose on-prem source data changed (U_DATETIME >
         # last_processed_at) and reset them to stage 1 so they are re-processed
         # in this run. Non-fatal — skipped silently on failure.
-        if not pr_filter:
+        # Skipped when an explicit list (single-PR or Excel) is being run —
+        # that flow already specifies exactly which PRs to process.
+        if not pr_filter and excel_pr_list is None:
             self._detect_and_requeue_changed_prs(tgt_cs)
 
-        pr_list   = self._fetch_pending_prs(tgt_cs)
+        if excel_pr_list is not None:
+            pr_list = excel_pr_list
+            run_mode = "excel"
+        else:
+            pr_list = self._fetch_pending_prs(tgt_cs)
+            run_mode = "single" if pr_filter else "pending"
 
         if not pr_list:
-            msg = Message(text="[No pending PRs to process]")
+            text = (
+                "[Excel PR list was empty — nothing to process]"
+                if run_mode == "excel"
+                else "[No pending PRs to process]"
+            )
+            msg = Message(text=text)
             self._cached_result = msg
             self._cached_pr_numbers = []
             return msg
@@ -5020,9 +5276,27 @@ class PipelineStage123Node(Node):
             # happens inside _process_pr at the start via _cleanup_for_pr.
             self._reset_for_reprocess(tgt_cs, pr_filter)
             self.log(f"Single-PR reprocess: {pr_filter!r} — tracker reset, cleanup will run at processing start")
+        elif run_mode == "excel":
+            # Each Excel-supplied PR is force-reprocessed from scratch (matches
+            # doc-intel run_pipeline_from_excel.py behaviour). Reset every
+            # tracker row up-front so _process_pr / _cleanup_for_pr picks them
+            # up cleanly regardless of their previous state (COMPLETE,
+            # EXCEPTION, mid-stage).
+            for pr in pr_list:
+                try:
+                    self._reset_for_reprocess(tgt_cs, pr)
+                except Exception as exc:
+                    self.log(f"[{pr}] Warning — tracker reset failed (will still attempt processing): {exc}")
+            self.log(
+                f"Excel-driven reprocess: {len(pr_list)} PR(s) reset — "
+                f"cleanup runs at processing start for each"
+            )
 
         workers = max(1, int(self.parallel_workers))
-        self.log(f"Processing {len(pr_list)} PR(s) with {workers} parallel worker(s)…")
+        self.log(
+            f"Processing {len(pr_list)} PR(s) [mode={run_mode}] "
+            f"with {workers} parallel worker(s)…"
+        )
 
         # Pre-warm shared caches before threads start so all workers reuse the
         # same already-initialised ContainerClient / blob config rather than
