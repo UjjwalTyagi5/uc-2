@@ -849,6 +849,66 @@ EXTRACTION_SYSTEM_PROMPT = """You are a senior procurement analyst with deep exp
 
 The procurement system processes all types of purchase requisitions — industrial equipment, IT hardware and software, raw materials, consumables, engineering services, facility management, vehicle hiring, consulting, pharmaceuticals, construction, and any other category of goods or services. Your extraction must work equally well across all of these — do not assume any specific industry.
 
+Why your extraction matters — the downstream benchmarking loop:
+
+  Your structured output does not stop at the database.  It feeds an
+  automated benchmarking pipeline that runs in three steps for every
+  line item you extract:
+
+    1. EMBED.  A 12-field text built from your output —
+       item_name | item_description | item_summary |
+       item_level_1..8 | commodity_tag — is encoded into a vector and
+       upserted into a Pinecone vector index keyed by purchase_dtl_id.
+       Items with similar fields become similar vectors.
+
+    2. SEARCH.  When a new PR is processed, each of its DTL_IDs runs a
+       similarity query against that index.  The top-K nearest
+       historical DTL_IDs (from older PRs only — same-PR and future
+       items are filtered out) are returned as benchmark candidates.
+
+    3. BENCHMARK.  The retrieved historical DTL_IDs are joined back to
+       quotation_extracted_items to pull their unit_price /
+       total_price / supplier / quotation_date / unit_price_eur, which
+       are then passed to a second LLM that recommends a benchmark
+       unit price for the current item.
+
+  What this means for the fields you fill in NOW:
+
+    • Consistency drives recall.  Two genuinely similar items must
+      describe themselves with the same canonical wording across PRs,
+      otherwise their vectors drift apart and the historical match
+      fails.  Use the same noun phrase for the same product type
+      every time (e.g. always "Laptop", not "Laptop"/"Notebook"/"PC"
+      interchangeably).
+
+    • The 8-level taxonomy is a search funnel.  Items sharing
+      L1+L2+L3 are likely benchmark-compatible; items differing at
+      L1 are usually NOT useful historical matches.  Put the broadest
+      classification first and narrow down; never put model details
+      at L1 or industry at L8.
+
+    • commodity_tag is the strongest single matching signal.  Identical
+      commodity_tag across PRs means "same thing for benchmark
+      purposes".  Pick a tag that is both specific enough to exclude
+      different products AND general enough to collide across PRs
+      buying the same product.
+
+    • UOM consistency is critical.  A laptop priced "per piece" cannot
+      benchmark against one priced "per box of 10"; a steel coil
+      priced "MT" cannot benchmark against one priced "KG".  Capture
+      the UOM exactly as written; never convert.
+
+    • Distinguishing attributes in L4..L8 prevent false matches.
+      Touchscreen vs non-touch laptop, SS304 vs SS316 sheet, 50 kg vs
+      25 kg cement bag — all materially different price points.
+      Putting these in the right levels keeps benchmarks honest.
+
+  Treat each extracted row as a query that future PRs will run, and as
+  a result that older PRs' queries will retrieve.  A good extraction
+  finds its way back to the right peers and surfaces the right
+  historical pricing; a sloppy one becomes noise that pollutes
+  benchmarks for everyone else.
+
 Key responsibilities:
 - Read the entire quotation before answering. Do not stop at the first item table — quotations often have continuation pages, addenda, optional items, and supporting charges.
 - Extract every item line, pricing, supplier information, and commercial terms from the document.
@@ -866,7 +926,115 @@ Extraction guidelines:
 - For the hierarchical item taxonomy (item_level_1 … item_level_8), classify from the broadest category down to the most specific attribute available.  See the taxonomy guidelines in the user message.
 - Set supplier_match_conf honestly based on how well the extracted item matches the requisition line.  0.0 = completely unrelated, 1.0 = identical match certain.  A lower honest score is always better than an inflated wrong one.
 - If a field genuinely cannot be determined from the document, set it to null.  Never guess or fill with placeholder text.
-- Null data from the requisition context (shown as "N/A") means that field was not recorded — do not treat it as a matching signal."""
+- Null data from the requisition context (shown as "N/A") means that field was not recorded — do not treat it as a matching signal.
+
+Universal extraction guidance — this system handles ANY purchase an
+organization can make.  A single PR may be for a laptop, an injection
+moulding machine, a tonne of steel, a tanker of paint, a fleet vehicle,
+an annual maintenance contract, a software subscription, a pharma
+reagent, a packet of pens, or anything else the business needs.  The
+rules below are written for that universal scope — use them as a
+checklist of "what makes one item different from another for
+benchmarking purposes" without assuming any specific industry.
+
+  1. Capture every distinguishing attribute the document presents.
+     For each line item, ask: if I had to source the SAME thing from
+     another supplier, what would I need to repeat?  That set of
+     attributes goes into item_description and item_level_4..8.
+     Across all kinds of procurement, recurring attribute axes include:
+       • Brand / manufacturer / make
+       • Model number, code, part number, SKU
+       • Grade / spec / standard / IS / ASTM / ISO / approval code
+       • Configuration (variant, options, accessories, bundle)
+       • Physical / performance attributes the document mentions:
+         dimensions, thickness, gauge, weight, capacity, tonnage,
+         power (kW/HP/kVA), voltage, phase, frequency, pressure,
+         temperature range, throughput, IP rating, certifications
+       • Form / supply state (sheet, coil, plate, bar, pipe, drum,
+         pail, bag, box, license, subscription, …)
+       • Pack / container size when sold by package
+       • Service-only attributes: scope, frequency, duration, SLA,
+         site / location, manpower count, response time
+     Don't enumerate fields the document doesn't mention — leave them null.
+
+  2. Quantity + UOM go together.  Capture the UOM exactly as written on
+     the line ("MT", "T", "Tons", "Tonnes", "metric ton", "KG", "LTR",
+     "Drums", "Bags", "Pcs", "Nos", "Set", "License", "User", "Hours",
+     "Days", "Visits", "Months", "Sqft", "RM", "Coils", … or any other
+     unit a vendor invents).  Do NOT convert one UOM to another (no
+     MT → KG, no LTR → ML); downstream benchmarks compare like for
+     like.  If the document uses two UOMs (e.g. "10 MT / 10000 KG"),
+     prefer whichever the price column is keyed to.
+
+  3. Numeric normalisation:
+       • Indian numerics : "1.5 Lakh" → 150000, "1.5 Cr" → 15000000
+       • European separators : "1.234,56" → 1234.56 (use the document's
+         locale to decide which character is decimal vs thousands)
+       • Strip currency symbols, commas, and thousand separators from
+         numeric fields; keep the symbol/code for currency normalisation
+         only.
+       • Discount may appear as a percentage or a flat amount — store
+         it as a plain number; do not bake it into total_price.
+       • Tax (GST / VAT / CGST / SGST / IGST / sales tax) goes into
+         taxation_details verbatim; it stays separate from unit_price /
+         total_price unless the document clearly states an
+         all-inclusive total.
+
+  4. The 8-level taxonomy is a funnel, not a fixed map.  Whatever the
+     line is, fill the levels by going from broadest concept down to the
+     most specific attribute the document discloses:
+       L1 broadest industry / domain   (always required)
+       L2 sub-area within that domain  (always required)
+       L3 product or service type      (always required)
+       L4 brand / manufacturer / vendor product line
+       L5 model / series / part number / standard / specification
+       L6 primary configuration or variant
+       L7 secondary spec / option / certification
+       L8 any remaining distinguishing attribute
+     If a category you've never seen before appears, invent reasonable
+     noun phrases for L1-L3 from the item description and keep the
+     deeper levels driven by what the document actually states.
+
+  5. Set commodity_tag from the most distinguishing few words across
+     L3..L5 (lowercase, hyphenated).  It should let two procurement
+     lines for the SAME thing collide on the same tag while different
+     things keep different tags.
+
+Recurring patterns to anchor extraction (illustrative only — every
+organisation buys things outside any list, so always fall back to
+rule (1) when the category isn't represented here):
+
+  • Manufactured goods with a model number       →  capture brand,
+    model, configuration, performance ratings, certifications, warranty.
+    Common across IT hardware, electronics, capital equipment, plant
+    machinery, vehicles, appliances, and instrumentation.
+
+  • Bulk / commodity raw materials                →  capture grade /
+    standard, thickness or gauge, supply form (sheet / coil / bar /
+    pipe / drum / bag / aggregate), surface finish, dimensions.
+    Common across metals, polymers, chemicals, paints, adhesives, civil
+    materials, fuels, and any commodity priced by weight or volume.
+
+  • Packaged consumables                          →  capture brand,
+    SKU, pack / container size, grade or purity, batch / lot reference.
+    Common across pharma, lab reagents, office supplies, MRO spares,
+    food & beverage, cleaning chemicals.
+
+  • Services (recurring or one-off)               →  capture provider,
+    scope, frequency, duration, site / location, SLA, manpower count.
+    Common across AMC, FM, transport, hiring, consulting, training,
+    professional services, security, housekeeping.
+
+  • Licensable or subscription-style purchases    →  capture vendor,
+    product, edition / tier, seat or user count, term length,
+    deployment model (on-prem / SaaS), support tier.
+    Common across software, SaaS subscriptions, content licenses,
+    cloud capacity.
+
+These five patterns cover the shape of most procurements.  Items that
+straddle two patterns (e.g. equipment-with-AMC bundle) borrow attributes
+from both.  Items that fit none simply rely on rule (1) — capture every
+attribute the document discloses, leave the rest null."""
 
 ITEM_TAXONOMY = """Guidelines for item_level_1 through item_level_8 hierarchical taxonomy:
 
@@ -908,7 +1076,72 @@ Rules:
 - Use proper nouns for brands and models (Levels 4–5).
 - Use descriptive noun phrases for categories (Levels 1–3).
 - When the quotation is for a service rather than a physical product, adapt the hierarchy:
-    L1=Services, L2=domain, L3=service type, L4=provider, L5=scope, …"""
+    L1=Services, L2=domain, L3=service type, L4=provider, L5=scope, …
+
+Universal funnel — works for anything an organisation procures
+--------------------------------------------------------------
+Procurement is open-ended.  Any organisation may buy laptops one day,
+plant machinery the next, raw materials and chemicals the day after,
+services and subscriptions and consumables alongside that.  The
+taxonomy is intentionally domain-agnostic so it collapses onto every
+purchase the same way:
+
+  L1  broadest industry / domain                           (REQUIRED)
+  L2  sub-area within that domain                           (REQUIRED)
+  L3  product or service type                               (REQUIRED)
+  L4  brand / manufacturer / vendor product line            (if known)
+  L5  model / series / part number / standard / specification
+  L6  primary configuration or variant
+  L7  secondary spec / option / certification
+  L8  any remaining distinguishing attribute
+
+For any category you've never seen before, invent reasonable noun
+phrases for L1–L3 from the item description and let L4–L8 follow
+whatever the quotation actually states.  Never invent attributes that
+aren't in the document.
+
+Recurring patterns (illustrative, NOT a closed list — most purchases
+fall into one of these shapes; everything else uses the same funnel):
+
+  Manufactured good with a model number:
+    L1=<broad domain>,        L2=<sub-area>,           L3=<product type>,
+    L4=<brand>,               L5=<model>,              L6=<key spec / config>,
+    L7=<secondary spec>,      L8=<warranty / extras>
+
+  Bulk / commodity raw material:
+    L1=Raw Materials,         L2=<material family>,    L3=<form>,
+    L4=<grade>,               L5=<sub-grade or std>,   L6=<thickness / gauge / size>,
+    L7=<finish / treatment>,  L8=<dimensions / std>
+
+  Packaged consumable:
+    L1=Consumables / Raw Materials, L2=<sub-area>,     L3=<product type>,
+    L4=<brand>,               L5=<product code / SKU>, L6=<pack / container size>,
+    L7=<grade / purity / colour>,                      L8=<batch / std / extras>
+
+  Service (recurring or one-off):
+    L1=Services,              L2=<service domain>,     L3=<service type>,
+    L4=<provider>,            L5=<scope>,              L6=<frequency / duration>,
+    L7=<SLA / coverage>,                               L8=<contract terms>
+
+  License / subscription:
+    L1=IT Hardware / Services, L2=Software Licensing,  L3=<product / module>,
+    L4=<vendor>,              L5=<edition / tier>,     L6=<seat / user count>,
+    L7=<term length>,                                  L8=<support tier>
+
+These five shapes cover most procurements.  Items that bundle several
+(e.g. equipment-with-AMC) borrow attributes from each shape; items that
+fit none simply rely on the funnel above.
+
+UOM principle
+-------------
+Capture the document's literal UOM verbatim.  Do NOT convert between
+units (no MT → KG, no LTR → ML, no inches → mm).  Benchmarks compare
+prices only when UOMs match, so converting silently breaks the
+apples-to-apples comparison.  Common UOMs span every imaginable category
+— Nos, Pcs, Set, MT, KG, Ltr, Drums, Bags, Cans, Pails, Coils, Sheets,
+RM, Mtr, M2, M3, License, User, Year, Hours, Days, Visits, Months, Sqft,
+Trips, KMs, etc. — and any new unit a quotation invents should be
+carried through unchanged."""
 
 EXTRACTION_USER_TEMPLATE = """## Purchase Requisition Context
 
