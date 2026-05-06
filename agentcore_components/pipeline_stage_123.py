@@ -4219,6 +4219,34 @@ class PipelineStage123Node(Node):
                 "cooldown × attempt (60s → 120s → 180s with default 3 retries)."
             ),
         ),
+        # ── DB deadlock retry settings ──────────────────────────────────────
+        # Multi-worker runs can hit SQL Server deadlock-victim errors
+        # (1205 / SQLSTATE 40001) on the cleanup transaction because parallel
+        # cleanups all DELETE through shared join chains. _process_pr wraps
+        # _cleanup_for_pr in a retry loop with exponential backoff + ±30%
+        # jitter so the victim transaction is rerun automatically.
+        IntInput(
+            name="db_deadlock_max_retries",
+            display_name="DB Deadlock Max Retries",
+            value=3,
+            advanced=True,
+            info=(
+                "How many times to retry a SQL Server deadlock-victim error "
+                "(1205 / 40001) before aborting the PR. Default 3 → up to 4 total "
+                "attempts (1 initial + 3 retries). Set 0 to disable retries."
+            ),
+        ),
+        IntInput(
+            name="db_deadlock_base_delay",
+            display_name="DB Deadlock Base Delay (seconds)",
+            value=2,
+            advanced=True,
+            info=(
+                "Base seconds for exponential backoff between deadlock retries. "
+                "Per-attempt sleep = base × 2^attempt × (1 + 0..0.3 jitter). "
+                "Default 2 → 4s, 8s, 16s base before jitter."
+            ),
+        ),
         # ── Extraction parallelism ────────────────────────────────────────────
         IntInput(
             name="ext_parallel_sources",
@@ -5201,10 +5229,16 @@ class PipelineStage123Node(Node):
             # exponential backoff and jitter to spread retries.
             self.log(f"[{pr_no}] Pre-run cleanup check…")
             try:
+                # Pull retry knobs from canvas inputs (defaults match the
+                # original constants if user leaves them blank).
+                _dl_max_retries = max(0, int(getattr(self, "db_deadlock_max_retries", 3) or 0))
+                _dl_base_delay  = max(0.5, float(getattr(self, "db_deadlock_base_delay", 2) or 2))
                 self._run_with_deadlock_retry(
                     lambda: self._cleanup_for_pr(tgt_cs, pr_no),
                     op_name="Pre-run cleanup",
                     pr_no=pr_no,
+                    max_retries=_dl_max_retries,
+                    base_delay=_dl_base_delay,
                 )
             except Exception as cleanup_exc:
                 # Either a non-deadlock error (raised immediately by the
