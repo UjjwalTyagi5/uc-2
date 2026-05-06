@@ -460,7 +460,11 @@ _SUPPORTED_CLASSIFY_EXTS = {
     ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
 }
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
-_MAX_CLASSIFY_CHARS = 12000   # ~3500 tokens for GPT-4o
+_MAX_CLASSIFY_CHARS = 100000  # safety cap inside each extractor only — the
+                              # *active* classification truncation happens in
+                              # _classify_file via the configurable cls_max_chars
+                              # (default 24000 ≈ 6000 tokens, matches doc-intel
+                              # truncate_to_token_limit max_content_tokens=6000).
 
 _EXT_TO_TYPE = {
     ".xlsx": "excel",  ".xls": "excel",  ".xlsm": "excel",  ".xlsb": "excel",  ".csv": "csv",
@@ -1619,20 +1623,68 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     ))
 
 
-def _call_llm_with_retry(llm, messages: list, prompts: dict | None = None):
+def _is_json_format_error(exc: Exception) -> bool:
+    """Detect when the LLM rejects the response_format=json_object kwarg.
+
+    Older models / some Azure deployments don't support strict JSON mode and
+    raise a 400-class BadRequestError mentioning response_format / json_object.
+    """
+    msg = str(exc).lower()
+    return ("response_format" in msg) or ("json_object" in msg) or (
+        "json mode" in msg
+    )
+
+
+def _call_llm_with_retry(
+    llm,
+    messages: list,
+    prompts: dict | None = None,
+    *,
+    force_json: bool = False,
+):
     """Invoke the LLM with automatic retry + cooldown on rate-limit / token-quota errors.
 
     Retry count and cooldown are read from the prompts dict so they can be set
     from the controller (llm_max_retries, llm_retry_cooldown keys).
     Cooldown is progressive: cooldown × (attempt+1) so each retry waits longer.
+
+    When force_json=True, binds response_format={"type": "json_object"} on the
+    LLM (mirrors doc-intel file_classifier/classifier/llm_client.py). If the
+    model rejects the kwarg, falls back transparently to plain invoke so older
+    deployments keep working.
     """
     import time
     max_retries = int((prompts or {}).get("llm_max_retries",  3))
     cooldown_s  = int((prompts or {}).get("llm_retry_cooldown", 60))
+
+    # Try to bind strict JSON output. Most modern Azure / OpenAI chat models
+    # support it; older ones reject the kwarg and we fall back below on first
+    # invoke. .bind() itself is lazy so it won't fail here.
+    active_llm = llm
+    json_mode_enabled = False
+    if force_json:
+        try:
+            active_llm = llm.bind(response_format={"type": "json_object"})
+            json_mode_enabled = True
+        except Exception:
+            active_llm = llm  # bind unsupported → use plain LLM
+
     for attempt in range(max_retries + 1):
         try:
-            return llm.invoke(messages)
+            return active_llm.invoke(messages)
         except Exception as exc:
+            # If JSON mode tripped a model-not-supported error, drop it and
+            # retry once with the unbound LLM. This is a recovery path, not a
+            # rate-limit retry, so it doesn't consume a retry slot.
+            if json_mode_enabled and _is_json_format_error(exc):
+                logger.warning(
+                    "LLM rejected response_format=json_object — "
+                    "retrying without JSON mode: {}",
+                    exc,
+                )
+                active_llm = llm
+                json_mode_enabled = False
+                continue
             if _is_rate_limit_error(exc) and attempt < max_retries:
                 wait = cooldown_s * (attempt + 1)  # 60s → 120s → 180s
                 logger.warning(
@@ -1688,7 +1740,10 @@ def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None =
             )
             messages = [SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)]
 
-        response = _call_llm_with_retry(llm, messages, prompts)
+        # force_json=True mirrors doc-intel's response_format={"type":"json_object"}.
+        # Without this the LLM may emit prose / markdown and json.loads() below
+        # fails, dropping the file to "Others" — a major source of misclassification.
+        response = _call_llm_with_retry(llm, messages, prompts, force_json=True)
         raw = (getattr(response, "content", None) or str(response)).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
@@ -1701,8 +1756,19 @@ def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None =
         doc_type   = _CLASSIFICATION_MAP.get(raw_cls, raw_cls)
         return doc_type, confidence
 
+    except json.JSONDecodeError as exc:
+        # Surface JSON parse failures explicitly so the user can see in the
+        # canvas log that the LLM output was unparseable (not just a generic
+        # classification miss).
+        logger.opt(exception=True).warning(
+            "Classification JSON parse failed for {!r}: {} — raw response was: {!r}",
+            filename, exc, (raw[:500] if 'raw' in locals() else '<no response>'),
+        )
+        return "Others", 0.0
     except Exception as exc:
-        logger.warning(f"Classification failed for {filename!r}: {exc}")
+        logger.opt(exception=True).warning(
+            "Classification failed for {!r}: {}", filename, exc
+        )
         return "Others", 0.0
 
 
@@ -2346,7 +2412,9 @@ def _call_extraction_llm(llm, ctx: RASContext, doc: DocumentContent, prompts: di
         "[PR={}] Calling extraction LLM — {} image(s) detail={}, ~{:.0f} kB prompt",
         ctx.purchase_req_no, img_count, img_detail, len(user_prompt) / 1024,
     )
-    response = _call_llm_with_retry(llm, messages, prompts)
+    # force_json=True so the extraction LLM emits a strict JSON object and
+    # our _parse_extraction_response doesn't have to clean up prose/fences.
+    response = _call_llm_with_retry(llm, messages, prompts, force_json=True)
     return (getattr(response, "content", None) or str(response)).strip()
 
 
@@ -3800,9 +3868,15 @@ class PipelineStage123Node(Node):
         IntInput(
             name="cls_max_chars",
             display_name="Max Chars — Classification Input (Stage 4)",
-            value=20000,
+            value=24000,
             advanced=True,
-            info="Truncate extracted text before sending to the classification LLM. 0 = no limit.",
+            info=(
+                "Truncate extracted text before sending to the classification LLM. "
+                "Default 24000 ≈ 6000 tokens, matches doc-intel "
+                "truncate_to_token_limit(max_content_tokens=6000). 0 = no limit. "
+                "Lowering this may cause Quotation signals (payment terms, totals, "
+                "signatures) at the end of long documents to be missed."
+            ),
         ),
         IntInput(
             name="ext_max_chars",
