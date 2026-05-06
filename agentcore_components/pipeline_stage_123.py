@@ -3267,10 +3267,14 @@ def _record_exception(tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) ->
         conn = _connect(tgt_cs)
         cur  = conn.cursor()
         try:
+            # Also stamp last_processed_at so audits / reporting can see when
+            # this PR last reached a terminal state (success OR exception).
             cur.execute("""
                 UPDATE [ras_procurement].[ras_tracker]
-                   SET current_stage_fk=99, updated_at=SYSUTCDATETIME()
-                 WHERE purchase_req_no=?
+                   SET current_stage_fk   = 99,
+                       last_processed_at  = SYSUTCDATETIME(),
+                       updated_at         = SYSUTCDATETIME()
+                 WHERE purchase_req_no    = ?
             """, pr_no)
             cur.execute("SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker] WHERE purchase_req_no=?", pr_no)
             row = cur.fetchone()
@@ -4368,14 +4372,27 @@ class PipelineStage123Node(Node):
             conn = self._connect(tgt_cs)
             cur  = conn.cursor()
             try:
+                # MERGE upsert. Updates current_stage_fk to 99 (EXCEPTION) and
+                # also stamps last_processed_at so a PR's terminal time is
+                # recorded for both success and failure paths (mirrors what
+                # _set_last_processed_at does on Stage 8 success).
                 cur.execute("""
                     MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
                     USING (SELECT PURCHASE_REQ_NO, PURCHASEFINALAPPROVALSTATUS
                              FROM [ras_procurement].[purchase_req_mst] WHERE PURCHASE_REQ_NO = ?
                     ) AS src ON target.purchase_req_no = src.PURCHASE_REQ_NO
-                    WHEN MATCHED THEN UPDATE SET current_stage_fk=99, updated_at=SYSUTCDATETIME()
-                    WHEN NOT MATCHED THEN INSERT (purchase_req_no, ras_status, current_stage_fk)
-                        VALUES (src.PURCHASE_REQ_NO, src.PURCHASEFINALAPPROVALSTATUS, 99);
+                    WHEN MATCHED THEN UPDATE SET
+                        current_stage_fk  = 99,
+                        last_processed_at = SYSUTCDATETIME(),
+                        updated_at        = SYSUTCDATETIME()
+                    WHEN NOT MATCHED THEN INSERT
+                        (purchase_req_no, ras_status, current_stage_fk, last_processed_at)
+                        VALUES (
+                            src.PURCHASE_REQ_NO,
+                            src.PURCHASEFINALAPPROVALSTATUS,
+                            99,
+                            SYSUTCDATETIME()
+                        );
                 """, pr_no)
                 cur.execute("SELECT ras_uuid_pk FROM [ras_procurement].[ras_tracker] WHERE purchase_req_no=?", pr_no)
                 row = cur.fetchone()
