@@ -1394,6 +1394,8 @@ class RASContext:
     purchase_category: Optional[str]     = None
     ras_title:         Optional[str]     = None
     line_items:        list              = field(default_factory=list)
+    req_start_date:    Optional[object]  = None
+    c_datetime:        Optional[object]  = None
     raw_mst:           dict             = field(default_factory=dict)
     raw_dtl_rows:      list             = field(default_factory=list)
     raw_vw_rows:       list             = field(default_factory=list)
@@ -2221,7 +2223,8 @@ def _build_ras_context(tgt_cs: str, pr_no: str) -> Optional[RASContext]:
                    prm.[PURCHASE_REQ_ID], prm.[SUPPLIER_NAME], prm.[JUSTIFICATION],
                    prm.[CURRENCY], prm.[ENQUIRY_NO], prm.[CLASSIFICATION],
                    prm.[Department], prm.[NEGOTIATED_BY], prm.[ADDRESS],
-                   prm.[CONTRACT_NO], prm.[ORDER_NO], prm.[PURCHASE_VALUE]
+                   prm.[CONTRACT_NO], prm.[ORDER_NO], prm.[PURCHASE_VALUE],
+                   prm.[REQ_START_DATE], prm.[C_DATETIME]
               FROM [ras_procurement].[purchase_req_mst] prm
              WHERE prm.[PURCHASE_REQ_NO] = ?
         """, pr_no)
@@ -2284,12 +2287,17 @@ def _build_ras_context(tgt_cs: str, pr_no: str) -> Optional[RASContext]:
         except Exception:
             pass
 
+        def _to_date(v):
+            if v is None: return None
+            return v.date() if hasattr(v, "date") else v
+
         return RASContext(
             purchase_req_no=pr_no, purchase_req_id=req_id,
             supplier_name=mst[1], justification=mst[2], currency=mst[3],
             enquiry_no=mst[4], classification=mst[5], department=mst[6],
             negotiated_by=mst[7], address=mst[8], contract_no=mst[9],
             order_no=mst[10], purchase_value=_d(mst[11]),
+            req_start_date=_to_date(mst[12]), c_datetime=_to_date(mst[13]),
             category=cat, sub_category=sub_cat, site_country=site_c,
             site_region=site_r, site=site, division=div, requisition_type=req_t,
             parent_supplier=par_s, supplier_type=sup_t, supplier_country=sup_c,
@@ -3328,7 +3336,7 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
 
 # ── DB writer: extracted items ─────────────────────────────────────────────────
 
-def _save_extracted_items(tgt_cs: str, items: list) -> int:
+def _save_extracted_items(tgt_cs: str, items: list, fallback_date=None) -> int:
     if not items:
         return 0
     conn = _connect(tgt_cs)
@@ -3357,8 +3365,8 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
                     if m: return date_cls(int(m[1]), int(m[2]), int(m[3]))
                 except Exception: pass
                 return None
-            unit_price_eur  = _convert_to_eur(tgt_cs, item.get("unit_price"),  item.get("currency"), item.get("quotation_date"))
-            total_price_eur = _convert_to_eur(tgt_cs, item.get("total_price"), item.get("currency"), item.get("quotation_date"))
+            unit_price_eur  = _convert_to_eur(tgt_cs, item.get("unit_price"),  item.get("currency"), fallback_date)
+            total_price_eur = _convert_to_eur(tgt_cs, item.get("total_price"), item.get("currency"), fallback_date)
             cur.execute("""
                 INSERT INTO [ras_procurement].[quotation_extracted_items] (
                     [attachment_classify_fk],[embedded_classify_fk],[purchase_dtl_id],
@@ -3487,7 +3495,8 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
     _canonicalize_supplier_names(all_items, ctx, prompts)
     _compute_quote_ranks(all_items)
     _select_best_quotes(all_items, ctx)
-    saved = _save_extracted_items(tgt_cs, all_items)
+    fallback_date = ctx.req_start_date or ctx.c_datetime
+    saved = _save_extracted_items(tgt_cs, all_items, fallback_date=fallback_date)
     logger.info(f"[{pr_no}] {saved} item(s) written to quotation_extracted_items")
     return saved
 
