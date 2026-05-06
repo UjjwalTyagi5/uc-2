@@ -4718,6 +4718,68 @@ class PipelineStage123Node(Node):
         finally:
             conn.close()
 
+    def _run_with_deadlock_retry(
+        self,
+        operation,
+        *,
+        op_name: str,
+        pr_no: str,
+        max_retries: int = 3,
+        base_delay: float = 2.0,
+    ):
+        """Run a callable that touches the DB with deadlock-aware retries.
+
+        SQL Server picks one transaction as the deadlock victim (error 1205
+        / SQLSTATE 40001) when concurrent workers contend on shared rows.
+        The server's documented guidance is to rerun the transaction, so
+        this helper does that with exponential backoff + ±30% jitter so
+        multiple victims don't synchronise their retries.
+
+        Logs are deliberately verbose so the user can see, for any given
+        PR, exactly how many retries were attempted, what happened, and
+        whether it ultimately succeeded or gave up:
+
+          • on victim   : warning showing attempt N/M, error code, sleep
+          • on success after retry : success line "recovered after N retry"
+          • on exhausted retries   : error line "giving up after M attempt(s)"
+          • on non-deadlock error  : raises immediately (caller decides)
+        """
+        attempt = 0
+        while True:
+            try:
+                result = operation()
+                if attempt > 0:
+                    self.log(
+                        f"[{pr_no}] {op_name} recovered after {attempt} retry/retries"
+                    )
+                return result
+            except Exception as exc:
+                if not _is_deadlock_error(exc):
+                    raise
+                if attempt >= max_retries:
+                    self.log(
+                        f"[{pr_no}] {op_name} — DEADLOCK retries exhausted "
+                        f"(gave up after {max_retries + 1} attempt(s)): {exc}"
+                    )
+                    logger.opt(exception=True).error(
+                        "[{}] {} — DEADLOCK retries exhausted: {}",
+                        pr_no, op_name, exc,
+                    )
+                    raise
+                attempt += 1
+                delay = base_delay * (2 ** attempt) * (1 + random.random() * 0.3)
+                self.log(
+                    f"[{pr_no}] {op_name} — DEADLOCK victim "
+                    f"(attempt {attempt}/{max_retries}) — "
+                    f"sleeping {delay:.1f}s then retrying"
+                )
+                logger.warning(
+                    "[{}] {} hit SQL Server deadlock (1205); "
+                    "retry {}/{} in {:.1f}s. underlying: {}",
+                    pr_no, op_name, attempt, max_retries, delay, exc,
+                )
+                time.sleep(delay)
+
     def _record_exception(self, tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) -> None:
         try:
             conn = self._connect(tgt_cs)
@@ -5138,29 +5200,16 @@ class PipelineStage123Node(Node):
             # SQL Server explicitly asks us to rerun, so we do — with
             # exponential backoff and jitter to spread retries.
             self.log(f"[{pr_no}] Pre-run cleanup check…")
-            _CLEANUP_MAX_RETRIES = 3
-            _CLEANUP_BASE_DELAY  = 2.0
-            cleanup_attempt = 0
-            cleanup_exc: Exception | None = None
-            while True:
-                try:
-                    self._cleanup_for_pr(tgt_cs, pr_no)
-                    cleanup_exc = None
-                    break
-                except Exception as exc:
-                    cleanup_exc = exc
-                    if _is_deadlock_error(exc) and cleanup_attempt < _CLEANUP_MAX_RETRIES:
-                        cleanup_attempt += 1
-                        delay = _CLEANUP_BASE_DELAY * (2 ** cleanup_attempt) * (1 + random.random() * 0.3)
-                        self.log(
-                            f"[{pr_no}] Cleanup hit deadlock victim "
-                            f"(attempt {cleanup_attempt}/{_CLEANUP_MAX_RETRIES}) "
-                            f"— retrying in {delay:.1f}s"
-                        )
-                        time.sleep(delay)
-                        continue
-                    break
-            if cleanup_exc is not None:
+            try:
+                self._run_with_deadlock_retry(
+                    lambda: self._cleanup_for_pr(tgt_cs, pr_no),
+                    op_name="Pre-run cleanup",
+                    pr_no=pr_no,
+                )
+            except Exception as cleanup_exc:
+                # Either a non-deadlock error (raised immediately by the
+                # helper) or deadlock retries fully exhausted. Both end the
+                # PR at stage 99 with a descriptive exception record.
                 logger.opt(exception=True).error(
                     "[{}] Pre-run cleanup failed — aborting PR: {}", pr_no, cleanup_exc
                 )
