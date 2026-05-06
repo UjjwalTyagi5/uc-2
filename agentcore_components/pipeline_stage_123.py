@@ -1201,6 +1201,24 @@ def _is_transient(exc: Exception) -> bool:
     return any(k in str(exc).lower() for k in kw)
 
 
+def _is_deadlock_error(exc: Exception) -> bool:
+    """True for SQL Server deadlock-victim errors.
+
+    Triggered when concurrent workers run _cleanup_for_pr against
+    different PRs but the DELETEs join through shared rows in
+    ras_tracker / attachment_classification and SQL Server picks the
+    transaction as a deadlock victim.
+
+    Error 1205 / SQLSTATE 40001 — the SQL Server message asks us
+    to rerun the transaction, which is exactly what the retry wrapper
+    in _process_pr does on the cleanup path.
+    """
+    msg = str(exc)
+    if "40001" in msg or "1205" in msg:
+        return True
+    return "deadlock" in msg.lower()
+
+
 def _connect(cs: str):
     import pyodbc
     for attempt in range(_MAX_RETRIES + 1):
@@ -5111,10 +5129,38 @@ class PipelineStage123Node(Node):
             # Pinecone vectors + quotation_extracted_items + benchmark_result deleted.
             # Explicit handling so cleanup failures are recorded with a clear message
             # before any stage tracker row exists.
+            #
+            # Cleanup retries on SQL Server deadlock victims (error 1205,
+            # SQLSTATE 40001). With multiple parallel workers each running
+            # their own multi-DELETE cleanup transaction, lock contention
+            # on shared join tables (ras_tracker / attachment_classification)
+            # can cause one transaction to be picked as the deadlock victim;
+            # SQL Server explicitly asks us to rerun, so we do — with
+            # exponential backoff and jitter to spread retries.
             self.log(f"[{pr_no}] Pre-run cleanup check…")
-            try:
-                self._cleanup_for_pr(tgt_cs, pr_no)
-            except Exception as cleanup_exc:
+            _CLEANUP_MAX_RETRIES = 3
+            _CLEANUP_BASE_DELAY  = 2.0
+            cleanup_attempt = 0
+            cleanup_exc: Exception | None = None
+            while True:
+                try:
+                    self._cleanup_for_pr(tgt_cs, pr_no)
+                    cleanup_exc = None
+                    break
+                except Exception as exc:
+                    cleanup_exc = exc
+                    if _is_deadlock_error(exc) and cleanup_attempt < _CLEANUP_MAX_RETRIES:
+                        cleanup_attempt += 1
+                        delay = _CLEANUP_BASE_DELAY * (2 ** cleanup_attempt) * (1 + random.random() * 0.3)
+                        self.log(
+                            f"[{pr_no}] Cleanup hit deadlock victim "
+                            f"(attempt {cleanup_attempt}/{_CLEANUP_MAX_RETRIES}) "
+                            f"— retrying in {delay:.1f}s"
+                        )
+                        time.sleep(delay)
+                        continue
+                    break
+            if cleanup_exc is not None:
                 logger.opt(exception=True).error(
                     "[{}] Pre-run cleanup failed — aborting PR: {}", pr_no, cleanup_exc
                 )
