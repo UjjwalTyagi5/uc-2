@@ -2171,9 +2171,8 @@ def _run_classification(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: d
     if not tasks:
         return
 
-    # Cap inner workers at 8 — each task is an LLM HTTP call (I/O-bound, not CPU).
-    # With N outer PR workers, peak threads = N × 8; all blocked on network I/O.
-    with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as inner_pool:
+    n_workers = max(1, int((prompts or {}).get("cls_parallel_sources", 8)))
+    with ThreadPoolExecutor(max_workers=min(len(tasks), n_workers)) as inner_pool:
         futures = [inner_pool.submit(fn, row) for fn, row in tasks]
         for f in as_completed(futures):
             f.result()  # exceptions already caught inside fn; this just awaits all
@@ -4913,6 +4912,18 @@ class PipelineStage123Node(Node):
                 "Default 2 → 4s, 8s, 16s base before jitter."
             ),
         ),
+        # ── Classification parallelism ────────────────────────────────────────
+        IntInput(
+            name="cls_parallel_sources",
+            display_name="Classification Parallel Sources (Stage 4)",
+            value=8,
+            advanced=True,
+            info=(
+                "Max files classified in parallel for a single PR (parent + embedded). "
+                "Default 8 matches the previous hardcoded cap. Reduce if hitting LLM "
+                "rate limits; increase for PRs with many attachments."
+            ),
+        ),
         # ── Extraction parallelism ────────────────────────────────────────────
         IntInput(
             name="ext_parallel_sources",
@@ -5867,6 +5878,8 @@ class PipelineStage123Node(Node):
         if llm_retries is not None: prompts["llm_max_retries"]  = int(llm_retries)
         llm_cool    = getattr(self, "llm_retry_cooldown", None)
         if llm_cool is not None:    prompts["llm_retry_cooldown"] = int(llm_cool)
+        cls_par     = getattr(self, "cls_parallel_sources", None)
+        if cls_par is not None:     prompts["cls_parallel_sources"] = int(cls_par)
         ext_par     = getattr(self, "ext_parallel_sources", None)
         if ext_par is not None:     prompts["ext_parallel_sources"] = int(ext_par)
         return prompts
