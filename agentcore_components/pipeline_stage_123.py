@@ -1,3 +1,20 @@
+"""Full Pipeline (Stages 1-8) — AgentCore custom-code component.
+
+Logging
+-------
+This file does NOT call logger.add(...) or open a log file. loguru uses its
+default stderr sink, and Node-level events are also surfaced via self.log()
+so they appear in the AgentCore canvas log panel in real time. No log
+directory is created on disk by this component.
+
+Verbosity:
+  - logger.info  : per-stage progress, page/image counts, LLM call summary
+  - logger.warning : recoverable issues (page truncation, transient retries,
+                     extraction failures for one file, no quotation found)
+  - logger.error : unrecoverable per-PR failures (DB write, render error)
+                   captured with stack trace via logger.opt(exception=True)
+  - logger.debug : low-level diagnostics (suppressed at default level)
+"""
 from __future__ import annotations
 
 import json
@@ -22,6 +39,18 @@ _STAGE_INGESTION  = 1
 _STAGE_EMBED_DOC  = 2
 _STAGE_BLOB_UPLOAD = 3
 _STAGE_EXCEPTION  = 99
+
+
+class NoQuotationFoundError(RuntimeError):
+    """Raised when a PR has no attachments classified as 'Quotation'.
+
+    Treated as an expected pipeline outcome (not a bug). Mirrors
+    quotation_extraction.run.NoQuotationFoundError from the doc-intel branch:
+    the caller logs it as a warning, records it in ras_pipeline_exceptions,
+    sets ras_tracker.current_stage_fk = 99, and breaks the per-PR flow so
+    no further stages run for this PR.
+    """
+    _suppress_traceback = True
 
 _TEXT_EXT  = {".txt", ".csv", ".xml", ".json", ".html", ".htm", ".eml"}
 _PDF_EXT   = {".pdf"}
@@ -559,87 +588,119 @@ CATEGORIES & MANDATORY FIELDS
      • If price columns are EMPTY (template for vendor to fill) → it is RFQ, not Quotation.
      • Filename is unreliable — e.g., "(875) CK Motherson Auto Hitech.docx" was issued BY Hi-Tech to CK Motherson; the customer name in the filename does not make it MPBC or RFQ.
      • PDF extraction may produce duplicated characters from font issues (e.g., "TTOO" instead of "TO", "QQUUOOTTAATTIIOONN" instead of "QUOTATION") — interpret semantically.
-     • **A Quotation can use the buyer's RFQ TEMPLATE FORMAT.** When a supplier fills in an RFQ specification template with their technical responses AND populates pricing fields with actual monetary values, the document has become a Quotation. Key differentiator: if ACTUAL PRICES are filled in (not blank placeholders) and a supplier contact person / company name is prominently featured, treat it as Quotation even if the original RFQ structure is retained.
+     • **A Quotation can use the buyer's RFQ TEMPLATE FORMAT.** When a supplier (e.g., HAITIAN, Engel, Sumitomo, KraussMaffei, Arburg) fills in an RFQ specification template with their technical responses ("STANDARD", "OPTIONAL", "OPTIONAL - AVAILABLE", option codes) AND populates pricing fields (Basic Price, Option Price, Net Price, Total Machine Cost, Delivery Price, etc. with actual monetary values in USD/EUR/INR), the document has become a Quotation — the supplier's price offer. Key differentiator: if ACTUAL PRICES are filled in (not blank "to be specified" placeholders) and a supplier contact person / company name is prominently featured, treat it as Quotation even if the original RFQ structure ("Pls Specify", "Required") is retained.
+     . There can be many vendors/supplier not just HAITIAN, Engel, Sumitomo, KraussMaffei, Arburg etc. these are just examples.
 
 3. **RFQ** — Request For Quotation (Motherson → vendors)
-   A specification / scope document issued BY Motherson (the buyer) TO vendors, asking them to submit a quotation.
+   A specification / scope document issued BY Motherson (the buyer) TO vendors, asking them to submit a quotation. The document defines WHAT Motherson needs and asks the vendor to respond with specs and pricing. May be an Excel template with columns for "Supplier Spec/Confirmation" that are blank (or have been partially filled by a responding vendor).
 
    Mandatory fields:
-     • Project Name
-     • RFQ Number (reference / inquiry number)
+     • Project Name (e.g., "INJECTION MOULDING MACHINE SPECIFICATIONS", "30KLD STP", or a specific project title)
+     • RFQ Number (reference / inquiry number — e.g., "MATEB/IMG 1300/2020/SEPT/1-Rev 01", "MATE SADDLES/SP/01-24/Rev03")
      • Date (issue date)
-     • Specifications — detailed technical / scope specifications structured as tables with:
+     • Specifications — the BULK of the document; detailed technical / scope specifications structured as tables with:
        - Sl. No / Item number
-       - Description / technical parameter
-       - "Required" / "Not Required" / "Std" flags
+       - Description / technical parameter (e.g., "Screw diameter [mm]", "Clamping force [kN]")
+       - "Required" / "Not Required" / "Std" flags (Motherson's requirement)
        - "To be specified by the supplier" / "Supplier Spec/Confirmation" / "Pls specify" columns (blank or for vendor to fill)
-     • Commercials section asking for pricing breakdown (blank fields for vendors to fill)
+       - Multiple specification sections: e.g., Injection unit, Clamping unit, Electrical/Hydraulic, Controller, General features, Spares, Special features
+     • Commercials — a section (typically at the bottom) asking for pricing breakdown:
+       - Option Price, Basic Price, Gross price, Special discount, Net price
+       - Spares Package, Sea worthy packing, CIF Cost + Insurance
+       - Startup cost, Delivery Price, Price in INR
+       - Payment terms, Taxes, Delivery period, Warranty, Guarantee
 
    Strong supporting signals:
-     • Sheet name contains "RFQ"
-     • "MATE-B Req" or "MATE Spec" column
-     • "Supplier Spec/Confirmation" or "Supplier Remarks" columns (empty = template)
-     • "Techno Commercial Comparison" as title
-     • Columns with "Fill this column by '0' if STD or Enter the cost if Optional"
-     • "Company Name:", "Contact Person:", "Telephone:", "Email:" fields for vendor to fill
+     • Sheet name contains "RFQ" (e.g., " RFQ", "RFQ - STP")
+     • "MATE-B Req" or "MATE Spec" column (Motherson Automotive Technologies & Engineering — a Motherson entity)
+     • "Supplier Spec/Confirmation" or "Supplier Remarks" columns (empty = template, filled = vendor response captured in same template)
+     • "Techno Commercial Comparison" as a title (still an RFQ when it's the request template, even if some vendor responses have been captured)
+     • Accompanying sheet " Parts & Mold data " with part specifications (part name, size, weight, wall thickness)
+     • Columns with "Fill this column by '0' if STD or Enter the cost if Optional" — template instruction language
+     • "Company Name:", "Contact Person:", "Telephone:", "Email:" fields (for vendor to fill)
 
    CRITICAL DISAMBIGUATION:
-     • Even if vendors have filled some spec responses, it remains RFQ IF pricing fields are EMPTY and no supplier is prominently featured.
-     • If a supplier has populated actual pricing (USD/EUR/INR values) AND supplier contact details appear prominently → classify as Quotation, not RFQ.
-     • If 3+ vendors compared side-by-side in consolidated evaluation → MPBC, not RFQ.
+     • An RFQ is the TEMPLATE / REQUEST document. Even if one or two vendors have filled in their spec responses, the document may still be an RFQ IF:
+         (a) pricing fields remain EMPTY or say "to be specified", AND
+         (b) no supplier contact/company is featured prominently.
+       HOWEVER, if a supplier has populated pricing (Basic Price, Net Price, Total cost, Option prices with actual USD/EUR/INR values) AND the supplier's contact details appear prominently (name, phone, email), the document has become a QUOTATION — the supplier's completed price offer using the RFQ template format. Classify as Quotation, not RFQ.
+     • If the document compares 3+ vendors side-by-side in a CONSOLIDATED EVALUATION format → it is MPBC, not RFQ.
+     • If the document is a standalone vendor letter with prices (no Motherson spec template structure) → it is Quotation, not RFQ.
+     • RFQ documents are typically MUCH longer / more detailed than Quotations (100+ rows of specifications with Required/Not Required flags). BUT length alone does not determine the category — a long spec sheet with filled-in prices is still a Quotation.
 
 4. **BER** — Bid Exception Report
-   SPECIFICALLY the Motherson "BID EXCEPTION REPORT" template form.
+   SPECIFICALLY the Motherson "BID EXCEPTION REPORT" template form. This is NOT a catch-all for any waiver, justification, or single-source document. The document must use the Motherson BER template structure.
 
-   Mandatory fields (ALL must be present or nearly all — strict template match):
-     • "BID EXCEPTION REPORT" appearing explicitly as a header / title (REQUIRED — generic "Waiver of Competition" or "Single Source Justification" is NOT sufficient)
-     • Reasoning for not obtaining at least three bids/quotes
-     • Order Value field (e.g., "Order Value: 671,57 €")
-     • Description of the product or service to be ordered
-     • Justification for waiver of competitive bidding
+   Mandatory fields (ALL of these must be present or nearly all — this is a strict template match):
+     • "BID EXCEPTION REPORT" appearing explicitly as a header / title (this exact phrase or very close equivalent is REQUIRED — a generic "Waiver of Competition" or "Single Source Justification" title is NOT sufficient for BER classification)
+     • Reasoning for not obtaining at least three bids/quotes (NOTE: language may differ in 20–40% of cases)
+     • Order Value field (e.g., "Order Value: 671,57 €", "Budget Line Ref. + amount")
+     • Description of the product or service to be ordered (a labeled section)
+     • Justification for waiver of competitive bidding (a labeled section)
+     • Justification of the product or service to be ordered (a separate labeled section)
 
-   Strong supporting signals:
+   Strong supporting signals (Motherson BER template-specific — presence of 2-3 is a near-certain indicator):
      • Header "Capital Equipment & Indirect Purchasing"
-     • Budget Line Ref.
-     • Reference to "LCC Suppliers" / "Low Cost Country"
-     • Checkbox options A through E (A: less than three potential bidders; B: sole-source; C: national supply contract; D: similar item purchased in past 6 months; E: Other)
+     • Budget Line Ref. (e.g., "Budget Line Ref.: ID 413128")
+     • Reference to "LCC Suppliers" / "Low Cost Country" / "Motherson internal company"
+     • Checkbox-style options A through E for reasoning (A: less than three potential bidders; B: sole-source / proprietary item; C: national/local supply contract; D: similar item purchased in past 6 months; E: Other reasons)
      • Three approval rows: "Prepared by:" + "Purchasing approval:" + "Managing Director / COO / EVP approval:"
+     • "Approver comments:" section
+     • Footer with template revision history (e.g., "Compiled by Mac Cheema", "Revised by Lousie Osgood")
      • Sheet named "BER" in an Excel workbook
 
-   CRITICAL: Do NOT classify as BER if the document is a generic waiver form, Single Source Justification from a non-Motherson template, or any exception document that does NOT use the specific Motherson BER template with the A-E checkbox structure. Classify those as "Other".
+   CRITICAL: Do NOT classify as BER if the document is:
+     • A generic "Waiver of Competition" form (different template, different structure)
+     • A "Single Source Justification" from a non-Motherson template
+     • A "Double Source Waiver" or supplier approval form
+     • Any competitive bidding exception document that does NOT use the specific Motherson "BID EXCEPTION REPORT" template with the A-E checkbox structure
+     These should be classified as "Other" instead.
 
 5. **E-Auction** — E-Auction results / reports / trackers
-   Documents generated from or summarizing an online reverse-auction event.
+   Documents generated from or summarizing an online reverse-auction event where vendors bid in real time. May be raw auction output from an e-procurement platform OR a summary/tracker/presentation consolidating auction results.
 
-   Mandatory fields:
-     • Event ID
-     • Event Name
-     • Publish Date / Open Date / Close Date
-     • BID Id
+   Mandatory fields (from client spec — match by meaning, naming may vary):
+     • Event ID (e.g., "Doc3071019131", "Auction ID")
+     • Event Name (e.g., "Live Japanese Reverse eAuction - R_268526-2026-EPP boxes...")
+     • Publish Date
+     • Open Date
+     • Close Date
+     • BID Id (e.g., "ID3240307353", "ID3244896110")
      • BID Status (e.g., "Accepted", "Default")
-     • Participant (vendor / bidder name)
+     • Participant (vendor / bidder name — e.g., "MORAplast, s.r.o(Sarka Bris...)")
      • Basic Price (per unit price)
      • Extended Price (total price for volume)
 
-   Strong supporting signals:
-     • "eAuction", "e-Auction", "Reverse Auction", "Japanese Auction" in title/headers
-     • Sheet names "Overview Sheet", "Full Bid Data Sheet"
-     • Rank column; Savings column; Capacity Planning Volume
-     • Pricing tiers: "Price 1" / "Price 2" / "Price 3" with savings definitions
-     • Tracker workbooks with sheets "Pivot", "Summary", "Project Details", "Project Negotiation"
+   Strong supporting signals (presence of 3+ is near-certain):
+     • "eAuction", "e-Auction", "Reverse Auction", "Japanese Auction", "Japanese Reverse eAuction" in title/headers
+     • Sheet names like "Overview Sheet", "Full Bid Data Sheet"
+     • Event Type field (e.g., "Japanese Auction")
+     • Owner field with eAuction email (e.g., "eAuction.GSP@motherson.com")
+     • Rank column (bidder ranking: 1, 2, 3...)
+     • Savings column / Total Cost column
+     • Capacity Planning Volume
+     • Report Generated Date
+     • Currency field (e.g., "European Union Euro")
+     • Submission Date with timestamps (time-stamped bids)
+     • Pricing tiers: "Price 1" (initial quotation), "Price 2" (revised/negotiated), "Price 3" (after eAuction)
+     • Saving definitions: "Pre Auction Saving", "eAuction Saving", "Total Saving"
+     • Tracker / summary workbooks: sheets like "Pivot", "Summary", "Project Details", "Project Negotiation" with columns for Auction type, GSP Buyer, Group company, L1 price, Final price, Savings
      • Presentation slides with "eAuction Overview", "eAuction Status", monthly savings summaries
+     • Project Names referencing RFQ numbers (e.g., "P352----RFQ16688---...")
 
    IMPORTANT — Two tiers of E-Auction documents (BOTH classify as E-Auction):
-     TIER 1 (raw auction output): Contains most mandatory fields (Event ID, BID Id, Participant, prices). High confidence.
+     TIER 1 (raw auction output): Contains most mandatory fields above (Event ID, BID Id, Participant, prices). High confidence.
      TIER 2 (summaries/trackers/presentations): May NOT contain individual event-level fields like Event ID or BID Id, but IS clearly ABOUT e-auction results — contains "eAuction" keyword prominently + pricing data (Price 1/2/3, savings, L1 price, Final price) + auction metadata (Auction type, Auction Month, GSP Buyer). Classify as E-Auction with moderate confidence (0.75-0.85) even if individual bid-level fields are missing.
 
    CRITICAL DISAMBIGUATION:
-     • E-Auction focuses on AUCTION EVENT and BIDDING PROCESS with event metadata and time-sequenced bids. MPBC is a static comparison table — fundamentally different.
-     • E-Auction tracker/summary workbooks and .pptx presentations summarizing eAuction results are still E-Auction, not "Other".
-     • If the document is ABOUT eAuction (mentions "eAuction" + savings/prices), classify as E-Auction even if not all mandatory fields are present.
+     • E-Auction documents focus on the AUCTION EVENT and BIDDING PROCESS — they have event metadata (IDs, dates, event type) and bid-level data (bid IDs, statuses, timestamps, ranks). This is fundamentally different from MPBC which is a static comparison table.
+     • An MPBC compares vendor quotations side-by-side; an E-Auction shows a time-sequenced bidding process with event infrastructure fields.
+     • E-Auction tracker/summary documents (multi-sheet workbooks tracking many auction events across a fiscal year) are still E-Auction, not "Other".
+     • Presentation files (.pptx) summarizing eAuction results/savings are still E-Auction, not "Other".
+     • If the document is ABOUT eAuction (mentions "eAuction" + savings/prices), classify as E-Auction even if not all 10 mandatory fields are present.
 
 6. **Other** — Anything that does NOT satisfy the mandatory field set of any category above
-   Examples: invoices, purchase orders, delivery notes, contracts, drawings, internal memos, generic emails, MSAs, NDAs, quality reports, etc.
+   Examples: invoices, purchase orders, delivery notes, contracts, drawings, internal memos, generic emails, MSAs, NDAs in isolation, quality reports, etc. Use this only when the document genuinely fails the field checks for all five named categories.
 
 ============================================================
 DECISION PROCESS (follow strictly)
@@ -661,10 +722,10 @@ OUTPUT FORMAT (strict JSON, no markdown, no commentary)
 {
   "classification": "RFQ" | "Quotation" | "MPBC" | "BER" | "E-Auction" | "Other",
   "confidence": <float 0.0 - 1.0>,
-  "reason": "<2-3 sentences explaining which mandatory fields you matched and which were missing>",
+  "reason": "<2-3 sentences explaining which mandatory fields you matched and which (if any) were missing>",
   "key_signals": ["<mandatory field matched 1>", "<mandatory field matched 2>", "<mandatory field matched 3>"],
   "fields_matched": ["<exact field/column/phrase observed in the document>", ...],
-  "fields_missing": ["<mandatory fields for the chosen category that were NOT found>", ...]
+  "fields_missing": ["<mandatory fields that were NOT found>", ...]
 }
 
 Rules:
@@ -704,38 +765,75 @@ File Type: {file_type}
 Examine the image carefully — read every visible field, column, and label. Check the mandatory fields for each category against what you see. Apply the decision process from the system prompt and return only the JSON object."""
 
 # ── Extraction prompt constants ────────────────────────────────────────────────
-EXTRACTION_SYSTEM_PROMPT = """You are a senior procurement analyst with deep experience evaluating supplier quotations across every spend category. Your job here is to read each quotation thoroughly and produce a complete, accurate, decision-grade extraction in a strict JSON schema. The downstream system uses your output to benchmark prices, pick winning suppliers, and approve purchase requisitions, so completeness and correctness directly affect business decisions.
+EXTRACTION_SYSTEM_PROMPT = """You are a senior procurement analyst with deep experience evaluating supplier quotations across every spend category. Your job here is to read each quotation thoroughly and produce a complete, accurate, decision-grade extraction in a strict JSON schema. The downstream system uses your output to benchmark prices, pick winning suppliers, and approve purchase requisitions, so completeness and correctness directly affect business decisions — missed line items, wrong DTL_ID mappings, and inflated confidence scores all propagate into bad recommendations.
+
+The procurement system processes all types of purchase requisitions — industrial equipment, IT hardware and software, raw materials, consumables, engineering services, facility management, vehicle hiring, consulting, pharmaceuticals, construction, and any other category of goods or services. Your extraction must work equally well across all of these — do not assume any specific industry.
 
 Key responsibilities:
-- Read the entire quotation before answering. Do not stop at the first item table.
-- Extract every item line, pricing, supplier information, and commercial terms.
-- Match each extracted item to the right purchase requisition DTL_ID.
-- Translate all extracted text to English regardless of the source language.
-- Return data in the exact JSON schema specified — no markdown fences, no commentary.
+- Read the entire quotation before answering. Do not stop at the first item table — quotations often have continuation pages, addenda, optional items, and supporting charges.
+- Extract every item line, pricing, supplier information, and commercial terms from the document.
+- Match each extracted item to the right purchase requisition DTL_ID using the strongest distinguishing signal available (model number, code, capacity, location, quantity, position).
+- Translate all extracted text to English regardless of the source language of the document.
+- Return data in the exact JSON schema specified — no markdown fences, no commentary, no analysis text, just the JSON object.
 - Handle diverse document formats: formal quotations, proforma invoices, price lists, rate cards, cost estimates, email quotations, and scanned documents.
 
 Extraction guidelines:
-- Be precise with numbers: prices, quantities, dates. Never hallucinate or infer figures not present.
-- Distinguish between unit price and total price. total_price = unit_price × quantity unless stated otherwise.
-- Identify currency from the document (₹, $, €, £, AED, ZAR or ISO codes). Return ISO-4217 code.
-- Extract payment terms verbatim then normalise.
-- Set supplier_match_conf honestly. 0.0 = unrelated, 1.0 = identical. A lower honest score is always better.
-- If a field genuinely cannot be determined, set it to null. Never guess."""
+- Be precise with numbers: prices, quantities, dates.  Never hallucinate or infer figures not present in the document.
+- Distinguish between unit price and total price.  total_price = unit_price × quantity unless the document states otherwise.
+- Identify currency from the document (symbols like ₹, $, €, £, AED, ZAR, or explicit ISO codes).  Return the ISO-4217 three-letter code (INR, USD, EUR, GBP, ZAR, AED, …).
+- For services, "quantity" may be hours, days, trips, or similar — capture the unit exactly as written.
+- Extract payment terms verbatim then normalise (e.g. "100% advance" → "100% Advance", "net 30 days" → "Net 30").
+- For the hierarchical item taxonomy (item_level_1 … item_level_8), classify from the broadest category down to the most specific attribute available.  See the taxonomy guidelines in the user message.
+- Set supplier_match_conf honestly based on how well the extracted item matches the requisition line.  0.0 = completely unrelated, 1.0 = identical match certain.  A lower honest score is always better than an inflated wrong one.
+- If a field genuinely cannot be determined from the document, set it to null.  Never guess or fill with placeholder text.
+- Null data from the requisition context (shown as "N/A") means that field was not recorded — do not treat it as a matching signal."""
 
 ITEM_TAXONOMY = """Guidelines for item_level_1 through item_level_8 hierarchical taxonomy:
 
-Level 1 — Broad industry/domain: "Electronics", "Mechanical", "IT Hardware", "Services", "Consumables", "Raw Materials"
-Level 2 — Sub-category: "Industrial Equipment", "Office Equipment", "Software Licensing", "Fleet Management"
-Level 3 — Product/service type: "Temperature Controller", "Laptop", "Annual Maintenance Contract", "Vehicle Hiring"
-Level 4 — Brand/Manufacturer: "Dell", "Siemens", "Bosch", "Toyota"
-Level 5 — Model/Series/Part: "Latitude 5540", "MCLX-350A-0", "PowerEdge R740"
-Level 6 — Configuration/Variant: "16 GB RAM / 512 GB SSD", "3-phase 440 V 50 Hz"
-Level 7 — Additional spec: "With touchscreen", "IP65 rated", "CE certified"
-Level 8 — Remaining detail: "Custom colour RAL 7035", "Extended warranty 5 yr"
+The eight levels represent a progressively narrower classification of each item.  Fill as many levels as the quotation document supports; leave deeper levels as null when information is not available.
 
-Rules: item_level_1/2/3 MUST always be filled. Levels 4-8 may be null when information is absent."""
+IMPORTANT: item_level_1, item_level_2, and item_level_3 MUST always be filled — you can always infer the broad category, sub-category, and product/service type from the item name and description.  Only item_level_4 through item_level_8 may be null when the information is genuinely absent.
+
+Level 1 — Broad industry / domain category
+  Examples: "Electronics", "Mechanical", "Civil", "IT Hardware", "Services",
+            "Consumables", "Furniture", "Vehicles", "Raw Materials", "Safety Equipment"
+
+Level 2 — Sub-category within the domain
+  Examples: "Industrial Equipment", "Office Equipment", "Construction Materials",
+            "Software Licensing", "Fleet Management", "Chemical Supplies"
+
+Level 3 — Product type or service type
+  Examples: "Temperature Controller", "Laptop", "Concrete Mix", "Annual Maintenance Contract",
+            "Vehicle Hiring", "Mold Machine Component"
+
+Level 4 — Brand / Manufacturer
+  Examples: "Dell", "Siemens", "Matsui", "Bosch", "Toyota", "Tata Motors"
+
+Level 5 — Model / Series / Part number
+  Examples: "Latitude 5540", "MCLX-350A-0", "PowerEdge R740", "Hilux 2.8 GD-6"
+
+Level 6 — Configuration / Variant
+  Examples: "16 GB RAM / 512 GB SSD", "3-phase 440 V 50 Hz", "4×4 Double Cab",
+            "Stainless Steel Grade 304"
+
+Level 7 — Additional specification
+  Examples: "With touchscreen", "IP65 rated", "CE certified", "Left-hand drive"
+
+Level 8 — Any remaining distinguishing detail
+  Examples: "Custom colour RAL 7035", "Extended warranty 5 yr", "Ex-works delivery"
+
+Rules:
+- Start at Level 1 and fill downward; never skip a level then fill a deeper one.
+- Never repeat the same information across two levels.
+- Use proper nouns for brands and models (Levels 4–5).
+- Use descriptive noun phrases for categories (Levels 1–3).
+- When the quotation is for a service rather than a physical product, adapt the hierarchy:
+    L1=Services, L2=domain, L3=service type, L4=provider, L5=scope, …"""
 
 EXTRACTION_USER_TEMPLATE = """## Purchase Requisition Context
+
+The following data was recorded at the time the purchase requisition was raised.
+Fields marked "N/A" were not captured in the source system — treat them as unknown.
 
 ### Header Information
 
@@ -773,17 +871,41 @@ EXTRACTION_USER_TEMPLATE = """## Purchase Requisition Context
 
 ### Line Items from the Requisition
 
+The table below lists the items the buyer expects to find in the quotation.
+Column legend:
+- **DTL_ID** — unique line-item identifier; use this value for `purchase_dtl_id` when you match a quotation item
+- **Item Code** — internal material/part code (may be N/A)
+- **Unit Price / Original Value / Initial Offer / Negotiated** — price history; use for cross-validation only
+- **Req Value** — total requisition value for the line (Qty × Unit Price)
+- **Prepayment / Payment Terms** — buyer-side payment conditions
+
+> **Matching tip:** Suppliers often use their own product codes (e.g. LP100, PT050SPEC, QMC122) that differ from the RAS description.
+> Use secondary signals to match when names differ:
+> - Machine tonnage / capacity (e.g. "650T", "350 tons") appearing in both the PDF and RAS description
+> - Quantity, UOM, or price proximity to a RAS line
+> - Machine model or site location if mentioned in both
+
 {line_items_table}
 
 ---
 
 ### Additional RAS Reference Data
 
+> **Important — treat as reference only.** The fields below come directly from
+> the procurement system database. Users sometimes enter incomplete or incorrect
+> data, so these values are hints, not ground truth.
+> - **Always extract actual prices, quantities, dates, and descriptions from the
+>   quotation document itself.**
+> - Use this data only to help identify which `DTL_ID` corresponds to which item
+>   in the quotation — look for matching machine specs, item codes, quantities,
+>   tonnage, site, or any other common signal between the DB row and the PDF item.
+> - If a DB field contradicts what the quotation clearly states, trust the quotation.
+
 {raw_ras_context}
 
 ---
 
-### Item Taxonomy Guidelines
+## Item Taxonomy Guidelines
 
 {item_taxonomy}
 
@@ -797,7 +919,16 @@ EXTRACTION_USER_TEMPLATE = """## Purchase Requisition Context
 
 ## Required Output
 
-Extract exactly one item per DTL_ID. Return a **single JSON object** — no markdown fences, no extra text:
+Analyse the quotation document above against the requisition context.
+Extract **exactly one item per DTL_ID** from the RAS line items table — the quotation row that best represents the supplier's quoted price and specs for that line.
+For each item match it to the closest line item in the requisition table
+(use Description, Item Code, Quantity, and UOM as primary matching signals).
+
+> **Important:** A purchase requisition can cover any type of procurement —
+> goods (equipment, components, materials, consumables), services (maintenance,
+> consulting, hiring, IT), or mixed orders.  Adapt your extraction accordingly.
+
+Return a **single JSON object** — no markdown fences, no extra text:
 
 {{
   "supplier_name": "string or null",
@@ -812,30 +943,83 @@ Extract exactly one item per DTL_ID. Return a **single JSON object** — no mark
   "items": [
     {{
       "purchase_dtl_id": "integer from DTL_ID column if matched, else null",
-      "supplier_match_conf": "0.0 to 1.0",
+      "supplier_match_conf": "0.0 to 1.0 — your confidence this item matches the requisition line",
       "item_name": "canonical item name in English",
       "item_description": "full description with all specs in English",
       "quantity": "number or null",
       "unit": "unit of measurement or null",
       "unit_price": "number or null",
       "total_price": "number or null",
-      "discount": "number or null",
-      "taxation_details": "string or null",
+      "discount": "discount amount or percentage as number, or null",
+      "taxation_details": "tax/GST/VAT info as string or null",
       "delivery_date": "YYYY-MM-DD or null",
-      "delivery_time_days": "integer or null",
-      "item_level_1": "broadest category (REQUIRED)",
-      "item_level_2": "sub-category (REQUIRED)",
-      "item_level_3": "product/service type (REQUIRED)",
-      "item_level_4": "brand if known, else null",
-      "item_level_5": "model if known, else null",
-      "item_level_6": "configuration if known, else null",
-      "item_level_7": "key spec if known, else null",
-      "item_level_8": "additional detail if known, else null",
-      "commodity_tag": "lowercase-slug-tag",
-      "item_summary": "plain-English summary max 20 words"
+      "delivery_time_days": "integer number of days or null",
+      "item_level_1": "broadest category (e.g. Industrial Equipment, IT Hardware, Services)",
+      "item_level_2": "sub-category (e.g. Pumps & Valves, Laptops, Facility Management)",
+      "item_level_3": "product or service type",
+      "item_level_4": "brand or manufacturer if known, else null",
+      "item_level_5": "model or series if known, else null",
+      "item_level_6": "configuration or variant if known, else null",
+      "item_level_7": "key technical specification if known, else null",
+      "item_level_8": "any additional distinguishing detail, else null",
+      "commodity_tag": "lowercase-slug-tag (e.g. industrial-pump, it-laptop, vehicle-hiring)",
+      "item_summary": "plain-English summary of the item and its intended use (max 20 words)"
     }}
   ]
-}}"""
+}}
+
+### Rules
+
+**Required fields — never null:**
+- `item_name` — always present; use the supplier's exact product/service name from the document.
+- `item_description` — always present; include all specs, model numbers, and technical details visible in the document.
+- `item_level_1`, `item_level_2`, `item_level_3` — always fill; you can always infer broad category, sub-category, and product type from the item name alone.
+- `commodity_tag` — always present; derive from the item type.
+
+**Pricing rules:**
+- Extract `unit_price` and `total_price` separately whenever both are shown.
+- If only a total price is shown and quantity > 1: `unit_price = total_price / quantity`.
+- If only one price is shown and quantity is 1 or absent: treat it as both unit_price and total_price.
+- Never leave both unit_price and total_price null if any price figure appears in the document for that item.
+
+**General rules:**
+- The quotation document is the primary source of truth. Extract all values (prices, quantities, dates, descriptions) from it — not from the RAS reference data.
+- All text fields MUST be in English — translate from any source language.
+- Dates must be ISO 8601 (YYYY-MM-DD).  Convert formats like "15-Apr-2026" or "15/04/26" accordingly.
+- Prices as plain numbers — strip currency symbols, commas, and thousand separators.
+- If a field genuinely cannot be determined from the document, return null (not an empty string, not "N/A").
+- item_level_4 through item_level_8 may be null when information is genuinely absent — do not invent brand or model names.
+- supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
+
+**DTL_ID matching — CRITICAL:**
+
+You MUST attempt to map every quotation item row to a `purchase_dtl_id` from the RAS line items table. Do not return `null` for `purchase_dtl_id` unless the item is clearly a non-line charge (shipping, packing, GST, freight, insurance, surcharge, taxes).
+
+Use these signals to pick the right DTL_ID for each item — pick whichever signals are strongest in the documents you actually see. Do not invent signals that aren't there:
+
+1. **Distinguishing identifiers shared between the item and the RAS line** — model numbers, part codes, sizes, capacities, dimensions, ratings, or any alphanumeric identifier that uniquely names the product/service variant. Match these exactly. If the RAS line says "650T machine" and the quotation item says "650T machine", that's a match. If the supplier uses their own internal code (e.g. their model "X1000-A") that maps to the same physical/logical thing as the RAS line, use that mapping.
+2. **Site / location** — when both the RAS line and the quotation item name a site, region, or location, that's a strong signal.
+3. **Quantity and UOM** — when only one RAS line matches the quantity / unit, use that DTL_ID.
+4. **Item description overlap** — significant word overlap in the descriptive text.
+5. **Position in the table** — if the quotation lists items in the same order as the RAS table and other signals are absent, use position as a last-resort signal.
+
+For supporting items in the quotation (installation, packing, commissioning, training, freight when itemised, etc.), map each to the DTL_ID of the **product/service they support**, unless the RAS has a separate DTL_ID specifically for that supporting item — in which case prefer that one.
+
+If the same quotation item legitimately covers multiple DTL_IDs (e.g. one quote line for "Installation for both Machine A and Machine B"), emit one row per DTL_ID with the same item details.
+
+**One row per DTL_ID — STRICT:**
+Return **at most one item per `purchase_dtl_id`**. If the supplier quoted multiple options, configurations, or variants for the same line (e.g. standard vs premium, different lead times, revised prices), pick the single row that best represents the primary quoted offer — the one with the clearest pricing and the closest match to the RAS description. Do not emit duplicate rows for the same DTL_ID.
+
+**Set `supplier_match_conf` honestly:**
+- `1.0` — exact match on a distinguishing identifier (model number, code, size).
+- `0.7-0.9` — strong but not perfect match (one signal matches clearly).
+- `0.3-0.6` — weak match (only position or partial description overlap).
+- `< 0.3` — guessing — prefer to leave `purchase_dtl_id = null`.
+
+**Coverage check before responding:**
+After listing all items, verify:
+1. For every DTL_ID in the RAS table that the supplier has clearly quoted on, you have emitted **exactly one** item with that `purchase_dtl_id`. If you forgot a DTL_ID, add it now. If you emitted more than one row for the same DTL_ID, remove the duplicates and keep only the best one.
+2. No `purchase_dtl_id` appears more than once in your `items` array."""
 
 
 # ── Dataclasses ────────────────────────────────────────────────────────────────
@@ -1756,6 +1940,12 @@ def _load_pdf_for_extract(file_bytes: bytes, max_pages: int) -> DocumentContent:
         import fitz
         doc        = fitz.open(stream=file_bytes, filetype="pdf")
         page_count = len(doc)
+        if page_count > max_pages:
+            # Match doc-intel: warn explicitly so the user can see truncation in the canvas log.
+            logger.warning(
+                "PDF has {} page(s) but max_pages={} — only first {} page(s) will be processed",
+                page_count, max_pages, max_pages,
+            )
         total      = min(page_count, max_pages)
         text_pages: list[str] = []
         images:     list[str] = []
@@ -1776,13 +1966,14 @@ def _load_pdf_for_extract(file_bytes: bytes, max_pages: int) -> DocumentContent:
             images.append(base64.b64encode(pix.tobytes("png")).decode())
 
         doc.close()
-        logger.debug(
-            "PDF loaded: {} page(s) — {} digital (72 DPI text+image), {} scanned (150 DPI image)",
-            total, text_count, scanned_count,
+        logger.info(
+            "PDF loaded: {}/{} page(s) — {} digital (72 DPI text+image), {} scanned (150 DPI image)",
+            total, page_count, text_count, scanned_count,
         )
         text = "\n\n".join(text_pages) if text_pages else None
         return DocumentContent(text=text, images=images, page_count=total)
     except Exception as exc:
+        logger.opt(exception=True).error("PDF load failed: {}", exc)
         return DocumentContent(text=f"[PDF error: {exc}]", page_count=0)
 
 
@@ -1963,15 +2154,23 @@ def _fitz_render_for_extract(file_bytes: bytes, max_pages: int) -> DocumentConte
     import base64
     try:
         import fitz
-        doc    = fitz.open(stream=file_bytes)
-        n      = min(len(doc), max_pages)
+        doc        = fitz.open(stream=file_bytes)
+        page_count = len(doc)
+        if page_count > max_pages:
+            logger.warning(
+                "Document has {} page(s) but max_pages={} — only first {} page(s) will be rendered",
+                page_count, max_pages, max_pages,
+            )
+        n = min(page_count, max_pages)
         images = []
         for i in range(n):
             pix = doc[i].get_pixmap(dpi=200)
             images.append(base64.b64encode(pix.tobytes("png")).decode())
         doc.close()
+        logger.info("Document rendered: {}/{} page(s) at 200 DPI", n, page_count)
         return DocumentContent(images=images, page_count=n)
     except Exception as exc:
+        logger.opt(exception=True).error("Document render failed: {}", exc)
         return DocumentContent(text=f"[Render error: {exc}]")
 
 
@@ -2117,18 +2316,36 @@ def _call_extraction_llm(llm, ctx: RASContext, doc: DocumentContent, prompts: di
     from langchain_core.messages import HumanMessage, SystemMessage
     user_prompt = _build_extraction_user_prompt(ctx, doc, prompts)
     sys_prompt  = (prompts or {}).get("ext_system", EXTRACTION_SYSTEM_PROMPT)
+    # Hard cap on images attached per LLM request — Azure OpenAI rejects
+    # requests with more than ~50 images. Mirrors doc-intel _MAX_IMAGES.
+    max_images = max(1, int((prompts or {}).get("ext_max_images", 50)))
     messages: list = [SystemMessage(content=sys_prompt)]
+    img_count  = 0
+    img_detail = "n/a"
     if doc.is_image_based and doc.images:
-        images = doc.images[:50]
+        total_imgs = len(doc.images)
+        if total_imgs > max_images:
+            logger.warning(
+                "[PR={}] Quotation has {} image(s) but max_images={} — truncating to first {}",
+                ctx.purchase_req_no, total_imgs, max_images, max_images,
+            )
+        images = doc.images[:max_images]
+        img_count  = len(images)
+        # Mirror doc-intel: low detail when text is also present, high otherwise.
+        img_detail = "low" if doc.text else "high"
         content_parts: list = [{"type": "text", "text": user_prompt}]
         for b64 in images:
             content_parts.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
+                "image_url": {"url": f"data:image/png;base64,{b64}", "detail": img_detail},
             })
         messages.append(HumanMessage(content=content_parts))
     else:
         messages.append(HumanMessage(content=user_prompt))
+    logger.info(
+        "[PR={}] Calling extraction LLM — {} image(s) detail={}, ~{:.0f} kB prompt",
+        ctx.purchase_req_no, img_count, img_detail, len(user_prompt) / 1024,
+    )
     response = _call_llm_with_retry(llm, messages, prompts)
     return (getattr(response, "content", None) or str(response)).strip()
 
@@ -2581,19 +2798,27 @@ def _apply_price_alignment_boost(items: list[dict], ctx: RASContext, thresholds:
 
 
 def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None = None) -> None:
-    """Union-Find supplier name canonicalization — aligned with doc-intel branch.
+    """Per-DTL Union-Find supplier name canonicalization with supplier_country guard.
 
-    Clusters ALL unique supplier names globally across the full PR (not per-DTL),
-    using four merge rules: exact, substring, SequenceMatcher ratio ≥ 0.82, acronym.
-    Geo-token guard prevents merging different country branches.
+    Mirrors doc-intel ExtractionWriter.canonicalize_supplier_names_in_db
+    (the production variant — not the in-memory geo-token variant):
+      1. Group items by purchase_dtl_id.
+      2. Within each DTL_ID, cluster supplier_name variants using four merge
+         rules: exact, substring, SequenceMatcher ratio ≥ 0.82, acronym.
+      3. Country guard: if both items have a non-empty supplier_country and
+         those countries differ, they are NOT merged — different country
+         branches stay separate suppliers.
+      4. Canonical preference: RAS-known supplier_name first, else shortest.
 
-    Canonical preference: RAS-known name first (matches doc-intel), then shortest.
-    For items whose name changed, supplier_match_conf is recomputed against RAS suppliers.
+    After clustering, supplier_match_conf is recomputed for ALL items against
+    the RAS supplier set (matches doc-intel run.py step 6 — fresh scores so
+    ranking uses canonical names; this also wipes the earlier
+    _apply_price_alignment_boost, same as doc-intel).
     """
     from difflib import SequenceMatcher
     from collections import defaultdict
 
-    # Build RAS-known name set for canonical preference (doc-intel branch logic)
+    # Build RAS-known name set for canonical preference (matches doc-intel)
     ras_known: set[str] = set()
     if getattr(ctx, "supplier_name", None):
         ras_known.add(ctx.supplier_name.strip().lower())
@@ -2603,69 +2828,91 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
         if getattr(li, "supplier_name", None):
             ras_known.add(li.supplier_name.strip().lower())
 
-    # Collect ALL unique names globally (doc-intel clusters across full PR, not per-DTL)
-    raw_names: list[str] = []
-    seen: set[str] = set()
+    threshold = (thresholds or {}).get("canonicalize_threshold", _CANONICALIZE_THRESHOLD)
+
+    # Group items by purchase_dtl_id (None → not clustered, keeps raw name)
+    by_dtl: dict[int, list[dict]] = defaultdict(list)
     for item in items:
-        n = (item.get("supplier_name") or "").strip()
-        if n and n not in seen:
-            raw_names.append(n)
-            seen.add(n)
+        dtl_id = item.get("purchase_dtl_id")
+        if dtl_id is not None:
+            by_dtl[dtl_id].append(item)
 
-    if len(raw_names) < 2:
-        return
+    # (dtl_id, raw_name) → canonical_name
+    canonical_per_dtl: dict[tuple[int, str], str] = {}
 
-    uf: dict[str, str] = {n: n for n in raw_names}
-
-    def _find(x: str) -> str:
-        while uf[x] != x:
-            uf[x] = uf[uf[x]]
-            x = uf[x]
-        return x
-
-    def _union(a: str, b: str) -> None:
-        uf[_find(a)] = _find(b)
-
-    for i, a in enumerate(raw_names):
-        a_clean = _strip_contact_suffix(a).lower()
-        a_geo   = _name_geo_tokens(a_clean)
-        for b in raw_names[i + 1:]:
-            b_clean = _strip_contact_suffix(b).lower()
-            b_geo   = _name_geo_tokens(b_clean)
-            if a_geo and b_geo and a_geo != b_geo:
+    for dtl_id, dtl_items in by_dtl.items():
+        # Collect unique names + first non-empty country seen per name
+        raw_names: list[str] = []
+        name_country: dict[str, str] = {}
+        for it in dtl_items:
+            n = (it.get("supplier_name") or "").strip()
+            if not n:
                 continue
-            if a_clean == b_clean:
-                _union(a, b)
-            elif a_clean in b_clean or b_clean in a_clean:
-                _union(a, b)
-            elif SequenceMatcher(None, a_clean, b_clean).ratio() >= (thresholds or {}).get("canonicalize_threshold", _CANONICALIZE_THRESHOLD):
-                _union(a, b)
-            elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
-                _union(a, b)
+            if n not in name_country:
+                raw_names.append(n)
+                name_country[n] = (it.get("supplier_country") or "").strip().lower()
 
-    clusters: dict[str, list[str]] = defaultdict(list)
-    for n in raw_names:
-        clusters[_find(n)].append(n)
+        if len(raw_names) < 2:
+            continue
 
-    canonical_map: dict[str, str] = {}
-    for members in clusters.values():
-        # Prefer RAS-known name as canonical (doc-intel branch), then shortest
-        ras_match = next((m for m in members if m.lower() in ras_known), None)
-        canonical = ras_match if ras_match else min(members, key=len)
-        for m in members:
-            canonical_map[m] = canonical
+        uf: dict[str, str] = {n: n for n in raw_names}
 
+        def _find(x: str) -> str:
+            while uf[x] != x:
+                uf[x] = uf[uf[x]]
+                x = uf[x]
+            return x
+
+        def _union(a: str, b: str) -> None:
+            uf[_find(a)] = _find(b)
+
+        for i, a in enumerate(raw_names):
+            a_clean   = _strip_contact_suffix(a).lower()
+            a_country = name_country.get(a, "")
+            for b in raw_names[i + 1:]:
+                b_clean   = _strip_contact_suffix(b).lower()
+                b_country = name_country.get(b, "")
+
+                # Different non-empty supplier_country → separate suppliers
+                if a_country and b_country and a_country != b_country:
+                    continue
+
+                if a_clean == b_clean:
+                    _union(a, b)
+                elif a_clean in b_clean or b_clean in a_clean:
+                    _union(a, b)
+                elif SequenceMatcher(None, a_clean, b_clean).ratio() >= threshold:
+                    _union(a, b)
+                elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
+                    _union(a, b)
+
+        clusters: dict[str, list[str]] = defaultdict(list)
+        for n in raw_names:
+            clusters[_find(n)].append(n)
+
+        for members in clusters.values():
+            ras_match = next((m for m in members if m.lower() in ras_known), None)
+            canonical = ras_match if ras_match else min(members, key=len)
+            for m in members:
+                canonical_per_dtl[(dtl_id, m)] = canonical
+
+    # Apply canonical names + recompute supplier_match_conf for ALL items
+    # (matches doc-intel run.py step 6 — fresh scores against RAS suppliers).
     changed = 0
     for item in items:
-        orig  = (item.get("supplier_name") or "").strip()
-        canon = canonical_map.get(orig, orig)
-        if canon != orig:
-            item["supplier_name"] = canon
-            changed += 1
-            _, new_conf = _compute_supplier_match(canon, ctx, thresholds)
-            item["supplier_match_conf"] = Decimal(str(round(float(new_conf), 4)))
+        dtl_id = item.get("purchase_dtl_id")
+        orig   = (item.get("supplier_name") or "").strip()
+        if dtl_id is not None and orig:
+            canon = canonical_per_dtl.get((dtl_id, orig), orig)
+            if canon != orig:
+                item["supplier_name"] = canon
+                changed += 1
+        # Recompute conf for every item against the (possibly canonical) name
+        _, new_conf = _compute_supplier_match(item.get("supplier_name"), ctx, thresholds)
+        item["supplier_match_conf"] = new_conf
+
     if changed:
-        logger.info(f"Supplier canonicalization: {changed} name(s) updated across PR")
+        logger.info(f"Supplier canonicalization (per-DTL): {changed} name(s) updated")
 
 
 # ── DB writer: extracted items ─────────────────────────────────────────────────
@@ -2736,8 +2983,14 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
             saved += 1
         conn.commit()
     except Exception as exc:
-        try: conn.rollback()
-        except Exception: pass
+        logger.opt(exception=True).error(
+            "DB INSERT into quotation_extracted_items failed after {} row(s): {}",
+            saved, exc,
+        )
+        try:
+            conn.rollback()
+        except Exception as rb_exc:
+            logger.warning("Rollback failed: {}", rb_exc)
         raise
     finally:
         conn.close()
@@ -2758,28 +3011,41 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
 
     sources = _resolve_quotation_sources(tgt_cs, pr_no)
     if not sources:
-        logger.warning(f"[{pr_no}] No Quotation attachments found — check classification")
-        return 0
+        # Mirror doc-intel branch: raise so the per-PR flow records an
+        # exception (stage_id=5) + sets tracker = 99 + breaks before
+        # stages 6/7/8 run. Caller catches NoQuotationFoundError specifically
+        # and logs it as a warning (no traceback).
+        raise NoQuotationFoundError(
+            f"No quotation documents found for PR={pr_no!r}. "
+            f"None of the attachments are classified as 'Quotation'."
+        )
 
     # Each source is: download blob → load doc → LLM extract → parse → align.
     # This is I/O + LLM bound, so threads give real speedup when a PR has
     # multiple quotation files. Keep n_workers low (default 1) to avoid
     # multiplying LLM rate-limit pressure on top of parallel_workers.
     n_workers = max(1, int((prompts or {}).get("ext_parallel_sources", 1)))
+    max_pages = max(1, int((prompts or {}).get("ext_max_pages", 20)))
 
     def _extract_one(src: dict) -> list[dict]:
         blob_path = src["blob_path"]
         filename  = os.path.basename(blob_path)
         try:
             file_bytes = _download_blob(blob_path, blob_cfg)
-            doc        = _load_document(file_bytes, filename)
+            doc        = _load_document(file_bytes, filename, max_pages=max_pages)
             raw        = _call_extraction_llm(llm, ctx, doc, prompts)
             items      = _parse_extraction_response(raw, src, ctx)
             items      = _align_to_ras_line_items(items, ctx, src)
-            logger.info(f"[{pr_no}] Extracted {len(items)} item(s) from {filename!r}")
+            logger.info(
+                "[{}] Extracted {} item(s) from {!r} ({} page(s) loaded, {} image(s))",
+                pr_no, len(items), filename, doc.page_count,
+                len(doc.images) if doc.images else 0,
+            )
             return items
         except Exception as exc:
-            logger.warning(f"[{pr_no}] Extraction failed for {filename!r}: {exc}")
+            logger.opt(exception=True).warning(
+                "[{}] Extraction failed for {!r}: {}", pr_no, filename, exc
+            )
             return []
 
     if n_workers == 1:
@@ -3545,6 +3811,29 @@ class PipelineStage123Node(Node):
             advanced=True,
             info="Truncate document content before sending to the extraction LLM. 0 = no limit.",
         ),
+        IntInput(
+            name="ext_max_pages",
+            display_name="Max Pages — PDF/Doc Render (Stage 5)",
+            value=20,
+            advanced=True,
+            info=(
+                "Max pages rendered per quotation document during extraction. "
+                "PDFs longer than this only have their first N pages processed; "
+                "a warning is logged when truncation happens. Matches doc-intel "
+                "MAX_PAGES default."
+            ),
+        ),
+        IntInput(
+            name="ext_max_images",
+            display_name="Max Images per LLM Call (Stage 5)",
+            value=50,
+            advanced=True,
+            info=(
+                "Hard cap on images attached to one extraction LLM request. "
+                "Azure OpenAI rejects requests with more than ~50 images per call, "
+                "so the value should not be raised above 50."
+            ),
+        ),
         MessageTextInput(
             name="selected_threshold",
             display_name="Selected Quote Min Score (Stage 7)",
@@ -4165,6 +4454,10 @@ class PipelineStage123Node(Node):
         if cls_max: prompts["cls_max_chars"] = int(cls_max)
         ext_max = getattr(self, "ext_max_chars", None)
         if ext_max: prompts["ext_max_chars"] = int(ext_max)
+        ext_max_pages = getattr(self, "ext_max_pages", None)
+        if ext_max_pages is not None: prompts["ext_max_pages"] = int(ext_max_pages)
+        ext_max_images = getattr(self, "ext_max_images", None)
+        if ext_max_images is not None: prompts["ext_max_images"] = int(ext_max_images)
         try:
             prompts["selected_threshold"] = Decimal(str(float(getattr(self, "selected_threshold", None) or "0.70")))
         except Exception:
@@ -4204,6 +4497,9 @@ class PipelineStage123Node(Node):
             self.log(f"[{pr_no}] Stage 4 — classification complete")
 
             # Stage 5 — Extraction
+            # Raises NoQuotationFoundError if classification produced zero
+            # 'Quotation' rows — caught below as an expected outcome (warning,
+            # no traceback) that records an exception row and stops further stages.
             current_stage = _STAGE_EXTRACTION
             self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
             n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
@@ -4229,6 +4525,16 @@ class PipelineStage123Node(Node):
             _set_last_processed_at(tgt_cs, pr_no)
             self.log(f"[{pr_no}] Stage 8 — pipeline complete")
             result["status"] = "complete"
+
+        except NoQuotationFoundError as exc:
+            # Expected outcome: PR has no attachments classified as 'Quotation'.
+            # Log as warning (no traceback), record in ras_pipeline_exceptions
+            # with stage_id=5, set tracker=99, and stop — stages 6/7/8 do not run.
+            self.log(f"[{pr_no}] Stage 5 (Extraction) — no quotation found: {exc}")
+            logger.warning("[{}] Stage 5 (Extraction): {}", pr_no, exc)
+            result["status"] = "failed_no_quotation"
+            result["error"]  = f"Stage 5 (Extraction): {exc}"
+            self._record_exception(tgt_cs, pr_no, _STAGE_EXTRACTION, str(exc))
 
         except Exception as exc:
             stage_name = {
