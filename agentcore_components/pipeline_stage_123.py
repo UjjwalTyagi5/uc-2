@@ -41,16 +41,34 @@ _STAGE_BLOB_UPLOAD = 3
 _STAGE_EXCEPTION  = 99
 
 
-class NoQuotationFoundError(RuntimeError):
-    """Raised when a PR has no attachments classified as 'Quotation'.
+class ExtractionAbortError(RuntimeError):
+    """Raised when Stage 5 (Extraction) cannot produce any items.
 
-    Treated as an expected pipeline outcome (not a bug). Mirrors
-    quotation_extraction.run.NoQuotationFoundError from the doc-intel branch:
-    the caller logs it as a warning, records it in ras_pipeline_exceptions,
-    sets ras_tracker.current_stage_fk = 99, and breaks the per-PR flow so
-    no further stages run for this PR.
+    The Stage 4-8 catch block treats every subclass as an expected pipeline
+    outcome (not a crash): logs it as a warning without traceback, records a
+    row in ras_pipeline_exceptions (stage_id=5), sets
+    ras_tracker.current_stage_fk = 99 (EXCEPTION), and skips stages 6/7/8.
+
+    Subclasses identify the specific reason so the exception_message in DB
+    is self-explanatory.
     """
     _suppress_traceback = True
+
+
+class NoQuotationFoundError(ExtractionAbortError):
+    """No attachments classified as 'Quotation'."""
+
+
+class NoLineItemsError(ExtractionAbortError):
+    """RAS context has zero rows in purchase_req_detail."""
+
+
+class NoRASContextError(ExtractionAbortError):
+    """No purchase_req_mst row found for this PR."""
+
+
+class AllExtractionsFailedError(ExtractionAbortError):
+    """All quotation files failed to extract any items."""
 
 _TEXT_EXT  = {".txt", ".csv", ".xml", ".json", ".html", ".htm", ".eml"}
 _PDF_EXT   = {".pdf"}
@@ -3069,20 +3087,23 @@ def _save_extracted_items(tgt_cs: str, items: list) -> int:
 
 def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict | None = None) -> int:
     import os
+    # Each abort path raises an ExtractionAbortError subclass so the per-PR
+    # catch in _run_stages_48 records ras_pipeline_exceptions (stage_id=5),
+    # sets ras_tracker.current_stage_fk = 99, and skips stages 6/7/8.
+    # Returning 0 silently here would let the pipeline advance to stage 8
+    # (COMPLETE) on a PR that had nothing to extract — which is wrong.
     ctx = _build_ras_context(tgt_cs, pr_no)
     if ctx is None:
-        logger.warning(f"[{pr_no}] No RAS context found — skipping extraction")
-        return 0
+        raise NoRASContextError(
+            f"No purchase_req_mst row for PR={pr_no!r} — cannot extract."
+        )
     if not ctx.line_items:
-        logger.warning(f"[{pr_no}] No line items — skipping extraction")
-        return 0
+        raise NoLineItemsError(
+            f"PR={pr_no!r} has no rows in purchase_req_detail — nothing to extract against."
+        )
 
     sources = _resolve_quotation_sources(tgt_cs, pr_no)
     if not sources:
-        # Mirror doc-intel branch: raise so the per-PR flow records an
-        # exception (stage_id=5) + sets tracker = 99 + breaks before
-        # stages 6/7/8 run. Caller catches NoQuotationFoundError specifically
-        # and logs it as a warning (no traceback).
         raise NoQuotationFoundError(
             f"No quotation documents found for PR={pr_no!r}. "
             f"None of the attachments are classified as 'Quotation'."
@@ -3128,7 +3149,14 @@ def _run_extraction(llm, tgt_cs: str, blob_cfg: dict, pr_no: str, prompts: dict 
         all_items = [item for batch in results for item in batch]
 
     if not all_items:
-        return 0
+        # Every quotation source raised inside _extract_one (LLM error, parse
+        # failure, blob 404, etc.) and was caught individually. With nothing to
+        # save, abort so this PR is moved to exception state instead of
+        # advancing through stages 6-8 with empty data.
+        raise AllExtractionsFailedError(
+            f"All {len(sources)} quotation source(s) for PR={pr_no!r} "
+            f"failed extraction; no items produced."
+        )
 
     _apply_price_alignment_boost(all_items, ctx, prompts)
     _canonicalize_supplier_names(all_items, ctx, prompts)
@@ -4571,9 +4599,11 @@ class PipelineStage123Node(Node):
             self.log(f"[{pr_no}] Stage 4 — classification complete")
 
             # Stage 5 — Extraction
-            # Raises NoQuotationFoundError if classification produced zero
-            # 'Quotation' rows — caught below as an expected outcome (warning,
-            # no traceback) that records an exception row and stops further stages.
+            # Raises an ExtractionAbortError subclass (NoQuotationFoundError,
+            # NoLineItemsError, NoRASContextError, AllExtractionsFailedError)
+            # whenever the PR cannot produce extracted items. Caught below as
+            # an expected outcome — records ras_pipeline_exceptions, sets
+            # tracker.current_stage_fk = 99, and skips stages 6/7/8.
             current_stage = _STAGE_EXTRACTION
             self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
             n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
@@ -4600,15 +4630,18 @@ class PipelineStage123Node(Node):
             self.log(f"[{pr_no}] Stage 8 — pipeline complete")
             result["status"] = "complete"
 
-        except NoQuotationFoundError as exc:
-            # Expected outcome: PR has no attachments classified as 'Quotation'.
-            # Log as warning (no traceback), record in ras_pipeline_exceptions
-            # with stage_id=5, set tracker=99, and stop — stages 6/7/8 do not run.
-            self.log(f"[{pr_no}] Stage 5 (Extraction) — no quotation found: {exc}")
-            logger.warning("[{}] Stage 5 (Extraction): {}", pr_no, exc)
-            result["status"] = "failed_no_quotation"
-            result["error"]  = f"Stage 5 (Extraction): {exc}"
-            self._record_exception(tgt_cs, pr_no, _STAGE_EXTRACTION, str(exc))
+        except ExtractionAbortError as exc:
+            # Expected outcome: Stage 5 cannot proceed for a known reason
+            # (NoQuotationFoundError, NoLineItemsError, NoRASContextError,
+            # AllExtractionsFailedError). Log as warning (no traceback),
+            # record in ras_pipeline_exceptions with stage_id=5, set
+            # tracker=99 (EXCEPTION), and stop — stages 6/7/8 do not run.
+            reason = type(exc).__name__
+            self.log(f"[{pr_no}] Stage 5 (Extraction) — {reason}: {exc}")
+            logger.warning("[{}] Stage 5 (Extraction) — {}: {}", pr_no, reason, exc)
+            result["status"] = f"failed_{reason}"
+            result["error"]  = f"Stage 5 (Extraction) — {reason}: {exc}"
+            self._record_exception(tgt_cs, pr_no, _STAGE_EXTRACTION, f"{reason}: {exc}")
 
         except Exception as exc:
             stage_name = {
