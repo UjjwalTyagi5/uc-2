@@ -3698,9 +3698,237 @@ def _compute_low_last(items: list[dict]) -> tuple:
     return low_item, last_item
 
 
-def _format_bench_prompt(current: dict, historical: list[dict]) -> str:
-    """Build structured LLM prompt matching doc intel branch style."""
-    eur_unit = current.get("unit_price_eur")
+def _hist_eur(it: dict) -> "Decimal | None":
+    """Best-effort EUR unit price for a historical row (fallback to unit_price)."""
+    v = it.get("unit_price_eur")
+    if v is None:
+        v = it.get("unit_price")
+    try:
+        return Decimal(str(v)) if v is not None else None
+    except Exception:
+        return None
+
+
+def _filter_historical_uom(historical: list[dict], current_uom: str | None, strict: bool) -> list[dict]:
+    """Drop historical items whose UOM does not match the current item.
+
+    Why: a laptop priced 'per piece' cannot be benchmarked against one priced
+    'per box of 10'; a steel coil priced 'MT' cannot be benchmarked against
+    one priced 'KG'. Mixing UOMs silently corrupts the recommendation.
+    Comparison is case-insensitive and trims whitespace; if either side has
+    no UOM the row is kept (cannot prove they differ).
+    """
+    if not strict or not current_uom:
+        return historical
+    norm = (current_uom or "").strip().lower()
+    if not norm:
+        return historical
+    kept: list[dict] = []
+    dropped = 0
+    for it in historical:
+        h = (it.get("unit") or "").strip().lower()
+        if not h or h == norm:
+            kept.append(it)
+        else:
+            dropped += 1
+    if dropped:
+        logger.debug("Benchmark UOM filter: dropped {} historical row(s) with UOM != {!r}", dropped, current_uom)
+    return kept
+
+
+def _filter_historical_outliers(historical: list[dict], factor: float) -> list[dict]:
+    """Drop rows whose unit_price_eur is more than `factor`× away from the median.
+
+    Why: a single typo'd quote (e.g. 1000 EUR instead of 100 EUR) skews the
+    LLM's recommendation. We compute the median across the kept set and drop
+    any row whose price is > median × factor or < median / factor. Set
+    factor <= 0 to disable outlier removal entirely.
+    """
+    if factor is None or factor <= 0 or len(historical) < 3:
+        return historical
+    eurs = [_hist_eur(it) for it in historical]
+    eurs = [float(e) for e in eurs if e is not None and e > 0]
+    if len(eurs) < 3:
+        return historical
+    eurs_sorted = sorted(eurs)
+    n = len(eurs_sorted)
+    median = (eurs_sorted[n // 2] if n % 2 else (eurs_sorted[n // 2 - 1] + eurs_sorted[n // 2]) / 2)
+    if median <= 0:
+        return historical
+    high = median * factor
+    low  = median / factor
+    kept: list[dict] = []
+    dropped = 0
+    for it in historical:
+        e = _hist_eur(it)
+        if e is None:
+            kept.append(it)        # no price → can't be an outlier; keep
+            continue
+        ev = float(e)
+        if low <= ev <= high:
+            kept.append(it)
+        else:
+            dropped += 1
+    if dropped:
+        logger.debug("Benchmark outlier filter: dropped {} row(s) outside [{:.2f}, {:.2f}] (median {:.2f}, factor {})",
+                     dropped, low, high, median, factor)
+    return kept
+
+
+def _filter_historical_age(historical: list[dict], current_iso: str, max_age_months: int) -> list[dict]:
+    """Drop rows older than max_age_months relative to the current item's
+    item_created_date. Set max_age_months <= 0 to disable."""
+    if max_age_months is None or max_age_months <= 0:
+        return historical
+    if not current_iso:
+        return historical
+    import re as _re
+    from datetime import date as _date
+    m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", str(current_iso))
+    if not m:
+        return historical
+    cur_date = _date(int(m[1]), int(m[2]), int(m[3]))
+    cur_months = cur_date.year * 12 + cur_date.month
+    kept: list[dict] = []
+    dropped = 0
+    for it in historical:
+        qd = it.get("quotation_date")
+        if qd is None:
+            kept.append(it)
+            continue
+        try:
+            qy = qd.year if hasattr(qd, "year") else int(str(qd)[:4])
+            qm = qd.month if hasattr(qd, "month") else int(str(qd)[5:7])
+        except Exception:
+            kept.append(it)
+            continue
+        age_months = cur_months - (qy * 12 + qm)
+        if age_months <= max_age_months:
+            kept.append(it)
+        else:
+            dropped += 1
+    if dropped:
+        logger.debug("Benchmark age filter: dropped {} row(s) older than {} month(s)", dropped, max_age_months)
+    return kept
+
+
+def _benchmark_aggregates(historical: list[dict], current_iso: str | None) -> dict:
+    """Pre-compute aggregate stats for the LLM benchmark prompt.
+
+    Returns a dict with:
+      median, p25, p75, mean, min, max, count       (across unit_price_eur)
+      time_buckets : { "≤6m": [...], "6-24m": [...], ">24m": [...] }
+                     each value is the list of historical dicts in that bucket
+      by_supplier  : { supplier_name: { count, min, max, median } }
+      qty_min, qty_max, qty_median (current vs historical scale context)
+
+    All numeric stats are floats, rounded to 4 dp.
+    """
+    if not historical:
+        return {}
+    import re as _re
+    from datetime import date as _date
+
+    eurs = [(_hist_eur(it), it) for it in historical]
+    priced = [(float(e), it) for e, it in eurs if e is not None and e > 0]
+
+    stats: dict = {"count": len(historical), "priced_count": len(priced)}
+    if priced:
+        vals = sorted(p for p, _ in priced)
+        n = len(vals)
+        def _quantile(arr: list[float], q: float) -> float:
+            if not arr:
+                return 0.0
+            k = (len(arr) - 1) * q
+            f, c = int(k), min(int(k) + 1, len(arr) - 1)
+            if f == c:
+                return arr[f]
+            return arr[f] + (arr[c] - arr[f]) * (k - f)
+        stats["min"]    = round(vals[0], 4)
+        stats["max"]    = round(vals[-1], 4)
+        stats["median"] = round(_quantile(vals, 0.50), 4)
+        stats["p25"]    = round(_quantile(vals, 0.25), 4)
+        stats["p75"]    = round(_quantile(vals, 0.75), 4)
+        stats["mean"]   = round(sum(vals) / n, 4)
+
+    # Time buckets relative to current_iso (or today if missing)
+    cur_date: _date | None = None
+    if current_iso:
+        m = _re.match(r"(\d{4})-(\d{2})-(\d{2})", str(current_iso))
+        if m:
+            cur_date = _date(int(m[1]), int(m[2]), int(m[3]))
+    if cur_date is None:
+        cur_date = _date.today()
+    cur_months = cur_date.year * 12 + cur_date.month
+    buckets: dict[str, list] = {"recent": [], "mid": [], "old": []}
+    for it in historical:
+        qd = it.get("quotation_date")
+        if qd is None:
+            buckets["old"].append(it)
+            continue
+        try:
+            qy = qd.year if hasattr(qd, "year") else int(str(qd)[:4])
+            qm = qd.month if hasattr(qd, "month") else int(str(qd)[5:7])
+        except Exception:
+            buckets["old"].append(it)
+            continue
+        age_months = cur_months - (qy * 12 + qm)
+        if age_months <= 6:
+            buckets["recent"].append(it)
+        elif age_months <= 24:
+            buckets["mid"].append(it)
+        else:
+            buckets["old"].append(it)
+    stats["time_buckets"] = buckets
+
+    # Per-supplier summary (top suppliers by count)
+    by_sup: dict[str, list[float]] = {}
+    for p, it in priced:
+        s = (it.get("supplier_name") or "Unknown").strip() or "Unknown"
+        by_sup.setdefault(s, []).append(p)
+    sup_summary: dict[str, dict] = {}
+    for s, prices in by_sup.items():
+        prices.sort()
+        n = len(prices)
+        med = prices[n // 2] if n % 2 else (prices[n // 2 - 1] + prices[n // 2]) / 2
+        sup_summary[s] = {
+            "count":  n,
+            "min":    round(prices[0], 4),
+            "max":    round(prices[-1], 4),
+            "median": round(med, 4),
+        }
+    stats["by_supplier"] = sup_summary
+
+    # Quantity context
+    qtys = [float(it.get("quantity")) for it in historical if it.get("quantity") is not None]
+    if qtys:
+        qtys.sort()
+        n = len(qtys)
+        med_q = qtys[n // 2] if n % 2 else (qtys[n // 2 - 1] + qtys[n // 2]) / 2
+        stats["qty_min"]    = qtys[0]
+        stats["qty_max"]    = qtys[-1]
+        stats["qty_median"] = med_q
+
+    return stats
+
+
+def _format_bench_prompt(
+    current: dict,
+    historical: list[dict],
+    stats: dict | None = None,
+) -> str:
+    """Build a richer benchmark LLM prompt.
+
+    Includes pre-computed aggregates (median, P25, P75, mean), per-supplier
+    mini-summary, and three time-bucketed views of the historical data
+    (recent ≤6m / mid 6-24m / old >24m). Asks for a price RANGE
+    (bp_low / bp_unit_price / bp_high) plus a confidence score so the
+    downstream system can communicate uncertainty.
+
+    Backward-compatible JSON: callers only need bp_unit_price + summary,
+    extra fields are folded into summary if not stored separately.
+    """
+    eur_unit  = current.get("unit_price_eur")
     raw_price = current.get("unit_price")
     currency  = current.get("currency") or ""
     if eur_unit is not None and currency.upper() != "EUR":
@@ -3728,16 +3956,75 @@ def _format_bench_prompt(current: dict, historical: list[dict]) -> str:
     ])
 
     if not historical:
-        hist_block = "No historical data available."
+        return (
+            "Recommend a benchmark unit price for this item.\n\n"
+            f"CURRENT ITEM:\n{current_block}\n\n"
+            "HISTORICAL DATA: none available — no comparable older purchases found.\n"
+            "Return your best estimate based on the item description alone.\n\n"
+            "Return ONLY JSON (no markdown): "
+            '{ "bp_unit_price": <number EUR or null>, '
+            '"bp_low": <number EUR or null>, '
+            '"bp_high": <number EUR or null>, '
+            '"confidence": <0.0-1.0>, '
+            '"summary": "<2-3 sentences>" }'
+        )
+
+    stats = stats or {}
+
+    # ── Aggregate stats block ────────────────────────────────────────────
+    agg_lines: list[str] = []
+    if stats.get("count") is not None:
+        agg_lines.append(
+            f"- Sample size : {stats['count']} historical row(s) "
+            f"({stats.get('priced_count', 0)} priced)"
+        )
+    if "median" in stats:
+        agg_lines.append(
+            f"- Price stats (EUR) : "
+            f"min={stats['min']}, P25={stats['p25']}, "
+            f"median={stats['median']}, P75={stats['p75']}, "
+            f"max={stats['max']}, mean={stats['mean']}"
+        )
+    if "qty_median" in stats:
+        cur_qty = current.get("quantity") or "?"
+        agg_lines.append(
+            f"- Quantity context : current={cur_qty} {current.get('unit') or ''}, "
+            f"historical qty (min / median / max) = "
+            f"{stats.get('qty_min')} / {stats['qty_median']} / {stats.get('qty_max')}"
+        )
+    agg_block = "\n".join(agg_lines) if agg_lines else "- No aggregate stats available"
+
+    # ── Per-supplier summary block ───────────────────────────────────────
+    by_sup = stats.get("by_supplier") or {}
+    if by_sup:
+        # Sort by count desc, take top 8 to keep prompt size sane
+        top_sups = sorted(by_sup.items(), key=lambda kv: -kv[1]["count"])[:8]
+        sup_rows = ["| Supplier | N | Min EUR | Median EUR | Max EUR |",
+                    "|----------|---|---------|------------|---------|"]
+        for s, d in top_sups:
+            sup_rows.append(
+                f"| {s} | {d['count']} | {d['min']} | {d['median']} | {d['max']} |"
+            )
+        sup_block = "\n".join(sup_rows)
+        if len(by_sup) > 8:
+            sup_block += f"\n  (… and {len(by_sup) - 8} more supplier(s) with smaller samples)"
     else:
+        sup_block = "No per-supplier breakdown available."
+
+    # ── Time-bucketed historical rows ─────────────────────────────────────
+    buckets = stats.get("time_buckets") or {}
+
+    def _hist_table(rows: list[dict]) -> str:
+        if not rows:
+            return "  (none in this window)"
         header = "| # | Supplier | Date | Qty | Unit | Unit Price (EUR) | Orig. Currency |"
         sep    = "|---|----------|------|-----|------|-----------------|----------------|"
-        rows_out = []
-        for i, it in enumerate(historical, 1):
+        out = [header, sep]
+        for i, it in enumerate(rows, 1):
             eur_p = it.get("unit_price_eur")
             raw_p = it.get("unit_price")
             eur_label = str(eur_p) if eur_p is not None else (f"{raw_p} *" if raw_p is not None else "N/A")
-            rows_out.append(
+            out.append(
                 f"| {i} | {it.get('supplier_name') or 'N/A'} "
                 f"| {it.get('quotation_date') or 'N/A'} "
                 f"| {it.get('quantity') or 'N/A'} "
@@ -3745,14 +4032,42 @@ def _format_bench_prompt(current: dict, historical: list[dict]) -> str:
                 f"| {eur_label} "
                 f"| {it.get('currency') or 'N/A'} |"
             )
-        hist_block = "\n".join([header, sep] + rows_out)
+        return "\n".join(out)
+
+    hist_block = (
+        "RECENT (last 6 months) — weight these highest:\n"
+        + _hist_table(buckets.get("recent") or []) + "\n\n"
+        "MID (6-24 months) — weight moderately:\n"
+        + _hist_table(buckets.get("mid") or []) + "\n\n"
+        "OLDER (>24 months) — apply inflation adjustment if relevant:\n"
+        + _hist_table(buckets.get("old") or [])
+    )
 
     return (
-        f"Recommend a benchmark unit price for this item based on historical similar purchases.\n\n"
+        "You are recommending a benchmark unit price for the CURRENT ITEM "
+        "below, drawing on historical purchases of similar items. The "
+        "historical set has already been pre-filtered for similarity, "
+        "UOM compatibility, age, and price outliers — every row shown is "
+        "a valid comparator.\n\n"
+        "How to weight the data:\n"
+        "  • Recent (≤6m) prices reflect today's market — anchor on these.\n"
+        "  • Mid (6-24m) prices are useful trend signals.\n"
+        "  • Older (>24m) prices may need inflation adjustment.\n"
+        "  • Per-supplier ranges show negotiation room with each vendor.\n"
+        "  • Quantity context flags volume-vs-pilot pricing differences.\n"
+        "  • The median and P25-P75 band are usually the safest anchor.\n\n"
         f"CURRENT ITEM:\n{current_block}\n\n"
-        f"HISTORICAL SIMILAR ITEMS:\n{hist_block}\n\n"
-        f"Return ONLY JSON (no markdown): "
-        f'{{ "bp_unit_price": <number in EUR or null>, "summary": "<2-3 sentences>" }}'
+        f"AGGREGATE STATS:\n{agg_block}\n\n"
+        f"PER-SUPPLIER SUMMARY:\n{sup_block}\n\n"
+        f"HISTORICAL DATA (time-bucketed):\n{hist_block}\n\n"
+        "Return ONLY JSON (no markdown):\n"
+        "{\n"
+        '  "bp_unit_price": <number EUR — your point estimate>,\n'
+        '  "bp_low":        <number EUR — pessimistic / floor of plausible range>,\n'
+        '  "bp_high":       <number EUR — optimistic / ceiling of plausible range>,\n'
+        '  "confidence":    <0.0-1.0 — how reliable this benchmark is given the sample>,\n'
+        '  "summary":       "<2-3 sentences explaining the recommendation, citing which data drove it>"\n'
+        "}"
     )
 
 
@@ -3840,10 +4155,26 @@ def _estimate_inflation_via_llm(llm, item_name: str | None, category: str | None
         return None
 
 
-def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str, top_k: int) -> None:
+def _run_benchmark(
+    llm,
+    tgt_cs: str,
+    pr_no: str,
+    embed_model,
+    pinecone_index: str,
+    pinecone_ns: str,
+    top_k: int,
+    prompts: dict | None = None,
+) -> None:
     # Structural errors (import, DB connect, query) propagate — caller records exception.
     from agentcore.services.pinecone_service_client import search_via_service
     from langchain_core.messages import HumanMessage
+
+    # Read benchmark filtering knobs from prompts dict (canvas-tunable).
+    p = prompts or {}
+    min_score       = float(p.get("bench_min_similarity", 0.70))
+    outlier_factor  = float(p.get("bench_outlier_factor", 3.0))
+    max_age_months  = int(p.get("bench_max_age_months", 0))
+    uom_strict      = bool(p.get("bench_uom_strict", True))
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
@@ -3932,12 +4263,13 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
             else:
                 matches = []
 
-            # Filter: minimum similarity score, exclude same PR, only items from older PRs
-            _MIN_SCORE = 0.70
+            # ── Stage 1 filtering: at-vector-DB level ────────────────────
+            # Configurable similarity threshold (was hardcoded 0.70).
+            # Same-PR + future-date guards retained.
             filtered = []
             for m in matches:
                 score = float(m.get("score", 0.0))
-                if score < _MIN_SCORE:
+                if score < min_score:
                     continue
                 meta = m.get("metadata") or {}
                 if meta.get("purchase_req_no") == pr_no:
@@ -3953,12 +4285,32 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                 if m.get("metadata", {}).get("purchase_dtl_id") is not None
             ]
             logger.info(
-                f"[{pr_no}] dtl_id={dtl_id}: {len(filtered)} Pinecone match(es) after filter "
-                f"→ dtl_ids={similar_dtl_ids_raw}"
+                f"[{pr_no}] dtl_id={dtl_id}: {len(filtered)} Pinecone match(es) after similarity "
+                f"filter (min_score={min_score}) → dtl_ids={similar_dtl_ids_raw}"
             )
 
             # Fetch full historical pricing from DB
-            historical = _fetch_historical_for_dtl_ids(tgt_cs, similar_dtl_ids_raw) if similar_dtl_ids_raw else []
+            historical_raw = _fetch_historical_for_dtl_ids(tgt_cs, similar_dtl_ids_raw) if similar_dtl_ids_raw else []
+
+            # ── Stage 2 filtering: post-fetch (uses DB-only fields) ─────
+            # UOM / outlier / age filters take effect here because Pinecone
+            # metadata doesn't carry the unit, eur price, or full date —
+            # we only have those after the join with quotation_extracted_items.
+            historical = historical_raw
+            historical = _filter_historical_uom(historical, rd.get("unit"), uom_strict)
+            historical = _filter_historical_age(historical, created_iso, max_age_months)
+            historical = _filter_historical_outliers(historical, outlier_factor)
+            if len(historical) != len(historical_raw):
+                logger.info(
+                    f"[{pr_no}] dtl_id={dtl_id}: filtered {len(historical_raw) - len(historical)}/{len(historical_raw)} "
+                    f"historical row(s) (uom_strict={uom_strict}, max_age_months={max_age_months}, "
+                    f"outlier_factor={outlier_factor})"
+                )
+
+            # Pre-compute aggregates for the LLM prompt (median, P25/P75,
+            # time buckets, per-supplier mini-summary, qty context).
+            agg = _benchmark_aggregates(historical, created_iso)
+
             low_item, last_item = _compute_low_last(historical)
             low_uuid  = str(low_item["extracted_item_uuid_pk"])  if low_item  else None
             last_uuid = str(last_item["extracted_item_uuid_pk"]) if last_item else None
@@ -3990,8 +4342,10 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
                     f"cpi_pct={cpi_dec} (country={supplier_country!r} {ref_year}-{current_year})"
                 )
 
-            # LLM benchmark analysis
-            bench_prompt = _format_bench_prompt(rd, historical[:top_k])
+            # LLM benchmark analysis — uses pre-computed aggregates so the
+            # LLM can anchor on the median + P25-P75 band + time buckets
+            # without re-deriving them mentally from raw rows.
+            bench_prompt = _format_bench_prompt(rd, historical[:top_k], stats=agg)
             bout = {}
             try:
                 resp = llm.invoke([HumanMessage(content=bench_prompt)])
@@ -4002,13 +4356,37 @@ def _run_benchmark(llm, tgt_cs: str, pr_no: str, embed_model, pinecone_index: st
             except Exception as exc:
                 logger.warning(f"[{pr_no}] LLM benchmark parse failed dtl_id={dtl_id}: {exc}")
 
-            bp_unit = bout.get("bp_unit_price")
-            summary = bout.get("summary", "")
+            bp_unit       = bout.get("bp_unit_price")
+            bp_low        = bout.get("bp_low")
+            bp_high       = bout.get("bp_high")
+            bp_confidence = bout.get("confidence")
+            llm_summary   = bout.get("summary", "")
             try:
                 bp_dec   = Decimal(str(bp_unit)) if bp_unit is not None else None
                 bp_total = round(float(bp_dec) * float(qty or 1), 2) if bp_dec is not None else None
             except Exception:
                 bp_dec = bp_total = None
+
+            # Fold the new range + confidence + sample-size info into the
+            # human-readable summary so we don't need a schema change to the
+            # benchmark_result table. bp_unit_price stays the canonical
+            # point estimate; the prefix gives consumers the band.
+            extras = []
+            if bp_low is not None or bp_high is not None:
+                extras.append(f"range={bp_low}–{bp_high} EUR")
+            if bp_confidence is not None:
+                try:
+                    extras.append(f"confidence={float(bp_confidence):.2f}")
+                except Exception:
+                    extras.append(f"confidence={bp_confidence}")
+            if agg.get("count") is not None:
+                extras.append(f"n={agg['count']} (priced={agg.get('priced_count', 0)})")
+            if "median" in agg:
+                extras.append(f"median={agg['median']} EUR")
+            summary = (
+                f"[{', '.join(extras)}] {llm_summary}".strip()
+                if extras else llm_summary
+            )
 
             try:
                 cur2.execute("""
@@ -4433,6 +4811,52 @@ class PipelineStage123Node(Node):
             value="0.82",
             advanced=True,
             info="SequenceMatcher ratio (0.0–1.0) above which two supplier names are merged into one canonical name.",
+        ),
+        # ── Benchmark filtering / quality knobs (Stage 7) ────────────────────
+        MessageTextInput(
+            name="bench_min_similarity",
+            display_name="Benchmark Min Similarity (Stage 7)",
+            value="0.70",
+            advanced=True,
+            info=(
+                "Minimum cosine similarity (0.0–1.0) for a Pinecone match to count "
+                "as a benchmark candidate. Raise toward 0.85 for catalogs with very "
+                "specific items; lower toward 0.60 for generic categories. "
+                "Was hardcoded to 0.70 prior to exposing this knob."
+            ),
+        ),
+        MessageTextInput(
+            name="bench_outlier_factor",
+            display_name="Benchmark Outlier Factor (Stage 7)",
+            value="3.0",
+            advanced=True,
+            info=(
+                "Drop any historical match whose unit_price_eur is more than this "
+                "factor away from the median (so > median × factor or < median / factor). "
+                "Typical: 3.0 = drop 3× outliers. Set 0 to disable outlier removal."
+            ),
+        ),
+        IntInput(
+            name="bench_max_age_months",
+            display_name="Benchmark Max Age (months, Stage 7)",
+            value=0,
+            advanced=True,
+            info=(
+                "Drop any historical match whose item_created_date is older than "
+                "N months. Helps filter out stale prices when tech / specs move on. "
+                "Set 0 to disable age filtering (use all older items)."
+            ),
+        ),
+        IntInput(
+            name="bench_uom_strict",
+            display_name="Benchmark Strict UOM Match (Stage 7)",
+            value=1,
+            advanced=True,
+            info=(
+                "1 = only benchmark against historical items with the SAME UOM "
+                "(prevents per-piece vs per-box-of-10 mixing). 0 = ignore UOM, "
+                "match by similarity score only."
+            ),
         ),
         # ── LLM retry / rate-limit settings ──────────────────────────────────
         IntInput(
@@ -5412,6 +5836,23 @@ class PipelineStage123Node(Node):
             prompts["canonicalize_threshold"] = float(getattr(self, "canonicalize_threshold", None) or "0.82")
         except Exception:
             prompts["canonicalize_threshold"] = _CANONICALIZE_THRESHOLD
+        # ── Benchmark filtering / quality knobs ──────────────────────────────
+        try:
+            prompts["bench_min_similarity"] = float(getattr(self, "bench_min_similarity", None) or "0.70")
+        except Exception:
+            prompts["bench_min_similarity"] = 0.70
+        try:
+            prompts["bench_outlier_factor"] = float(getattr(self, "bench_outlier_factor", None) or "3.0")
+        except Exception:
+            prompts["bench_outlier_factor"] = 3.0
+        try:
+            prompts["bench_max_age_months"] = int(getattr(self, "bench_max_age_months", None) or 0)
+        except Exception:
+            prompts["bench_max_age_months"] = 0
+        try:
+            prompts["bench_uom_strict"] = bool(int(getattr(self, "bench_uom_strict", None) or 0))
+        except Exception:
+            prompts["bench_uom_strict"] = True
         # ── LLM retry / rate-limit settings ──────────────────────────────────
         llm_retries = getattr(self, "llm_max_retries", None)
         if llm_retries is not None: prompts["llm_max_retries"]  = int(llm_retries)
@@ -5460,7 +5901,8 @@ class PipelineStage123Node(Node):
             # Stage 7 — Benchmark
             current_stage = _STAGE_PRICE_BENCHMARK
             _run_benchmark(self.llm, tgt_cs, pr_no, self.embed_model,
-                           self.pinecone_index, self.pinecone_namespace, top_k)
+                           self.pinecone_index, self.pinecone_namespace, top_k,
+                           prompts=prompts)
             self._advance_tracker(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
             self.log(f"[{pr_no}] Stage 7 — benchmark done")
 
