@@ -2546,7 +2546,13 @@ def _parse_extraction_response(raw: str, source: dict, ctx: RASContext) -> list:
     header_fields = {
         "supplier_name":      h_supplier,
         "supplier_address":   header.get("supplier_address") or None,
-        "supplier_country":   _normalize_supplier_country(header.get("supplier_country") or None),
+        # Store the LLM-extracted country verbatim (matches doc-intel
+        # _parse_llm_response). Previously this was force-normalised to ISO
+        # alpha-2 via pycountry which lost the readable country name in the
+        # DB (e.g. "India" → "IN"). Downstream consumers (_compute_cpi_pct,
+        # _estimate_inflation_via_llm) already handle both full names and
+        # alpha-2/3 codes, so no functional dependency was lost.
+        "supplier_country":   (header.get("supplier_country") or "").strip() or None,
         "quotation_ref_no":   header.get("quotation_ref_no") or None,
         "quotation_date":     header.get("quotation_date"),
         "currency":           _normalize_currency_code(header.get("currency") or None),
@@ -3013,12 +3019,22 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
         for i, a in enumerate(raw_names):
             a_clean   = _strip_contact_suffix(a).lower()
             a_country = name_country.get(a, "")
+            a_geo     = _name_geo_tokens(a_clean)
             for b in raw_names[i + 1:]:
                 b_clean   = _strip_contact_suffix(b).lower()
                 b_country = name_country.get(b, "")
+                b_geo     = _name_geo_tokens(b_clean)
 
-                # Different non-empty supplier_country → separate suppliers
+                # Country-branch guard — combines BOTH doc-intel variants:
+                #   1. supplier_country column (writer.py canonicalize_in_db)
+                #   2. geo-token in the supplier_name itself
+                #      (extractor.py canonicalize_supplier_names)
+                # Either signal alone is enough to keep two names separate,
+                # so "ACME Corp India" / "ACME Corp China" don't merge even
+                # when the LLM forgot to extract supplier_country.
                 if a_country and b_country and a_country != b_country:
+                    continue
+                if a_geo and b_geo and a_geo != b_geo:
                     continue
 
                 if a_clean == b_clean:
