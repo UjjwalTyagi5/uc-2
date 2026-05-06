@@ -4442,6 +4442,52 @@ class PipelineStage123Node(Node):
             conn.close()
         return total_updated
 
+    def _sort_excel_pr_list_by_date(self, tgt_cs: str, pr_nos: list[str]) -> list[str]:
+        """Return pr_nos reordered by purchase_req_mst.C_DATETIME ASC.
+
+        Used in Excel mode to reduce the Stage 7 benchmark race where a
+        newer PR's _run_benchmark can fire before an older PR finishes
+        Stage 6 (embeddings) — leaving the newer PR's benchmark with
+        thin historical context. Submitting the worker pool oldest-first
+        means oldest PRs reach Pinecone first; by the time a newer PR's
+        Stage 7 runs, the older PRs' items have already been upserted.
+
+        Partial fix only: with heavily uneven PR sizes a small new PR
+        can still overtake a large old one. Acceptable for typical
+        workloads; for full guarantees the two-phase approach is needed.
+
+        PRs missing from purchase_req_mst (will fail with
+        NoRASContextError during processing anyway) are appended at the
+        end in their original Excel order so they don't disturb the
+        sort of valid PRs.
+        """
+        if len(pr_nos) <= 1:
+            return list(pr_nos)
+
+        BATCH = 500
+        date_by_pr: dict[str, object] = {}
+        conn = self._connect(tgt_cs)
+        try:
+            cur = conn.cursor()
+            for i in range(0, len(pr_nos), BATCH):
+                chunk = pr_nos[i : i + BATCH]
+                placeholders = ",".join(["?"] * len(chunk))
+                cur.execute(
+                    f"SELECT [PURCHASE_REQ_NO], [C_DATETIME] "
+                    f"FROM [ras_procurement].[purchase_req_mst] "
+                    f"WHERE [PURCHASE_REQ_NO] IN ({placeholders})",
+                    *chunk,
+                )
+                for row in cur.fetchall():
+                    date_by_pr[row[0]] = row[1]
+        finally:
+            conn.close()
+
+        found    = [pr for pr in pr_nos if date_by_pr.get(pr) is not None]
+        missing  = [pr for pr in pr_nos if date_by_pr.get(pr) is None]
+        found.sort(key=lambda p: date_by_pr[p])
+        return found + missing
+
     def _fetch_current_stages(self, tgt_cs: str, pr_nos: list[str]) -> dict[str, int | None]:
         """Return {pr_no → current_stage_fk} for the given PRs.
 
@@ -4722,29 +4768,46 @@ class PipelineStage123Node(Node):
             conn.close()
 
     def _advance_tracker(self, tgt_cs: str, pr_no: str, stage_id: int) -> None:
-        conn = self._connect(tgt_cs)
-        cur  = conn.cursor()
-        try:
-            if stage_id == _STAGE_INGESTION:
-                cur.execute("""
-                    MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
-                    USING (
-                        SELECT PURCHASE_REQ_NO, PURCHASEFINALAPPROVALSTATUS
-                          FROM [ras_procurement].[purchase_req_mst] WHERE PURCHASE_REQ_NO = ?
-                    ) AS src ON target.purchase_req_no = src.PURCHASE_REQ_NO
-                    WHEN MATCHED THEN UPDATE SET current_stage_fk=?, updated_at=SYSUTCDATETIME()
-                    WHEN NOT MATCHED THEN INSERT (purchase_req_no, ras_status, current_stage_fk)
-                        VALUES (src.PURCHASE_REQ_NO, src.PURCHASEFINALAPPROVALSTATUS, ?);
-                """, pr_no, stage_id, stage_id)
-            else:
-                cur.execute("""
-                    UPDATE [ras_procurement].[ras_tracker]
-                       SET current_stage_fk=?, updated_at=SYSUTCDATETIME()
-                     WHERE purchase_req_no=?
-                """, stage_id, pr_no)
-            conn.commit()
-        finally:
-            conn.close()
+        # Wrapped in deadlock retry — when many parallel workers all advance
+        # their own tracker rows the shared HOLDLOCK / UPDATE locks can race
+        # and SQL Server picks a victim. Retry with backoff per the canvas
+        # knobs (db_deadlock_max_retries / db_deadlock_base_delay).
+        def _do() -> None:
+            conn = self._connect(tgt_cs)
+            cur  = conn.cursor()
+            try:
+                if stage_id == _STAGE_INGESTION:
+                    cur.execute("""
+                        MERGE [ras_procurement].[ras_tracker] WITH (HOLDLOCK) AS target
+                        USING (
+                            SELECT PURCHASE_REQ_NO, PURCHASEFINALAPPROVALSTATUS
+                              FROM [ras_procurement].[purchase_req_mst] WHERE PURCHASE_REQ_NO = ?
+                        ) AS src ON target.purchase_req_no = src.PURCHASE_REQ_NO
+                        WHEN MATCHED THEN UPDATE SET current_stage_fk=?, updated_at=SYSUTCDATETIME()
+                        WHEN NOT MATCHED THEN INSERT (purchase_req_no, ras_status, current_stage_fk)
+                            VALUES (src.PURCHASE_REQ_NO, src.PURCHASEFINALAPPROVALSTATUS, ?);
+                    """, pr_no, stage_id, stage_id)
+                else:
+                    cur.execute("""
+                        UPDATE [ras_procurement].[ras_tracker]
+                           SET current_stage_fk=?, updated_at=SYSUTCDATETIME()
+                         WHERE purchase_req_no=?
+                    """, stage_id, pr_no)
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+
+        self._run_with_deadlock_retry(
+            _do,
+            op_name=f"advance_tracker(stage={stage_id})",
+            pr_no=pr_no,
+        )
 
     def _run_with_deadlock_retry(
         self,
@@ -4752,8 +4815,8 @@ class PipelineStage123Node(Node):
         *,
         op_name: str,
         pr_no: str,
-        max_retries: int = 3,
-        base_delay: float = 2.0,
+        max_retries: int | None = None,
+        base_delay: float | None = None,
     ):
         """Run a callable that touches the DB with deadlock-aware retries.
 
@@ -4772,6 +4835,12 @@ class PipelineStage123Node(Node):
           • on exhausted retries   : error line "giving up after M attempt(s)"
           • on non-deadlock error  : raises immediately (caller decides)
         """
+        # Default knobs from canvas inputs when caller doesn't override.
+        if max_retries is None:
+            max_retries = max(0, int(getattr(self, "db_deadlock_max_retries", 3) or 0))
+        if base_delay is None:
+            base_delay  = max(0.5, float(getattr(self, "db_deadlock_base_delay", 2) or 2))
+
         attempt = 0
         while True:
             try:
@@ -4809,7 +4878,13 @@ class PipelineStage123Node(Node):
                 time.sleep(delay)
 
     def _record_exception(self, tgt_cs: str, pr_no: str, stage_id: int, error_msg: str) -> None:
-        try:
+        # Wrapped in deadlock retry — the MERGE on ras_tracker + INSERT on
+        # ras_pipeline_exceptions touches the same shared chain that
+        # _cleanup_for_pr does, and concurrent failure recording on
+        # different PRs can pick this transaction as the deadlock victim.
+        # Retries follow the canvas knobs (db_deadlock_max_retries /
+        # db_deadlock_base_delay).
+        def _do() -> None:
             conn = self._connect(tgt_cs)
             cur  = conn.cursor()
             try:
@@ -4843,9 +4918,25 @@ class PipelineStage123Node(Node):
                         VALUES (?, ?, ?)
                     """, row[0], stage_id, error_msg[:4000])
                 conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
             finally:
                 conn.close()
+
+        try:
+            self._run_with_deadlock_retry(
+                _do,
+                op_name=f"record_exception(stage={stage_id})",
+                pr_no=pr_no,
+            )
         except Exception as exc:
+            # Even after retries the exception write failed. Don't propagate
+            # — the per-PR processing path is already in an error state and
+            # we don't want a secondary failure to mask the original cause.
             logger.warning(f"[{pr_no}] Could not write exception record: {exc}")
 
     # ── attachment_classification upserts ─────────────────────────────────
@@ -5111,7 +5202,7 @@ class PipelineStage123Node(Node):
             # Stage 4 — Classification
             self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
             _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
-            _advance_tracker(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
+            self._advance_tracker(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
             self.log(f"[{pr_no}] Stage 4 — classification complete")
 
             # Stage 5 — Extraction
@@ -5123,26 +5214,33 @@ class PipelineStage123Node(Node):
             current_stage = _STAGE_EXTRACTION
             self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
             n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
-            _advance_tracker(tgt_cs, pr_no, _STAGE_EXTRACTION)
+            self._advance_tracker(tgt_cs, pr_no, _STAGE_EXTRACTION)
             self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
 
             # Stage 6 — Embeddings
             current_stage = _STAGE_EMBEDDINGS
             _run_embeddings(tgt_cs, pr_no, self.embed_model,
                             self.pinecone_index, self.pinecone_namespace)
-            _advance_tracker(tgt_cs, pr_no, _STAGE_EMBEDDINGS)
+            self._advance_tracker(tgt_cs, pr_no, _STAGE_EMBEDDINGS)
             self.log(f"[{pr_no}] Stage 6 — embeddings done")
 
             # Stage 7 — Benchmark
             current_stage = _STAGE_PRICE_BENCHMARK
             _run_benchmark(self.llm, tgt_cs, pr_no, self.embed_model,
                            self.pinecone_index, self.pinecone_namespace, top_k)
-            _advance_tracker(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
+            self._advance_tracker(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
             self.log(f"[{pr_no}] Stage 7 — benchmark done")
 
             # Stage 8 — Complete
-            _advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
-            _set_last_processed_at(tgt_cs, pr_no)
+            self._advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
+            # _set_last_processed_at is the module-level helper; wrap its
+            # call in deadlock retry so it shares the same retry budget as
+            # the rest of the pipeline's tracker writes.
+            self._run_with_deadlock_retry(
+                lambda: _set_last_processed_at(tgt_cs, pr_no),
+                op_name="set_last_processed_at",
+                pr_no=pr_no,
+            )
             self.log(f"[{pr_no}] Stage 8 — pipeline complete")
             result["status"] = "complete"
 
@@ -5229,16 +5327,10 @@ class PipelineStage123Node(Node):
             # exponential backoff and jitter to spread retries.
             self.log(f"[{pr_no}] Pre-run cleanup check…")
             try:
-                # Pull retry knobs from canvas inputs (defaults match the
-                # original constants if user leaves them blank).
-                _dl_max_retries = max(0, int(getattr(self, "db_deadlock_max_retries", 3) or 0))
-                _dl_base_delay  = max(0.5, float(getattr(self, "db_deadlock_base_delay", 2) or 2))
                 self._run_with_deadlock_retry(
                     lambda: self._cleanup_for_pr(tgt_cs, pr_no),
                     op_name="Pre-run cleanup",
                     pr_no=pr_no,
-                    max_retries=_dl_max_retries,
-                    base_delay=_dl_base_delay,
                 )
             except Exception as cleanup_exc:
                 # Either a non-deadlock error (raised immediately by the
@@ -5547,6 +5639,29 @@ class PipelineStage123Node(Node):
             # Excel mode = workers self-filter inside _process_pr via
             # skip_if_complete=True. No serial pre-pass: stage-8 check
             # runs on each worker's own DB connection in parallel.
+            #
+            # Submit oldest-first to mitigate the Stage 7 benchmark race —
+            # if PR_NEW is processed before PR_OLD reaches Stage 6,
+            # PR_NEW's benchmark sees thin Pinecone history. Sorting by
+            # purchase_req_mst.C_DATETIME ASC means older PRs start first
+            # and their embeddings land in Pinecone before newer PRs reach
+            # Stage 7. Single batched query (chunked at 500 PRs).
+            try:
+                sorted_excel = self._sort_excel_pr_list_by_date(tgt_cs, pr_list)
+                if sorted_excel != pr_list:
+                    self.log(
+                        f"Excel — reordered {len(sorted_excel)} PR(s) by "
+                        f"C_DATETIME ASC (oldest first) so historical "
+                        f"context is in Pinecone before newer PRs hit Stage 7"
+                    )
+                    pr_list = sorted_excel
+                else:
+                    self.log("Excel — PR list already in C_DATETIME ASC order")
+            except Exception as exc:
+                # Non-fatal: if sort fails (e.g. DB hiccup), fall back to
+                # original Excel order rather than aborting the run.
+                self.log(f"Excel — date sort skipped (non-fatal): {exc}")
+
             self.log(
                 f"Excel-driven run: {len(pr_list)} PR(s) queued — "
                 f"each worker will skip if already at stage {_STAGE_COMPLETE}"
