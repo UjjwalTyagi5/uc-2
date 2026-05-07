@@ -30,6 +30,7 @@ SELECT
     -- Primary selected quote (is_selected_quote = 1)
     qi.[item_name],
     qi.[commodity_tag],
+    qi.[quantity]           AS primary_quantity,
     qi.[unit_price]         AS primary_unit_price,
     qi.[unit_price_eur]     AS primary_unit_price_eur,
     qi.[total_price]        AS primary_total_price,
@@ -41,6 +42,8 @@ SELECT
     qi.[quotation_date]     AS primary_quotation_date,
 
     -- Low hist (cheapest historical match via Pinecone)
+    prm_low.[PURCHASE_REQ_NO] AS low_hist_purchase_req_no,
+    low.[quantity]          AS low_hist_quantity,
     low.[unit_price]        AS low_hist_unit_price,
     low.[unit_price_eur]    AS low_hist_unit_price_eur,
     low.[currency]          AS low_hist_currency,
@@ -49,6 +52,8 @@ SELECT
     low.[quotation_date]    AS low_hist_quotation_date,
 
     -- Last hist (most recent historical match via Pinecone)
+    prm_lst.[PURCHASE_REQ_NO] AS last_hist_purchase_req_no,
+    lst.[quantity]          AS last_hist_quantity,
     lst.[unit_price]        AS last_hist_unit_price,
     lst.[unit_price_eur]    AS last_hist_unit_price_eur,
     lst.[currency]          AS last_hist_currency,
@@ -56,6 +61,7 @@ SELECT
     lst.[quotation_date]    AS last_hist_quotation_date,
 
     -- L1 = lowest-priced proposal for this line item (all quotes, including primary)
+    proposals.l1_quantity,
     proposals.l1_unit_price,
     proposals.l1_unit_price_eur,
     proposals.l1_total_price,
@@ -66,6 +72,7 @@ SELECT
     proposals.l1_supplier_country,
 
     -- L2 = second lowest-priced proposal for this line item
+    proposals.l2_quantity,
     proposals.l2_unit_price,
     proposals.l2_unit_price_eur,
     proposals.l2_total_price,
@@ -103,8 +110,19 @@ LEFT JOIN [ras_procurement].[quotation_extracted_items] low
 LEFT JOIN [ras_procurement].[quotation_extracted_items] lst
   ON lst.[extracted_item_uuid_pk] = br.[last_hist_item_fk]
 
+LEFT JOIN [ras_procurement].[purchase_req_detail] prd_low
+  ON prd_low.[PURCHASE_DTL_ID] = low.[purchase_dtl_id]
+LEFT JOIN [ras_procurement].[purchase_req_mst] prm_low
+  ON prm_low.[PURCHASE_REQ_ID] = prd_low.[PURCHASE_REQ_ID]
+
+LEFT JOIN [ras_procurement].[purchase_req_detail] prd_lst
+  ON prd_lst.[PURCHASE_DTL_ID] = lst.[purchase_dtl_id]
+LEFT JOIN [ras_procurement].[purchase_req_mst] prm_lst
+  ON prm_lst.[PURCHASE_REQ_ID] = prd_lst.[PURCHASE_REQ_ID]
+
 OUTER APPLY (
     SELECT
+        MAX(CASE WHEN rn = 1 THEN p.quantity        END) AS l1_quantity,
         MAX(CASE WHEN rn = 1 THEN p.unit_price      END) AS l1_unit_price,
         MAX(CASE WHEN rn = 1 THEN p.unit_price_eur  END) AS l1_unit_price_eur,
         MAX(CASE WHEN rn = 1 THEN p.total_price     END) AS l1_total_price,
@@ -113,6 +131,7 @@ OUTER APPLY (
         MAX(CASE WHEN rn = 1 THEN p.payment_terms   END) AS l1_payment_terms,
         MAX(CASE WHEN rn = 1 THEN p.supplier_name   END) AS l1_supplier_name,
         MAX(CASE WHEN rn = 1 THEN p.supplier_country END) AS l1_supplier_country,
+        MAX(CASE WHEN rn = 2 THEN p.quantity        END) AS l2_quantity,
         MAX(CASE WHEN rn = 2 THEN p.unit_price      END) AS l2_unit_price,
         MAX(CASE WHEN rn = 2 THEN p.unit_price_eur  END) AS l2_unit_price_eur,
         MAX(CASE WHEN rn = 2 THEN p.total_price     END) AS l2_total_price,
@@ -123,6 +142,7 @@ OUTER APPLY (
         MAX(CASE WHEN rn = 2 THEN p.supplier_country END) AS l2_supplier_country
     FROM (
         SELECT
+            p.[quantity],
             p.[unit_price],
             p.[unit_price_eur],
             p.[total_price],
