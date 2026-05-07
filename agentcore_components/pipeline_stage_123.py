@@ -3686,12 +3686,15 @@ def _fetch_historical_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
                qi.[unit_price], qi.[total_price], qi.[quantity], qi.[unit],
                qi.[currency], qi.[quotation_date], qi.[supplier_name], qi.[supplier_country],
                qi.[unit_price_eur], qi.[total_price_eur],
-               rt.[purchase_req_no]
+               rt.[purchase_req_no],
+               prd.[C_DATETIME] AS pr_created_date
           FROM [ras_procurement].[quotation_extracted_items] qi
           JOIN [ras_procurement].[attachment_classification] ac
             ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
           JOIN [ras_procurement].[ras_tracker] rt
             ON ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+          LEFT JOIN [ras_procurement].[purchase_req_detail] prd
+            ON prd.[PURCHASE_DTL_ID] = qi.[purchase_dtl_id]
          WHERE qi.[purchase_dtl_id] IN ({placeholders})
            AND qi.[is_selected_quote] = 1
     """
@@ -3700,6 +3703,7 @@ def _fetch_historical_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
         "unit_price", "total_price", "quantity", "unit",
         "currency", "quotation_date", "supplier_name", "supplier_country",
         "unit_price_eur", "total_price_eur", "purchase_req_no",
+        "pr_created_date",
     ]
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
@@ -3711,14 +3715,14 @@ def _fetch_historical_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
 
 
 def _compute_low_last(items: list[dict]) -> tuple:
-    """Return (low_item, last_item) — cheapest EUR price and most recent quotation_date."""
+    """Return (low_item, last_item) — cheapest EUR price and most recently created PR dtl."""
     def _eur(it: dict):
         return it.get("unit_price_eur") or it.get("unit_price")
 
     priced = [it for it in items if _eur(it) is not None]
-    dated  = [it for it in items if it.get("quotation_date") is not None]
+    dated  = [it for it in items if it.get("pr_created_date") is not None]
     low_item  = min(priced, key=_eur) if priced else None
-    last_item = max(dated,  key=lambda it: it["quotation_date"]) if dated else None
+    last_item = max(dated,  key=lambda it: it["pr_created_date"]) if dated else None
     return low_item, last_item
 
 
