@@ -10,7 +10,7 @@ Usage:
     python re_benchmark.py R_153634/2021          # specific PR(s)
     python re_benchmark.py R_153634/2021 R_151787/2021
 
-Configure via environment variables (see CONFIG section below).
+All config is read from a .env file or environment variables.
 """
 
 import os
@@ -18,35 +18,38 @@ import sys
 import logging
 import argparse
 
-# ── CONFIG — edit or set as environment variables ────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
+
+# ── DB connection (Azure SQL — target) ───────────────────────────────────────
 TGT_CS = (
     "DRIVER={ODBC Driver 18 for SQL Server};"
-    f"SERVER={os.getenv('DB_SERVER', '<your-server>')},"
-    f"{os.getenv('DB_PORT', '1433')};"
-    f"DATABASE={os.getenv('DB_NAME', '<your-database>')};"
-    f"UID={os.getenv('DB_USER', '<your-user>')};"
-    f"PWD={os.getenv('DB_PASSWORD', '<your-password>')};"
+    f"SERVER={os.getenv('AZURE_SERVER', '')};"
+    f"DATABASE={os.getenv('AZURE_DB', '')};"
+    f"UID={os.getenv('AZURE_USER', '')};"
+    f"PWD={os.getenv('AZURE_PASS', '')};"
     "TrustServerCertificate=yes;"
 )
 
-PINECONE_INDEX      = os.getenv("PINECONE_INDEX",      "ras-quotations")
-PINECONE_NAMESPACE  = os.getenv("PINECONE_NAMESPACE",  "procurement")
-PINECONE_TOP_K      = int(os.getenv("PINECONE_TOP_K",  "5"))
+# ── Pinecone ─────────────────────────────────────────────────────────────────
+PINECONE_INDEX      = os.getenv("PINECONE_INDEX_NAME",  "")
+PINECONE_NAMESPACE  = os.getenv("PINECONE_NAMESPACE",   "")
+PINECONE_TOP_K      = int(os.getenv("PINECONE_TOP_K",   "5"))
 
+# ── Azure OpenAI ─────────────────────────────────────────────────────────────
 AZURE_ENDPOINT      = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_API_KEY       = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_API_VERSION   = os.getenv("AZURE_OPENAI_API_VERSION",  "2024-02-01")
-AZURE_LLM_DEPLOY    = os.getenv("AZURE_LLM_DEPLOYMENT",      "gpt-4o")
-AZURE_EMBED_DEPLOY  = os.getenv("AZURE_EMBED_DEPLOYMENT",    "text-embedding-ada-002")
+AZURE_API_VERSION   = os.getenv("AZURE_OPENAI_API_VERSION",          "2024-10-21")
+AZURE_LLM_DEPLOY    = os.getenv("AZURE_OPENAI_DEPLOYMENT",           "gpt-4o")
+AZURE_EMBED_DEPLOY  = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
 
-# Benchmark tuning — exact defaults from pipeline_stage_123.py
+# ── Benchmark tuning — exact defaults from pipeline_stage_123.py ─────────────
 BENCH_PARAMS = {
     "bench_min_similarity": 0.70,
     "bench_outlier_factor": 3.0,
     "bench_max_age_months": 0,
     "bench_uom_strict":     False,
 }
-# ── END CONFIG ────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +58,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Allow importing from the agentcore_components sibling package
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agentcore_components.pipeline_stage_123 import _run_benchmark, _connect  # noqa: E402
 
@@ -85,7 +87,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Lazy import so config errors surface early
     try:
         from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
     except ImportError:
