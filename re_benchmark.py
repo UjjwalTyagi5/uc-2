@@ -45,7 +45,7 @@ AZURE_EMBED_DEPLOY  = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embed
 
 # ── Benchmark tuning — exact defaults from pipeline_stage_123.py ─────────────
 BENCH_PARAMS = {
-    "bench_min_similarity": 0.70,
+    "bench_min_similarity": float(os.getenv("PINECONE_THRESHOLD", "0.70")),
     "bench_outlier_factor": 3.0,
     "bench_max_age_months": 0,
     "bench_uom_strict":     False,
