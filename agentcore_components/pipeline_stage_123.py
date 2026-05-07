@@ -4478,20 +4478,26 @@ def _run_benchmark(
             # without re-deriving them mentally from raw rows.
             bench_prompt = _format_bench_prompt(rd, historical[:top_k], stats=agg, prior_benchmarks=prior_benchmarks or None)
             bout = {}
+            llm_succeeded = False
             try:
                 resp = llm.invoke([HumanMessage(content=bench_prompt)])
                 raw  = (getattr(resp, "content", None) or str(resp)).strip()
                 raw  = re.sub(r"^```(?:json)?\s*", "", raw)
                 raw  = re.sub(r"\s*```$", "", raw)
                 bout = json.loads(raw)
+                llm_succeeded = True
             except Exception as exc:
-                logger.warning(f"[{pr_no}] LLM benchmark parse failed dtl_id={dtl_id}: {exc}")
+                logger.error(
+                    f"[{pr_no}] LLM benchmark parse failed dtl_id={dtl_id}: {exc}",
+                    exc_info=True,
+                )
 
             bp_unit       = bout.get("bp_unit_price")
             bp_low        = bout.get("bp_low")
             bp_high       = bout.get("bp_high")
             bp_confidence = bout.get("confidence")
             llm_summary   = bout.get("summary", "")
+            llm_succeeded = llm_succeeded and bp_unit is not None
             try:
                 bp_dec   = Decimal(str(bp_unit)) if bp_unit is not None else Decimal("0")
                 bp_total = round(float(bp_dec) * float(qty or 1), 2)
@@ -4520,6 +4526,12 @@ def _run_benchmark(
                 if extras else llm_summary
             )
 
+            # When LLM failed, pass None for price/summary in UPDATE so COALESCE
+            # preserves any existing good values rather than overwriting with 0.
+            bp_dec_u   = bp_dec   if llm_succeeded else None
+            bp_total_u = bp_total if llm_succeeded else None
+            summary_u  = summary  if (llm_succeeded and summary) else None
+
             try:
                 cur2.execute("""
                     MERGE [ras_procurement].[benchmark_result] WITH (HOLDLOCK) AS target
@@ -4528,14 +4540,14 @@ def _run_benchmark(
                     WHEN MATCHED THEN
                         UPDATE SET
                             extracted_item_uuid_fk = ?,
-                            bp_unit_price          = ?,
-                            bp_total_price         = ?,
+                            bp_unit_price          = COALESCE(?, target.bp_unit_price),
+                            bp_total_price         = COALESCE(?, target.bp_total_price),
                             low_hist_item_fk       = ?,
                             last_hist_item_fk      = ?,
                             inflation_pct          = ?,
                             cpi_inflation_pct      = ?,
                             similar_dtl_ids        = ?,
-                            summary                = ?,
+                            summary                = COALESCE(?, target.summary),
                             updated_at             = SYSUTCDATETIME()
                     WHEN NOT MATCHED THEN
                         INSERT (
@@ -4548,7 +4560,7 @@ def _run_benchmark(
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                     dtl_id,
-                    item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary,
+                    item_uuid, bp_dec_u, bp_total_u, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary_u,
                     dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary,
                 )
             except Exception as exc:
