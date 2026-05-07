@@ -70,17 +70,28 @@ def _stub_agentcore() -> None:
         def __init__(self, *args, **kwargs): pass  # noqa: ANN
         def __init_subclass__(cls, **kwargs): pass  # noqa: ANN
 
-    mods = {
-        "agentcore":                _types.ModuleType("agentcore"),
-        "agentcore.custom":         _types.ModuleType("agentcore.custom"),
-        "agentcore.io":             _types.ModuleType("agentcore.io"),
-        "agentcore.schema":         _types.ModuleType("agentcore.schema"),
-        "agentcore.schema.data":    _types.ModuleType("agentcore.schema.data"),
-        "agentcore.schema.message": _types.ModuleType("agentcore.schema.message"),
-    }
-    for name, mod in mods.items():
+    mod_names = [
+        "agentcore",
+        "agentcore.custom",
+        "agentcore.io",
+        "agentcore.schema",
+        "agentcore.schema.data",
+        "agentcore.schema.message",
+        "agentcore.services",
+        "agentcore.services.deps",
+        "agentcore.services.database",
+        "agentcore.services.database.models",
+        "agentcore.services.database.models.connector_catalogue",
+        "agentcore.services.database.models.connector_catalogue.model",
+        "agentcore.services.pinecone_service_client",
+    ]
+    for name in mod_names:
+        mod = _types.ModuleType(name)
+        mod.__path__ = []       # mark as package so sub-imports work
+        mod.__package__ = name
         sys.modules.setdefault(name, mod)
 
+    # Module-level class stubs
     sys.modules["agentcore.custom"].Node             = _Stub
     sys.modules["agentcore.io"].HandleInput          = _Stub
     sys.modules["agentcore.io"].IntInput             = _Stub
@@ -88,6 +99,31 @@ def _stub_agentcore() -> None:
     sys.modules["agentcore.io"].Output               = _Stub
     sys.modules["agentcore.schema.data"].Data        = _Stub
     sys.modules["agentcore.schema.message"].Message  = _Stub
+
+    # search_via_service — real Pinecone SDK call used inside _run_benchmark
+    def search_via_service(
+        index_name: str,
+        namespace: str,
+        text_key: str,        # unused here; kept for signature compatibility
+        query: str,           # unused here; we use pre-computed embedding
+        query_embedding: list,
+        number_of_results: int,
+    ) -> list:
+        from pinecone import Pinecone
+        pc    = Pinecone(api_key=os.getenv("PINECONE_API_KEY", ""))
+        index = pc.Index(index_name)
+        result = index.query(
+            namespace=namespace or "",
+            vector=query_embedding,
+            top_k=number_of_results,
+            include_metadata=True,
+        )
+        return [
+            {"score": float(m["score"]), "metadata": m.get("metadata") or {}}
+            for m in (result.get("matches") or [])
+        ]
+
+    sys.modules["agentcore.services.pinecone_service_client"].search_via_service = search_via_service
 
 _stub_agentcore()
 
