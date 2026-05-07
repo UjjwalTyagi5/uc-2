@@ -59,6 +59,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# pipeline_stage_123.py imports agentcore framework classes at module level.
+# Stub them out so the file can be imported standalone — the benchmark
+# functions themselves don't use any of these classes at runtime.
+import types as _types
+
+def _stub_agentcore() -> None:
+    class _Stub:
+        def __init__(self, *args, **kwargs): pass  # noqa: ANN
+        def __init_subclass__(cls, **kwargs): pass  # noqa: ANN
+
+    mods = {
+        "agentcore":                _types.ModuleType("agentcore"),
+        "agentcore.custom":         _types.ModuleType("agentcore.custom"),
+        "agentcore.io":             _types.ModuleType("agentcore.io"),
+        "agentcore.schema":         _types.ModuleType("agentcore.schema"),
+        "agentcore.schema.data":    _types.ModuleType("agentcore.schema.data"),
+        "agentcore.schema.message": _types.ModuleType("agentcore.schema.message"),
+    }
+    for name, mod in mods.items():
+        sys.modules.setdefault(name, mod)
+
+    sys.modules["agentcore.custom"].Node             = _Stub
+    sys.modules["agentcore.io"].HandleInput          = _Stub
+    sys.modules["agentcore.io"].IntInput             = _Stub
+    sys.modules["agentcore.io"].MessageTextInput     = _Stub
+    sys.modules["agentcore.io"].Output               = _Stub
+    sys.modules["agentcore.schema.data"].Data        = _Stub
+    sys.modules["agentcore.schema.message"].Message  = _Stub
+
+_stub_agentcore()
+
 from agentcore_components.pipeline_stage_123 import _run_benchmark, _connect  # noqa: E402
 
 
