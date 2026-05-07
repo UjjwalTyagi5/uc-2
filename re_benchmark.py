@@ -39,12 +39,12 @@ AZURE_API_VERSION   = os.getenv("AZURE_OPENAI_API_VERSION",  "2024-02-01")
 AZURE_LLM_DEPLOY    = os.getenv("AZURE_LLM_DEPLOYMENT",      "gpt-4o")
 AZURE_EMBED_DEPLOY  = os.getenv("AZURE_EMBED_DEPLOYMENT",    "text-embedding-ada-002")
 
-# Benchmark tuning — mirrors the defaults in pipeline_stage_123.py
+# Benchmark tuning — exact defaults from pipeline_stage_123.py
 BENCH_PARAMS = {
-    "bench_min_similarity": float(os.getenv("BENCH_MIN_SIMILARITY", "0.70")),
-    "bench_outlier_factor": float(os.getenv("BENCH_OUTLIER_FACTOR", "3.0")),
-    "bench_max_age_months": int(os.getenv("BENCH_MAX_AGE_MONTHS",   "0")),
-    "bench_uom_strict":     bool(int(os.getenv("BENCH_UOM_STRICT",  "0"))),
+    "bench_min_similarity": 0.70,
+    "bench_outlier_factor": 3.0,
+    "bench_max_age_months": 0,
+    "bench_uom_strict":     False,
 }
 # ── END CONFIG ────────────────────────────────────────────────────────────────
 
