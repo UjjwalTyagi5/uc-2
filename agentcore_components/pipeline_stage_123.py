@@ -3714,6 +3714,38 @@ def _fetch_historical_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
         conn.close()
 
 
+def _fetch_benchmark_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
+    """Fetch existing benchmark_result rows for similar dtl_ids to use as LLM context."""
+    if not dtl_ids:
+        return []
+    placeholders = ", ".join(["?"] * len(dtl_ids))
+    sql = f"""
+        SELECT br.[purchase_dtl_id],
+               br.[bp_unit_price], br.[bp_total_price],
+               br.[inflation_pct], br.[cpi_inflation_pct],
+               br.[summary],
+               prm.[PURCHASE_REQ_NO]
+          FROM [ras_procurement].[benchmark_result] br
+          JOIN [ras_procurement].[purchase_req_detail] prd
+            ON prd.[PURCHASE_DTL_ID] = br.[purchase_dtl_id]
+          JOIN [ras_procurement].[purchase_req_mst] prm
+            ON prm.[PURCHASE_REQ_ID] = prd.[PURCHASE_REQ_ID]
+         WHERE br.[purchase_dtl_id] IN ({placeholders})
+           AND br.[bp_unit_price] IS NOT NULL
+    """
+    cols = [
+        "purchase_dtl_id", "bp_unit_price", "bp_total_price",
+        "inflation_pct", "cpi_inflation_pct", "summary", "purchase_req_no",
+    ]
+    conn = _connect(tgt_cs)
+    cur  = conn.cursor()
+    try:
+        cur.execute(sql, *dtl_ids)
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def _compute_low_last(items: list[dict]) -> tuple:
     """Return (low_item, last_item) — cheapest EUR price and most recently created PR dtl."""
     def _eur(it: dict):
@@ -3944,6 +3976,7 @@ def _format_bench_prompt(
     current: dict,
     historical: list[dict],
     stats: dict | None = None,
+    prior_benchmarks: list[dict] | None = None,
 ) -> str:
     """Build a richer benchmark LLM prompt.
 
@@ -4071,6 +4104,29 @@ def _format_bench_prompt(
         + _hist_table(buckets.get("old") or [])
     )
 
+    # ── Prior benchmark results block ────────────────────────────────────
+    if prior_benchmarks:
+        pb_rows = [
+            "| PR No | Recommended (EUR) | Inflation % | CPI % | Summary |",
+            "|-------|-------------------|-------------|-------|---------|",
+        ]
+        for pb in prior_benchmarks:
+            pb_rows.append(
+                f"| {pb.get('purchase_req_no') or 'N/A'} "
+                f"| {pb.get('bp_unit_price') or 'N/A'} "
+                f"| {pb.get('inflation_pct') or 'N/A'} "
+                f"| {pb.get('cpi_inflation_pct') or 'N/A'} "
+                f"| {(pb.get('summary') or '')[:120]} |"
+            )
+        prior_block = "\n".join(pb_rows)
+        prior_section = (
+            f"PRIOR BENCHMARK RESULTS FOR SIMILAR ITEMS (reference only):\n{prior_block}\n"
+            "Use these as calibration context. Do NOT copy these values directly —\n"
+            "they may reflect different specs, quantities, or market conditions.\n\n"
+        )
+    else:
+        prior_section = ""
+
     return (
         "You are recommending a benchmark unit price for the CURRENT ITEM "
         "below, drawing on historical purchases of similar items. The "
@@ -4088,6 +4144,7 @@ def _format_bench_prompt(
         f"AGGREGATE STATS:\n{agg_block}\n\n"
         f"PER-SUPPLIER SUMMARY:\n{sup_block}\n\n"
         f"HISTORICAL DATA (time-bucketed):\n{hist_block}\n\n"
+        f"{prior_section}"
         "Return ONLY JSON (no markdown):\n"
         "{\n"
         '  "bp_unit_price": <number EUR — your point estimate>,\n'
@@ -4356,6 +4413,9 @@ def _run_benchmark(
             # Fetch full historical pricing from DB
             historical_raw = _fetch_historical_for_dtl_ids(tgt_cs, similar_dtl_ids_raw) if similar_dtl_ids_raw else []
 
+            # Fetch prior benchmark results for similar items as LLM context
+            prior_benchmarks = _fetch_benchmark_for_dtl_ids(tgt_cs, similar_dtl_ids_raw) if similar_dtl_ids_raw else []
+
             # ── Stage 2 filtering: post-fetch (uses DB-only fields) ─────
             # UOM / outlier / age filters take effect here because Pinecone
             # metadata doesn't carry the unit, eur price, or full date —
@@ -4416,7 +4476,7 @@ def _run_benchmark(
             # LLM benchmark analysis — uses pre-computed aggregates so the
             # LLM can anchor on the median + P25-P75 band + time buckets
             # without re-deriving them mentally from raw rows.
-            bench_prompt = _format_bench_prompt(rd, historical[:top_k], stats=agg)
+            bench_prompt = _format_bench_prompt(rd, historical[:top_k], stats=agg, prior_benchmarks=prior_benchmarks or None)
             bout = {}
             try:
                 resp = llm.invoke([HumanMessage(content=bench_prompt)])
