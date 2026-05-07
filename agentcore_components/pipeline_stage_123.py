@@ -3756,7 +3756,7 @@ def _filter_historical_uom(historical: list[dict], current_uom: str | None, stri
         else:
             dropped += 1
     if dropped:
-        logger.debug("Benchmark UOM filter: dropped {} historical row(s) with UOM != {!r}", dropped, current_uom)
+        logger.info("Benchmark UOM filter: dropped %d historical row(s) with UOM != %r", dropped, current_uom)
     return kept
 
 
@@ -3794,8 +3794,8 @@ def _filter_historical_outliers(historical: list[dict], factor: float) -> list[d
         else:
             dropped += 1
     if dropped:
-        logger.debug("Benchmark outlier filter: dropped {} row(s) outside [{:.2f}, {:.2f}] (median {:.2f}, factor {})",
-                     dropped, low, high, median, factor)
+        logger.info("Benchmark outlier filter: dropped %d row(s) outside [%.2f, %.2f] (median %.2f, factor %s)",
+                    dropped, low, high, median, factor)
     return kept
 
 
@@ -3832,7 +3832,7 @@ def _filter_historical_age(historical: list[dict], current_iso: str, max_age_mon
         else:
             dropped += 1
     if dropped:
-        logger.debug("Benchmark age filter: dropped {} row(s) older than {} month(s)", dropped, max_age_months)
+        logger.info("Benchmark age filter: dropped %d row(s) older than %d month(s)", dropped, max_age_months)
     return kept
 
 
@@ -4229,7 +4229,7 @@ def _run_benchmark(
     min_score       = float(p.get("bench_min_similarity", 0.70))
     outlier_factor  = float(p.get("bench_outlier_factor", 3.0))
     max_age_months  = int(p.get("bench_max_age_months", 0))
-    uom_strict      = bool(p.get("bench_uom_strict", True))
+    uom_strict      = bool(p.get("bench_uom_strict", False))
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
@@ -4365,6 +4365,13 @@ def _run_benchmark(
                     f"[{pr_no}] dtl_id={dtl_id}: filtered {len(historical_raw) - len(historical)}/{len(historical_raw)} "
                     f"historical row(s) (uom_strict={uom_strict}, max_age_months={max_age_months}, "
                     f"outlier_factor={outlier_factor})"
+                )
+            if similar_dtl_ids_raw and not historical:
+                logger.warning(
+                    f"[{pr_no}] dtl_id={dtl_id}: {len(similar_dtl_ids_raw)} Pinecone match(es) found "
+                    f"but ALL eliminated by post-fetch filters (uom_strict={uom_strict}, "
+                    f"max_age_months={max_age_months}, outlier_factor={outlier_factor}) — "
+                    f"low_hist/last_hist will be NULL"
                 )
 
             # Pre-compute aggregates for the LLM prompt (median, P25/P75,
