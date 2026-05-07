@@ -4179,6 +4179,37 @@ def _estimate_inflation_via_llm(llm, item_name: str | None, category: str | None
         return None
 
 
+def _is_pinecone_server_error(exc: Exception) -> bool:
+    """True for hard server/connectivity errors that mean Pinecone is unavailable."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in (
+        "connection", "timeout", "503", "502", "500", "unavailable",
+        "network", "refused", "reset", "ssl",
+    ))
+
+
+def _write_benchmark_stub(cur, dtl_id: int, item_uuid: str, summary: str) -> None:
+    """Write a placeholder benchmark row so every selected item appears in vw_benchmark_summary."""
+    try:
+        cur.execute("""
+            MERGE [ras_procurement].[benchmark_result] WITH (HOLDLOCK) AS target
+            USING (SELECT ? AS purchase_dtl_id) AS src
+               ON target.purchase_dtl_id = src.purchase_dtl_id
+            WHEN MATCHED THEN
+                UPDATE SET extracted_item_uuid_fk=?, bp_unit_price=NULL, bp_total_price=NULL,
+                           low_hist_item_fk=NULL, last_hist_item_fk=NULL,
+                           inflation_pct=NULL, cpi_inflation_pct=NULL,
+                           similar_dtl_ids=NULL, summary=?, updated_at=SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT (purchase_dtl_id, extracted_item_uuid_fk, bp_unit_price, bp_total_price,
+                        low_hist_item_fk, last_hist_item_fk, inflation_pct, cpi_inflation_pct,
+                        similar_dtl_ids, summary)
+                VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?);
+        """, dtl_id, item_uuid, summary, dtl_id, item_uuid, summary)
+    except Exception as write_exc:
+        logger.warning(f"Benchmark stub write failed dtl_id={dtl_id}: {write_exc}")
+
+
 def _run_benchmark(
     llm,
     tgt_cs: str,
@@ -4257,6 +4288,8 @@ def _run_benchmark(
             # Build the same 12-field text used at embedding time
             bench_text = _build_embed_text(rd)
             if not bench_text:
+                logger.warning(f"[{pr_no}] dtl_id={dtl_id}: no embedding text — writing stub benchmark row")
+                _write_benchmark_stub(cur2, dtl_id, item_uuid, "No embedding text — item descriptor fields are empty")
                 continue
 
             # Item created_date as ISO string for date filtering
@@ -4276,7 +4309,10 @@ def _run_benchmark(
                     number_of_results=top_k * 3,  # fetch extra to absorb score + date filtered-out
                 )
             except Exception as exc:
+                if _is_pinecone_server_error(exc):
+                    raise RuntimeError(f"Pinecone server error during benchmark for PR={pr_no}: {exc}") from exc
                 logger.warning(f"[{pr_no}] Benchmark similarity search failed dtl_id={dtl_id}: {exc}")
+                _write_benchmark_stub(cur2, dtl_id, item_uuid, f"Similarity search failed: {type(exc).__name__}")
                 continue
 
             # Normalise response to a list of match dicts
