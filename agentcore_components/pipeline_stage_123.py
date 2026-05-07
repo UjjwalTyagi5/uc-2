@@ -3344,11 +3344,12 @@ def _save_extracted_items(tgt_cs: str, items: list, fallback_date=None) -> int:
     try:
         for item in items:
             _COL_LIMITS = {
-                "item_description": 2000, "item_summary": 2000,
-                "taxation_details": 500,  "payment_terms": 500,
+                "item_description": 4000, "item_summary": 4000,
+                "taxation_details": 2000, "payment_terms": 2000,
                 "supplier_address": 500,  "item_name": 500,
-                "quotation_ref_no": 200,  "supplier_name": 200,
-                "commodity_tag": 200,
+                "supplier_name": 255,     "supplier_country": 100,
+                "quotation_ref_no": 100,  "commodity_tag": 255,
+                "unit": 50,
             }
             def _v(k, cast=None):
                 v = item.get(k)
