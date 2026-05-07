@@ -21,6 +21,7 @@ SELECT
     prm.[LAST_APPROVED_COMMENTS] AS last_approver_comments,
     prt.[PURCHASE_REQ_TYPE]      AS item_category,
 
+    -- Benchmark recommendation
     br.[bp_unit_price]    AS recommended_unit_price_eur,
     br.[bp_total_price]   AS recommended_total_price_eur,
     br.[inflation_pct]    AS recommended_inflation_pct,
@@ -31,56 +32,56 @@ SELECT
     qi.[item_name],
     qi.[commodity_tag],
     qi.[quantity]           AS primary_quantity,
+    qi.[currency]           AS primary_currency,
     qi.[unit_price]         AS primary_unit_price,
     qi.[unit_price_eur]     AS primary_unit_price_eur,
     qi.[total_price]        AS primary_total_price,
     qi.[total_price_eur]    AS primary_total_price_eur,
-    qi.[currency]           AS primary_currency,
     qi.[payment_terms]      AS primary_payment_terms,
     qi.[supplier_name]      AS primary_supplier_name,
     qi.[supplier_country]   AS primary_supplier_country,
     qi.[quotation_date]     AS primary_quotation_date,
 
-    -- Low hist (cheapest historical match via Pinecone)
-    prm_low.[PURCHASE_REQ_NO] AS low_hist_purchase_req_no,
-    low.[quantity]          AS low_hist_quantity,
-    low.[unit_price]        AS low_hist_unit_price,
-    low.[unit_price_eur]    AS low_hist_unit_price_eur,
-    low.[currency]          AS low_hist_currency,
-    low.[supplier_name]     AS low_hist_supplier_name,
-    low.[supplier_country]  AS low_hist_supplier_country,
-    low.[quotation_date]    AS low_hist_quotation_date,
-
-    -- Last hist (most recent historical match via Pinecone)
-    prm_lst.[PURCHASE_REQ_NO] AS last_hist_purchase_req_no,
-    lst.[quantity]          AS last_hist_quantity,
-    lst.[unit_price]        AS last_hist_unit_price,
-    lst.[unit_price_eur]    AS last_hist_unit_price_eur,
-    lst.[currency]          AS last_hist_currency,
-    lst.[supplier_name]     AS last_hist_supplier_name,
-    lst.[quotation_date]    AS last_hist_quotation_date,
-
     -- L1 = lowest-priced proposal for this line item (all quotes, including primary)
     proposals.l1_quantity,
+    proposals.l1_currency,
     proposals.l1_unit_price,
     proposals.l1_unit_price_eur,
     proposals.l1_total_price,
     proposals.l1_total_price_eur,
-    proposals.l1_currency,
     proposals.l1_payment_terms,
     proposals.l1_supplier_name,
     proposals.l1_supplier_country,
 
     -- L2 = second lowest-priced proposal for this line item
     proposals.l2_quantity,
+    proposals.l2_currency,
     proposals.l2_unit_price,
     proposals.l2_unit_price_eur,
     proposals.l2_total_price,
     proposals.l2_total_price_eur,
-    proposals.l2_currency,
     proposals.l2_payment_terms,
     proposals.l2_supplier_name,
     proposals.l2_supplier_country,
+
+    -- Low hist (cheapest historical match via Pinecone)
+    prm_low.[PURCHASE_REQ_NO]  AS low_hist_purchase_req_no,
+    low.[quantity]             AS low_hist_quantity,
+    low.[currency]             AS low_hist_currency,
+    low.[unit_price]           AS low_hist_unit_price,
+    low.[unit_price_eur]       AS low_hist_unit_price_eur,
+    low.[supplier_name]        AS low_hist_supplier_name,
+    low.[supplier_country]     AS low_hist_supplier_country,
+    low.[quotation_date]       AS low_hist_quotation_date,
+
+    -- Last hist (most recent historical match via Pinecone)
+    prm_lst.[PURCHASE_REQ_NO]  AS last_hist_purchase_req_no,
+    lst.[quantity]             AS last_hist_quantity,
+    lst.[currency]             AS last_hist_currency,
+    lst.[unit_price]           AS last_hist_unit_price,
+    lst.[unit_price_eur]       AS last_hist_unit_price_eur,
+    lst.[supplier_name]        AS last_hist_supplier_name,
+    lst.[quotation_date]       AS last_hist_quotation_date,
 
     -- Quotation statistics
     quot_stats.[total_quotations],
@@ -123,31 +124,31 @@ LEFT JOIN [ras_procurement].[purchase_req_mst] prm_lst
 OUTER APPLY (
     SELECT
         MAX(CASE WHEN rn = 1 THEN p.quantity        END) AS l1_quantity,
+        MAX(CASE WHEN rn = 1 THEN p.currency        END) AS l1_currency,
         MAX(CASE WHEN rn = 1 THEN p.unit_price      END) AS l1_unit_price,
         MAX(CASE WHEN rn = 1 THEN p.unit_price_eur  END) AS l1_unit_price_eur,
         MAX(CASE WHEN rn = 1 THEN p.total_price     END) AS l1_total_price,
         MAX(CASE WHEN rn = 1 THEN p.total_price_eur END) AS l1_total_price_eur,
-        MAX(CASE WHEN rn = 1 THEN p.currency        END) AS l1_currency,
         MAX(CASE WHEN rn = 1 THEN p.payment_terms   END) AS l1_payment_terms,
         MAX(CASE WHEN rn = 1 THEN p.supplier_name   END) AS l1_supplier_name,
         MAX(CASE WHEN rn = 1 THEN p.supplier_country END) AS l1_supplier_country,
         MAX(CASE WHEN rn = 2 THEN p.quantity        END) AS l2_quantity,
+        MAX(CASE WHEN rn = 2 THEN p.currency        END) AS l2_currency,
         MAX(CASE WHEN rn = 2 THEN p.unit_price      END) AS l2_unit_price,
         MAX(CASE WHEN rn = 2 THEN p.unit_price_eur  END) AS l2_unit_price_eur,
         MAX(CASE WHEN rn = 2 THEN p.total_price     END) AS l2_total_price,
         MAX(CASE WHEN rn = 2 THEN p.total_price_eur END) AS l2_total_price_eur,
-        MAX(CASE WHEN rn = 2 THEN p.currency        END) AS l2_currency,
         MAX(CASE WHEN rn = 2 THEN p.payment_terms   END) AS l2_payment_terms,
         MAX(CASE WHEN rn = 2 THEN p.supplier_name   END) AS l2_supplier_name,
         MAX(CASE WHEN rn = 2 THEN p.supplier_country END) AS l2_supplier_country
     FROM (
         SELECT
             p.[quantity],
+            p.[currency],
             p.[unit_price],
             p.[unit_price_eur],
             p.[total_price],
             p.[total_price_eur],
-            p.[currency],
             p.[payment_terms],
             p.[supplier_name],
             p.[supplier_country],
