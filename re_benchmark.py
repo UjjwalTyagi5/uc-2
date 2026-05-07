@@ -166,7 +166,6 @@ def main() -> None:
         api_key=AZURE_API_KEY,
         api_version=AZURE_API_VERSION,
         azure_deployment=AZURE_LLM_DEPLOY,
-        temperature=0,
     )
     embed_model = AzureOpenAIEmbeddings(
         azure_endpoint=AZURE_ENDPOINT,
