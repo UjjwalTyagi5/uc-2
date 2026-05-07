@@ -4455,7 +4455,7 @@ def _run_benchmark(
             item_category = " > ".join(
                 str(rd[f]) for f in ["item_level_1", "item_level_2", "item_level_3"] if rd.get(f)
             )
-            infl_dec = cpi_dec = None
+            infl_dec = cpi_dec = Decimal("0")
             if ref_year and current_year and ref_year < current_year:
                 infl_raw = _estimate_inflation_via_llm(
                     llm, rd.get("item_name"), item_category or None,
@@ -4493,10 +4493,11 @@ def _run_benchmark(
             bp_confidence = bout.get("confidence")
             llm_summary   = bout.get("summary", "")
             try:
-                bp_dec   = Decimal(str(bp_unit)) if bp_unit is not None else None
-                bp_total = round(float(bp_dec) * float(qty or 1), 2) if bp_dec is not None else None
+                bp_dec   = Decimal(str(bp_unit)) if bp_unit is not None else Decimal("0")
+                bp_total = round(float(bp_dec) * float(qty or 1), 2)
             except Exception:
-                bp_dec = bp_total = None
+                bp_dec = Decimal("0")
+                bp_total = 0
 
             # Fold the new range + confidence + sample-size info into the
             # human-readable summary so we don't need a schema change to the
