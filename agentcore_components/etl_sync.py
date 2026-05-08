@@ -95,6 +95,7 @@ class AgentCoreETLSync(Node):
 
     outputs = [
         Output(display_name="Sync Result", name="result", method="run_sync"),
+        Output(display_name="Stop Sync", name="stop_result", method="stop_sync"),
     ]
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -283,6 +284,9 @@ class AgentCoreETLSync(Node):
         }
 
         for attempt in range(retries + 1):
+            if _ETL_STOP.is_set():
+                result.update(status="stopped", error="Stopped by user")
+                return result
             tgt = None
             try:
                 filter_key = source_table.split(".")[-1].lower()
@@ -397,6 +401,17 @@ class AgentCoreETLSync(Node):
 
         return result
 
+    # ── stop signal ───────────────────────────────────────────────────────────
+
+    def stop_sync(self) -> Data:
+        if _ETL_SYNC_LOCK.locked():
+            _ETL_STOP.set()
+            return Data(data={
+                "success": True,
+                "message": "Stop signal sent. Current table will finish, remaining will be skipped.",
+            })
+        return Data(data={"success": True, "message": "No sync is currently running."})
+
     # ── main entry ────────────────────────────────────────────────────────────
 
     def run_sync(self) -> Data:
@@ -453,6 +468,8 @@ class AgentCoreETLSync(Node):
                 "message": "ETL sync is already running. Wait for the current job to finish.",
             })
 
+        _ETL_STOP.clear()  # reset stop flag for this new job
+
         # Start the heavy sync in a daemon thread so this output method returns
         # immediately — keeps the SSE stream from timing out on long syncs.
         # _run_full_sync releases _ETL_SYNC_LOCK in its finally block.
@@ -482,6 +499,8 @@ class AgentCoreETLSync(Node):
 
 # One ETL sync at a time — acquired in run_sync(), released in _run_full_sync finally.
 _ETL_SYNC_LOCK = threading.Lock()
+# Set this event to request graceful cancellation of the running job.
+_ETL_STOP = threading.Event()
 
 
 def _run_full_sync(node, src_cs, tgt_cs, filters, exclusions, configs,
@@ -502,17 +521,22 @@ def _run_full_sync(node, src_cs, tgt_cs, filters, exclusions, configs,
 
         results = []
         with ThreadPoolExecutor(max_workers=table_workers) as pool:
-            futures = {
+            all_futures = [
                 pool.submit(
                     node._sync_table,
                     src_cs, tgt_cs,
                     etl_id, src_tbl, tgt_tbl,
                     filters, exclusions,
-                ): tgt_tbl
+                )
                 for etl_id, src_tbl, tgt_tbl, _ in configs
-            }
-            for f in as_completed(futures):
+            ]
+            for f in as_completed(all_futures):
                 results.append(f.result())
+                if _ETL_STOP.is_set():
+                    logger.warning(f"[ETL job={job_id}] stop requested — cancelling queued tables")
+                    for pf in all_futures:
+                        pf.cancel()
+                    break
 
         if node.disable_constraints:
             try:
