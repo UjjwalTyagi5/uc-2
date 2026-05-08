@@ -65,6 +65,7 @@ SELECT
     proposals.l2_supplier_country,
 
     -- Low hist (cheapest historical match via Pinecone)
+    low.[purchase_dtl_id]      AS low_hist_dtl_id,
     prm_low.[PURCHASE_REQ_NO]  AS low_hist_purchase_req_no,
     low.[quantity]             AS low_hist_quantity,
     low.[currency]             AS low_hist_currency,
@@ -75,6 +76,7 @@ SELECT
     low.[quotation_date]       AS low_hist_quotation_date,
 
     -- Last hist (most recent historical match via Pinecone)
+    lst.[purchase_dtl_id]      AS last_hist_dtl_id,
     prm_lst.[PURCHASE_REQ_NO]  AS last_hist_purchase_req_no,
     lst.[quantity]             AS last_hist_quantity,
     lst.[currency]             AS last_hist_currency,
@@ -84,7 +86,7 @@ SELECT
     lst.[quotation_date]       AS last_hist_quotation_date,
 
     -- Quotation statistics
-    quot_stats.[total_quotations],
+    quot_stats.[supplier_count],
     quot_stats.[supplier_names],
 
     -- Similar items from Pinecone
@@ -163,7 +165,7 @@ OUTER APPLY (
 
 OUTER APPLY (
     SELECT
-        COUNT(*)                                                             AS total_quotations,
+        COUNT(*)                                                             AS supplier_count,
         '[' + STRING_AGG('"' + s.[supplier_name] + '"', ',')
               WITHIN GROUP (ORDER BY s.[supplier_name]) + ']'               AS supplier_names
     FROM (
