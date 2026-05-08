@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 import pyodbc
+from loguru import logger
 
 from agentcore.custom import Node
 from agentcore.io import BoolInput, DataInput, IntInput, MessageInput, MessageTextInput, MultilineInput, Output
@@ -246,7 +247,7 @@ class AgentCoreETLSync(Node):
                 if attempt >= retries or not self._is_transient(exc):
                     raise
                 delay = 2 ** attempt
-                self.log(
+                logger.warning(
                     f"Segment offset={offset} attempt {attempt+1}/{retries} "
                     f"failed ({exc!s:.80}), retrying in {delay}s…"
                 )
@@ -326,7 +327,7 @@ class AgentCoreETLSync(Node):
                 lock    = threading.Lock()
                 segment = max(1, total // workers)
 
-                self.log(
+                logger.info(
                     f"[{target_table}] {total:,} rows | "
                     f"{workers} workers | segment={segment:,} | attempt {attempt+1}"
                 )
@@ -357,7 +358,7 @@ class AgentCoreETLSync(Node):
                 tgt.commit()
 
                 result.update(status="success", rows=counter[0])
-                self.log(f"[{target_table}] done — {counter[0]:,} rows")
+                logger.info(f"[{target_table}] done — {counter[0]:,} rows")
                 return result
 
             except Exception as exc:
@@ -378,10 +379,10 @@ class AgentCoreETLSync(Node):
                     except Exception:
                         pass
                     result["error"] = str(exc)
-                    self.log(f"[{target_table}] FAILED: {exc}")
+                    logger.error(f"[{target_table}] FAILED: {exc}")
                     return result
                 delay = 2 ** attempt
-                self.log(
+                logger.warning(
                     f"[{target_table}] attempt {attempt+1}/{retries} failed "
                     f"({exc!s:.80}), retrying in {delay}s…"
                 )
