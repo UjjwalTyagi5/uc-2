@@ -133,7 +133,9 @@ class AgentCoreETLSync(Node):
         )
 
     def _connect(self, conn_str: str) -> pyodbc.Connection:
-        return pyodbc.connect(conn_str, timeout=30)
+        conn = pyodbc.connect(conn_str, timeout=30)
+        conn.timeout = 600  # query execution timeout: 10 min max per statement
+        return conn
 
     def _is_transient(self, exc: Exception) -> bool:
         transient_states = {"08S01", "08001", "HYT00", "HYT01", "40001", "40613"}
