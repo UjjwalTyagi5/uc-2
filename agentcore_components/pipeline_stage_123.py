@@ -926,6 +926,8 @@ Extraction guidelines:
 - For the hierarchical item taxonomy (item_level_1 … item_level_8), classify from the broadest category down to the most specific attribute available.  See the taxonomy guidelines in the user message.
 - Set supplier_match_conf honestly based on how well the extracted item matches the requisition line.  0.0 = completely unrelated, 1.0 = identical match certain.  A lower honest score is always better than an inflated wrong one.
 - If a field genuinely cannot be determined from the document, set it to null.  Never guess or fill with placeholder text.
+- EXCEPTION — item_level_1 … item_level_8 are MANDATORY.  All eight levels MUST be filled for every item.  When a level cannot be inferred even loosely, use the literal string "Unspecified" instead of null.  All other null rules still apply to non-taxonomy fields.
+- The supplier / vendor / distributor name belongs ONLY in the top-level `supplier_name` field.  It must NEVER appear inside item_level_1 … item_level_8, commodity_tag, or item_summary.  L4 (brand/manufacturer) is the maker of the product, not the company selling it — use "Unspecified" in L4 if the brand is unknown rather than reusing the supplier name.
 - Null data from the requisition context (shown as "N/A") means that field was not recorded — do not treat it as a matching signal.
 
 Universal extraction guidance — this system handles ANY purchase an
@@ -1038,9 +1040,20 @@ attribute the document discloses, leave the rest null."""
 
 ITEM_TAXONOMY = """Guidelines for item_level_1 through item_level_8 hierarchical taxonomy:
 
-The eight levels represent a progressively narrower classification of each item.  Fill as many levels as the quotation document supports; leave deeper levels as null when information is not available.
+The eight levels represent a progressively narrower classification of each item.
 
-IMPORTANT: item_level_1, item_level_2, and item_level_3 MUST always be filled — you can always infer the broad category, sub-category, and product/service type from the item name and description.  Only item_level_4 through item_level_8 may be null when the information is genuinely absent.
+IMPORTANT — ALL EIGHT LEVELS ARE MANDATORY:
+item_level_1 through item_level_8 MUST ALL be filled for every item.  None of these may be null.
+Use the strongest inference you can make from the item name, description, specs in the document, and the RAS reference data.
+If a level is genuinely absent after honest inspection, use the literal string "Unspecified" — never null, never an empty string.
+
+CRITICAL — NEVER USE THE SUPPLIER NAME IN ANY OF L1–L8:
+L1–L8 describe the ITEM ITSELF, not the company selling it.
+- The supplier (e.g. "ABC Trading Co.", "XYZ Distributors Pvt Ltd") is captured separately in the top-level `supplier_name` field.
+- L4 is the BRAND / MANUFACTURER of the product (e.g. "Dell", "Siemens", "Bosch") — this is the maker of the item, NOT the company selling it on the quotation.  When the supplier IS the manufacturer (e.g. Siemens quoting their own equipment), put the brand name "Siemens" in L4 — but never the legal entity / distributor name.
+- If the brand cannot be determined from the document, use "Unspecified" in L4 — do NOT fall back to the supplier name.
+- The same rule applies to L5–L8: never put supplier name, distributor name, or vendor company name in any of these fields.
+This separation is critical: two suppliers selling the SAME product (same brand/model/spec) must produce identical L1–L8 values so the benchmark vector matches.  If supplier identity leaks into L1–L8, identical items get different embeddings and benchmarking breaks.
 
 Level 1 — Broad industry / domain category
   Examples: "Electronics", "Mechanical", "Civil", "IT Hardware", "Services",
@@ -1075,8 +1088,11 @@ Rules:
 - Never repeat the same information across two levels.
 - Use proper nouns for brands and models (Levels 4–5).
 - Use descriptive noun phrases for categories (Levels 1–3).
+- ALL eight levels must be filled — use "Unspecified" if a level is genuinely absent.
+- NEVER put the supplier / vendor / distributor company name in any of L1–L8.  L4 is the product's brand / manufacturer, which is a different concept from the supplier selling the quotation.
 - When the quotation is for a service rather than a physical product, adapt the hierarchy:
-    L1=Services, L2=domain, L3=service type, L4=provider, L5=scope, …
+    L1=Services, L2=domain, L3=service type, L4=service brand / standard (NOT the vendor company), L5=scope, …
+    For services where there is no recognised brand, L4="Unspecified" — never the vendor's company name.
 
 Universal funnel — works for anything an organisation procures
 --------------------------------------------------------------
@@ -1089,16 +1105,20 @@ purchase the same way:
   L1  broadest industry / domain                           (REQUIRED)
   L2  sub-area within that domain                           (REQUIRED)
   L3  product or service type                               (REQUIRED)
-  L4  brand / manufacturer / vendor product line            (if known)
-  L5  model / series / part number / standard / specification
-  L6  primary configuration or variant
-  L7  secondary spec / option / certification
-  L8  any remaining distinguishing attribute
+  L4  brand / manufacturer / product line (NEVER supplier)  (REQUIRED — "Unspecified" if absent)
+  L5  model / series / part number / standard / spec        (REQUIRED — "Unspecified" if absent)
+  L6  primary configuration or variant                      (REQUIRED — "Unspecified" if absent)
+  L7  secondary spec / option / certification               (REQUIRED — "Unspecified" if absent)
+  L8  any remaining distinguishing attribute                (REQUIRED — "Unspecified" if absent)
 
-For any category you've never seen before, invent reasonable noun
-phrases for L1–L3 from the item description and let L4–L8 follow
-whatever the quotation actually states.  Never invent attributes that
-aren't in the document.
+ALL EIGHT LEVELS MUST BE FILLED — none may be null.  For any category
+you've never seen before, invent reasonable noun phrases for L1–L3
+from the item description and fill L4–L8 from whatever the quotation
+states.  When a level cannot be reasonably inferred, use the literal
+string "Unspecified".  Never invent fake attributes (no fictional brand
+names, no made-up part numbers).  Never substitute the supplier /
+distributor company name for the product brand — use "Unspecified" in
+L4 instead.
 
 Recurring patterns (illustrative, NOT a closed list — most purchases
 fall into one of these shapes; everything else uses the same funnel):
@@ -1267,16 +1287,16 @@ Return a **single JSON object** — no markdown fences, no extra text:
       "taxation_details": "tax/GST/VAT info as string or null",
       "delivery_date": "YYYY-MM-DD or null",
       "delivery_time_days": "integer number of days or null",
-      "item_level_1": "broadest category (e.g. Industrial Equipment, IT Hardware, Services)",
-      "item_level_2": "sub-category (e.g. Pumps & Valves, Laptops, Facility Management)",
-      "item_level_3": "product or service type",
-      "item_level_4": "brand or manufacturer if known, else null",
-      "item_level_5": "model or series if known, else null",
-      "item_level_6": "configuration or variant if known, else null",
-      "item_level_7": "key technical specification if known, else null",
-      "item_level_8": "any additional distinguishing detail, else null",
-      "commodity_tag": "lowercase-slug-tag (e.g. industrial-pump, it-laptop, vehicle-hiring)",
-      "item_summary": "plain-English summary of the item and its intended use (max 20 words)"
+      "item_level_1": "broadest category (e.g. Industrial Equipment, IT Hardware, Services) — REQUIRED, never null",
+      "item_level_2": "sub-category (e.g. Pumps & Valves, Laptops, Facility Management) — REQUIRED, never null",
+      "item_level_3": "product or service type — REQUIRED, never null",
+      "item_level_4": "brand / manufacturer of the product (e.g. Dell, Siemens) — REQUIRED; use \"Unspecified\" if absent. NEVER the supplier/vendor company name.",
+      "item_level_5": "model / series / part number / standard — REQUIRED; use \"Unspecified\" if absent",
+      "item_level_6": "configuration or variant — REQUIRED; use \"Unspecified\" if absent",
+      "item_level_7": "key technical specification / certification — REQUIRED; use \"Unspecified\" if absent",
+      "item_level_8": "any additional distinguishing detail — REQUIRED; use \"Unspecified\" if absent",
+      "commodity_tag": "lowercase-slug-tag describing the PRODUCT (e.g. industrial-pump, it-laptop, vehicle-hiring) — never include supplier name",
+      "item_summary": "plain-English summary of the item and its intended use (max 20 words) — never mention the supplier/vendor name"
     }}
   ]
 }}
@@ -1286,8 +1306,16 @@ Return a **single JSON object** — no markdown fences, no extra text:
 **Required fields — never null:**
 - `item_name` — always present; use the supplier's exact product/service name from the document.
 - `item_description` — always present; include all specs, model numbers, and technical details visible in the document.
-- `item_level_1`, `item_level_2`, `item_level_3` — always fill; you can always infer broad category, sub-category, and product type from the item name alone.
-- `commodity_tag` — always present; derive from the item type.
+- `item_level_1` through `item_level_8` — ALL EIGHT levels are mandatory.  Infer each level from the item name, description, document specs, and RAS reference data.  When a level is genuinely absent after honest inspection, use the literal string `"Unspecified"` — never null, never an empty string.
+- `commodity_tag` — always present; derive from the item type (lowercase, hyphenated).
+- `item_summary` — always present; max 20 words.
+
+**NEVER include the supplier / vendor / distributor name in any of these fields:**
+- L1–L8 describe the **item itself**, not the company selling it.  The supplier identity is captured separately in the top-level `supplier_name` field.
+- L4 is the **brand / manufacturer of the product** (e.g. "Dell", "Siemens", "Bosch").  This is different from the supplier — a supplier "ABC Computers Pvt Ltd" may sell items branded "Dell".  L4 = "Dell", supplier_name = "ABC Computers Pvt Ltd".  When the brand cannot be determined, L4 = "Unspecified" — NEVER fall back to the supplier name.
+- `item_summary` must describe the item and its intended use.  It must NOT mention the supplier, vendor, or distributor by name.
+- `commodity_tag` must describe the product type, not the supplier.
+- This separation is critical for benchmarking: identical products from different suppliers must produce identical L1–L8 / commodity_tag / item_summary values so they collide in the vector index.  Leaking supplier identity into these fields breaks benchmark matching.
 
 **Pricing rules:**
 - Extract `unit_price` and `total_price` separately whenever both are shown.
