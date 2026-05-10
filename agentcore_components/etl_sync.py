@@ -280,7 +280,7 @@ class AgentCoreETLSync(Node):
                     f"SELECT {column_sql} FROM {self._quote(staging)}"
                 )
                 self._drop_staging(tc, staging)
-                self._write_status(tc, etl_id, "Success", counter[0])
+                self._write_status(tc, etl_id, "Success", total_rows)
                 tgt.commit()
 
                 result.update(status="success", rows=total_rows)
