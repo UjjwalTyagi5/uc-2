@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import time
 import threading
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
@@ -95,7 +94,6 @@ class AgentCoreETLSync(Node):
 
     outputs = [
         Output(display_name="Sync Result", name="result", method="run_sync"),
-        Output(display_name="Stop Sync", name="stop_result", method="stop_sync"),
     ]
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -184,6 +182,7 @@ class AgentCoreETLSync(Node):
         )
 
     # ── segment loader with retry ─────────────────────────────────────────────
+    # Runs inside ThreadPoolExecutor — must use logger.* not self.log()
 
     def _load_segment(
         self,
@@ -263,6 +262,7 @@ class AgentCoreETLSync(Node):
                             pass
 
     # ── per-table sync with retry ─────────────────────────────────────────────
+    # Runs inside ThreadPoolExecutor — must use logger.* not self.log()
 
     def _sync_table(
         self,
@@ -284,9 +284,6 @@ class AgentCoreETLSync(Node):
         }
 
         for attempt in range(retries + 1):
-            if _ETL_STOP.is_set():
-                result.update(status="stopped", error="Stopped by user")
-                return result
             tgt = None
             try:
                 filter_key = source_table.split(".")[-1].lower()
@@ -401,37 +398,13 @@ class AgentCoreETLSync(Node):
 
         return result
 
-    # ── stop signal ───────────────────────────────────────────────────────────
-
-    def stop_sync(self) -> Data:
-        if _ETL_SYNC_LOCK.locked():
-            _ETL_STOP.set()
-            return Data(data={
-                "success": True,
-                "message": "Stop signal sent. Current table will finish, remaining will be skipped.",
-            })
-        return Data(data={"success": True, "message": "No sync is currently running."})
-
     # ── main entry ────────────────────────────────────────────────────────────
 
     def run_sync(self) -> Data:
-        # Validate and build connection strings first — surface readable errors
-        try:
-            src_cfg = self._data_to_dict(self.source_connection)
-            tgt_cfg = self._data_to_dict(self.target_connection)
-            src_cs  = self._sqlserver_conn_str(src_cfg)
-            tgt_cs  = self._sqlserver_conn_str(tgt_cfg)
-        except Exception as exc:
-            return Data(data={"success": False, "error": f"Connection config error: {exc}"})
-
-        # Quick smoke-test — fail fast with a readable message before touching anything
-        for label, cs in [("source", src_cs), ("target", tgt_cs)]:
-            try:
-                c = self._connect(cs)
-                c.close()
-            except Exception as exc:
-                return Data(data={"success": False, "error": f"Cannot connect to {label} DB: {exc}"})
-
+        src_cfg = self._data_to_dict(self.source_connection)
+        tgt_cfg = self._data_to_dict(self.target_connection)
+        src_cs  = self._sqlserver_conn_str(src_cfg)
+        tgt_cs  = self._sqlserver_conn_str(tgt_cfg)
         filters    = json.loads(self.table_filters_json     or "{}")
         exclusions = json.loads(self.column_exclusions_json or "{}")
 
@@ -459,101 +432,58 @@ class AgentCoreETLSync(Node):
         table_workers = max(1, int(self.max_table_workers or 4))
         per_table     = max(1, int(self.parallel_workers   or 4))
         retries       = max(1, int(self.max_retries        or 3))
-
-        # Guard: only one ETL sync may run at a time across all instances.
-        if not _ETL_SYNC_LOCK.acquire(blocking=False):
-            return Data(data={
-                "success": False,
-                "already_running": True,
-                "message": "ETL sync is already running. Wait for the current job to finish.",
-            })
-
-        _ETL_STOP.clear()  # reset stop flag for this new job
-
-        # Start the heavy sync in a daemon thread so this output method returns
-        # immediately — keeps the SSE stream from timing out on long syncs.
-        # _run_full_sync releases _ETL_SYNC_LOCK in its finally block.
-        job_id = str(uuid.uuid4())[:8]
-        t = threading.Thread(
-            target=_run_full_sync,
-            args=(self, src_cs, tgt_cs, filters, exclusions, configs,
-                  table_workers, per_table, retries, job_id),
-            daemon=True,
-            name=f"etl-sync-{job_id}",
-        )
-        t.start()
-
         self.log(
-            f"ETL sync started in background | job={job_id} | "
-            f"{len(configs)} table(s) | "
-            f"{table_workers} parallel tables | {per_table} workers/table"
+            f"Syncing {len(configs)} table(s) | "
+            f"{table_workers} parallel tables | "
+            f"{per_table} workers/table | "
+            f"{retries} retries on transient errors"
         )
-        return Data(data={
-            "success": True,
-            "started": True,
-            "job_id": job_id,
-            "tables_queued": len(configs),
-            "message": "Sync running in background. Check sync_status_table for results.",
-        })
 
-
-# One ETL sync at a time — acquired in run_sync(), released in _run_full_sync finally.
-_ETL_SYNC_LOCK = threading.Lock()
-# Set this event to request graceful cancellation of the running job.
-_ETL_STOP = threading.Event()
-
-
-def _run_full_sync(node, src_cs, tgt_cs, filters, exclusions, configs,
-                   table_workers, per_table, retries, job_id):
-    try:
-        logger.info(f"[ETL job={job_id}] starting {len(configs)} tables")
-
-        if node.disable_constraints:
+        # ── disable FK constraints ─────────────────────────────────────
+        if self.disable_constraints:
             try:
-                fk = node._connect(tgt_cs)
+                fk = self._connect(tgt_cs)
                 fc = fk.cursor()
                 for _, _, tgt_tbl, _ in configs:
-                    node._toggle_constraints(fc, tgt_tbl, enable=False)
+                    self._toggle_constraints(fc, tgt_tbl, enable=False)
                 fk.commit()
                 fk.close()
             except Exception as exc:
-                logger.warning(f"[ETL job={job_id}] FK disable failed: {exc}")
+                self.log(f"Warning: FK disable failed: {exc}")
 
+        # ── sync all tables in parallel ────────────────────────────────
         results = []
         with ThreadPoolExecutor(max_workers=table_workers) as pool:
-            all_futures = [
+            futures = {
                 pool.submit(
-                    node._sync_table,
+                    self._sync_table,
                     src_cs, tgt_cs,
                     etl_id, src_tbl, tgt_tbl,
                     filters, exclusions,
-                )
+                ): tgt_tbl
                 for etl_id, src_tbl, tgt_tbl, _ in configs
-            ]
-            for f in as_completed(all_futures):
+            }
+            for f in as_completed(futures):
                 results.append(f.result())
-                if _ETL_STOP.is_set():
-                    logger.warning(f"[ETL job={job_id}] stop requested — cancelling queued tables")
-                    for pf in all_futures:
-                        pf.cancel()
-                    break
 
-        if node.disable_constraints:
+        # ── re-enable FK constraints ───────────────────────────────────
+        if self.disable_constraints:
             try:
-                fk2 = node._connect(tgt_cs)
+                fk2 = self._connect(tgt_cs)
                 fc2 = fk2.cursor()
                 for _, _, tgt_tbl, _ in configs:
-                    node._toggle_constraints(fc2, tgt_tbl, enable=True)
+                    self._toggle_constraints(fc2, tgt_tbl, enable=True)
                 fk2.commit()
                 fk2.close()
             except Exception as exc:
-                logger.warning(f"[ETL job={job_id}] FK re-enable failed: {exc}")
+                self.log(f"Warning: FK re-enable failed: {exc}")
 
         failed = [r for r in results if r["status"] == "failed"]
-        logger.info(
-            f"[ETL job={job_id}] done — {len(results)} tables, "
-            f"{len(failed)} failed: {[r['target'] for r in failed]}"
-        )
-    finally:
-        _ETL_SYNC_LOCK.release()
-        logger.info(f"[ETL job={job_id}] lock released")
+        output = {
+            "success":       len(failed) == 0,
+            "tables_synced": len(results),
+            "failed_tables": len(failed),
+            "results":       results,
+        }
+        self.status = output
+        return Data(data=output)
