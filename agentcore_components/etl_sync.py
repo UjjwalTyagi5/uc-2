@@ -56,12 +56,6 @@ class AgentCoreETLSync(Node):
             info="Number of rows committed per INSERT batch.",
         ),
         IntInput(
-            name="parallel_workers",
-            display_name="Workers per Table",
-            value=4,
-            info="Parallel threads that split and load each table's rows concurrently.",
-        ),
-        IntInput(
             name="max_table_workers",
             display_name="Max Parallel Tables",
             value=4,
@@ -184,93 +178,6 @@ class AgentCoreETLSync(Node):
             etl_id, datetime.now(), status, row_count, error,
         )
 
-    # ── segment loader with retry ─────────────────────────────────────────────
-    # Runs inside ThreadPoolExecutor — must use logger.* not self.log()
-
-    def _load_segment(
-        self,
-        src_cs: str,
-        tgt_cs: str,
-        staging: str,
-        column_sql: str,
-        placeholders: str,
-        select_base: str,
-        offset: int,
-        fetch_n: int,
-        counter: list,
-        lock: threading.Lock,
-        job_id: str,
-        target_table: str,
-    ):
-        retries = max(1, int(self.max_retries or 3))
-        ins_sql = (
-            f"INSERT INTO {self._quote(staging)} "
-            f"({column_sql}) VALUES ({placeholders})"
-        )
-        seg_sql = (
-            f"{select_base} "
-            f"ORDER BY (SELECT NULL) "
-            f"OFFSET {offset} ROWS FETCH NEXT {fetch_n} ROWS ONLY"
-        )
-        chunk = max(1, int(self.batch_size or 5000))
-        tag   = f"[job={job_id}][{target_table}][offset={offset}]"
-
-        logger.info(f"{tag} segment started — fetching {fetch_n:,} rows")
-
-        for attempt in range(retries + 1):
-            src = None
-            tgt = None
-            rows_this_attempt = 0
-            try:
-                src = self._connect(src_cs)
-                tgt = self._connect(tgt_cs)
-
-                sc = src.cursor()
-                sc.execute(seg_sql)
-                tc = tgt.cursor()
-                tc.fast_executemany = True
-
-                batch = []
-                for row in sc:
-                    batch.append(row)
-                    if len(batch) >= chunk:
-                        tc.executemany(ins_sql, batch)
-                        rows_this_attempt += len(batch)
-                        batch = []
-                if batch:
-                    tc.executemany(ins_sql, batch)
-                    rows_this_attempt += len(batch)
-
-                tgt.commit()
-                with lock:
-                    counter[0] += rows_this_attempt
-
-                logger.info(f"{tag} segment done — {rows_this_attempt:,} rows inserted")
-                return
-
-            except Exception as exc:
-                if tgt:
-                    try:
-                        tgt.rollback()
-                    except Exception:
-                        pass
-                if attempt >= retries or not self._is_transient(exc):
-                    logger.error(f"{tag} segment FAILED after {attempt+1} attempt(s): {exc}")
-                    raise
-                delay = 2 ** attempt
-                logger.warning(
-                    f"{tag} attempt {attempt+1}/{retries} failed ({exc!s:.80}) "
-                    f"— retrying in {delay}s"
-                )
-                time.sleep(delay)
-            finally:
-                for conn in (src, tgt):
-                    if conn:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-
     # ── per-table sync with retry ─────────────────────────────────────────────
     # Runs inside ThreadPoolExecutor — must use logger.* not self.log()
 
@@ -286,8 +193,8 @@ class AgentCoreETLSync(Node):
         job_id: str,
     ) -> dict:
         staging = self._staging_table(target_table)
-        workers = max(1, int(self.parallel_workers or 4))
         retries = max(1, int(self.max_retries or 3))
+        chunk   = max(1, int(self.batch_size or 5000))
         result  = {
             "etl_id": etl_id, "source": source_table,
             "target": target_table, "status": "failed",
@@ -298,41 +205,34 @@ class AgentCoreETLSync(Node):
         logger.info(f"{tag} ── table sync started (source: {source_table})")
 
         for attempt in range(retries + 1):
+            src = None
             tgt = None
             try:
                 filter_key = source_table.split(".")[-1].lower()
                 where      = filters.get(filter_key, "")
 
-                # ── row count + columns ───────────────────────────────
-                logger.info(f"{tag} reading row count and schema from source")
+                # ── schema from source ────────────────────────────────
+                logger.info(f"{tag} reading schema from source")
                 src = self._connect(src_cs)
                 sc  = src.cursor()
-                count_sql = (
-                    f"SELECT COUNT(*) FROM {self._quote(source_table)}"
-                    + (f" WHERE {where}" if where else "")
-                )
-                sc.execute(count_sql)
-                total = sc.fetchone()[0]
-
                 sc.execute(f"SELECT TOP 0 * FROM {self._quote(source_table)}")
                 excluded = {c.lower() for c in exclusions.get(filter_key, [])}
                 cols     = [col[0] for col in sc.description if col[0].lower() not in excluded]
-                src.close()
-
-                logger.info(
-                    f"{tag} {total:,} rows | {len(cols)} columns"
-                    + (f" | filter: {where}" if where else "")
-                    + (f" | excluding: {list(excluded)}" if excluded else "")
-                )
 
                 if not cols:
                     raise ValueError(f"No columns found for {source_table}")
 
                 column_sql   = ", ".join(self._quote(c) for c in cols)
                 placeholders = ", ".join("?" for _ in cols)
-                select_base  = (
+                select_sql   = (
                     f"SELECT {column_sql} FROM {self._quote(source_table)}"
                     + (f" WHERE {where}" if where else "")
+                )
+
+                logger.info(
+                    f"{tag} {len(cols)} columns"
+                    + (f" | filter: {where}" if where else "")
+                    + (f" | excluding: {list(excluded)}" if excluded else "")
                 )
 
                 # ── create fresh staging ──────────────────────────────
@@ -345,35 +245,32 @@ class AgentCoreETLSync(Node):
                     f"FROM {self._quote(target_table)}"
                 )
                 tgt.commit()
-                logger.info(f"{tag} staging table ready")
+                logger.info(f"{tag} staging table ready — streaming rows (batch={chunk:,})")
 
-                # ── parallel segment load ─────────────────────────────
-                counter = [0]
-                lock    = threading.Lock()
-                segment = max(1, total // workers)
-
-                logger.info(
-                    f"{tag} loading {total:,} rows in {workers} parallel segments "
-                    f"of ~{segment:,} rows each (attempt {attempt+1}/{retries+1})"
+                # ── single-pass streaming load ────────────────────────
+                # One source scan, batched inserts — no OFFSET redundancy.
+                ins_sql = (
+                    f"INSERT INTO {self._quote(staging)} "
+                    f"({column_sql}) VALUES ({placeholders})"
                 )
+                tc.fast_executemany = True
+                sc.execute(select_sql)
+                total_rows = 0
+                batch = []
+                for row in sc:
+                    batch.append(row)
+                    if len(batch) >= chunk:
+                        tc.executemany(ins_sql, batch)
+                        total_rows += len(batch)
+                        tgt.commit()
+                        logger.info(f"{tag} {total_rows:,} rows loaded so far…")
+                        batch = []
+                if batch:
+                    tc.executemany(ins_sql, batch)
+                    total_rows += len(batch)
+                    tgt.commit()
 
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = []
-                    for i in range(workers):
-                        off = i * segment
-                        n   = segment if i < workers - 1 else total - off
-                        if n > 0:
-                            futures.append(pool.submit(
-                                self._load_segment,
-                                src_cs, tgt_cs, staging,
-                                column_sql, placeholders, select_base,
-                                off, n, counter, lock,
-                                job_id, target_table,
-                            ))
-                    for f in as_completed(futures):
-                        f.result()
-
-                logger.info(f"{tag} all segments loaded — {counter[0]:,} rows in staging")
+                logger.info(f"{tag} {total_rows:,} rows loaded into staging")
 
                 # ── atomic swap ───────────────────────────────────────
                 logger.info(f"{tag} swapping staging → target (TRUNCATE + INSERT)")
@@ -386,8 +283,8 @@ class AgentCoreETLSync(Node):
                 self._write_status(tc, etl_id, "Success", counter[0])
                 tgt.commit()
 
-                result.update(status="success", rows=counter[0])
-                logger.info(f"{tag} ✓ DONE — {counter[0]:,} rows synced successfully")
+                result.update(status="success", rows=total_rows)
+                logger.info(f"{tag} ✓ DONE — {total_rows:,} rows synced successfully")
                 return result
 
             except Exception as exc:
@@ -417,11 +314,12 @@ class AgentCoreETLSync(Node):
                 )
                 time.sleep(delay)
             finally:
-                if tgt:
-                    try:
-                        tgt.close()
-                    except Exception:
-                        pass
+                for conn in (src, tgt):
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
 
         return result
 
@@ -477,7 +375,6 @@ class AgentCoreETLSync(Node):
             })
 
         table_workers = max(1, int(self.max_table_workers or 4))
-        per_table     = max(1, int(self.parallel_workers   or 4))
         retries       = max(1, int(self.max_retries        or 3))
 
         logger.info(
@@ -486,8 +383,7 @@ class AgentCoreETLSync(Node):
         )
         logger.info(
             f"[ETL] config — table_workers={table_workers} | "
-            f"segment_workers={per_table} | max_retries={retries} | "
-            f"batch_size={self.batch_size}"
+            f"max_retries={retries} | batch_size={self.batch_size}"
         )
 
         # Fire-and-forget: return immediately so AKS proxy timeout is never hit.
@@ -498,7 +394,7 @@ class AgentCoreETLSync(Node):
         threading.Thread(
             target=_run_full_sync,
             args=(self, src_cs, tgt_cs, filters, exclusions, configs,
-                  table_workers, per_table, retries, job_id),
+                  table_workers, retries, job_id),
             daemon=True,
             name=f"etl-{job_id}",
         ).start()
@@ -518,7 +414,7 @@ class AgentCoreETLSync(Node):
 
 
 def _run_full_sync(node, src_cs, tgt_cs, filters, exclusions, configs,
-                   table_workers, per_table, retries, job_id):
+                   table_workers, retries, job_id):
     """Background daemon thread — uses logger.* only, never self.log()."""
     started_at = datetime.now()
     logger.info(
