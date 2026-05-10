@@ -239,6 +239,7 @@ class AgentCoreETLSync(Node):
                 logger.info(f"{tag} creating staging table: {staging}")
                 tgt = self._connect(tgt_cs)
                 tc  = tgt.cursor()
+                tc.execute("SET ANSI_WARNINGS OFF")  # allow silent truncation for wider source values
                 self._drop_staging(tc, staging)
                 tc.execute(
                     f"SELECT TOP 0 {column_sql} INTO {self._quote(staging)} "
