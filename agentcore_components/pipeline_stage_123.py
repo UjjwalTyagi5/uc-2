@@ -3,7 +3,7 @@
 Logging
 -------
 This file does NOT call logger.add(...) or open a log file. loguru uses its
-default stderr sink, and Node-level events are also surfaced via self.log()
+default stderr sink, and Node-level events are also surfaced via self._safe_log()
 so they appear in the AgentCore canvas log panel in real time. No log
 directory is created on disk by this component.
 
@@ -1329,7 +1329,7 @@ Return a **single JSON object** — no markdown fences, no extra text:
 - Dates must be ISO 8601 (YYYY-MM-DD).  Convert formats like "15-Apr-2026" or "15/04/26" accordingly.
 - Prices as plain numbers — strip currency symbols, commas, and thousand separators.
 - If a field genuinely cannot be determined from the document, return null (not an empty string, not "N/A").
-- item_level_4 through item_level_8 may be null when information is genuinely absent — do not invent brand or model names.
+- EXCEPTION — item_level_1 through item_level_8 are MANDATORY for every item.  All eight levels MUST be filled.  When a level is genuinely absent, use the literal string "Unspecified" instead of null.  Never invent fake brand or model names; "Unspecified" is the correct fallback.
 - supplier_match_conf is confidence that the extracted item matches its mapped requisition line (0.0 = no match, 1.0 = certain).
 
 **DTL_ID matching — CRITICAL:**
@@ -5110,6 +5110,39 @@ class PipelineStage123Node(Node):
 
     # ── Connection helpers ────────────────────────────────────────────────
 
+    def _safe_log(self, message: str) -> None:
+        """Log routed via AgentCore in the main component thread, falling
+        back to loguru in ThreadPoolExecutor workers.
+
+        AgentCore's Node.log resolves the active component via a contextvar
+        that's only populated on the original asyncio.to_thread call. Worker
+        threads we spawn (e.g. inside `_process_pr` or `_run_classification`)
+        do not inherit that contextvar, so calling Node.log there emits
+        "called add_log but no component context found" warnings and the
+        message is dropped.
+
+        This helper detects worker threads by name and routes them through
+        loguru so logs still reach stderr — and the main-thread path keeps
+        surfacing in the AgentCore canvas as before.
+        """
+        import threading
+        # build_file_batch stamps _main_thread_id with the AgentCore-invoked
+        # thread before any bg work fires. Any other thread (ThreadPoolExecutor
+        # workers, the fire-and-forget pipeline daemon, etc.) routes to loguru
+        # to avoid the "no component context" warning.
+        main_tid = getattr(self, "_main_thread_id", None)
+        if main_tid is None or threading.get_ident() != main_tid:
+            logger.info(message)
+            return
+        # getattr keeps this call invisible to text-based search-and-replace,
+        # so it stays as the real AgentCore Node.log invocation instead of
+        # recursing back into _safe_log.
+        _ac_log = getattr(self, "log")
+        try:
+            _ac_log(message)
+        except Exception:
+            logger.info(message)
+
     def _conn_str(self, conn_data: Data) -> str:
         d      = conn_data.data or {}
         driver = d.get("driver", "ODBC Driver 18 for SQL Server")
@@ -5170,7 +5203,7 @@ class PipelineStage123Node(Node):
                 pr_list = payload.get("pr_numbers") or payload.get("pr_nos")
                 if isinstance(pr_list, list) and pr_list:
                     cleaned = [str(p).strip() for p in pr_list if str(p).strip()]
-                    self.log(
+                    self._safe_log(
                         f"Excel PR list — using {len(cleaned)} PR(s) from "
                         f"wired Data.pr_numbers (no parsing needed)"
                     )
@@ -5190,7 +5223,7 @@ class PipelineStage123Node(Node):
                                 column=(self.pr_excel_column or None),
                                 sheet=(self.pr_excel_sheet or None),
                             )
-                            self.log(
+                            self._safe_log(
                                 f"Excel PR list — parsed {len(pr_nos)} PR(s) "
                                 f"from wired Data.{key}"
                             )
@@ -5204,7 +5237,7 @@ class PipelineStage123Node(Node):
         # Source 2: blob path under the configured Blob Connector container.
         blob_path = (getattr(self, "pr_excel_blob_path", None) or "").strip()
         if blob_path:
-            self.log(f"Excel PR list — downloading from blob: {blob_path!r}")
+            self._safe_log(f"Excel PR list — downloading from blob: {blob_path!r}")
             try:
                 blob_cfg    = self._blob_cfg()
                 excel_bytes = _download_blob(blob_path, blob_cfg)
@@ -5213,7 +5246,7 @@ class PipelineStage123Node(Node):
                     column=(self.pr_excel_column or None),
                     sheet=(self.pr_excel_sheet or None),
                 )
-                self.log(
+                self._safe_log(
                     f"Excel PR list — parsed {len(pr_nos)} PR(s) from {blob_path!r}"
                 )
                 return pr_nos
@@ -5405,9 +5438,9 @@ class PipelineStage123Node(Node):
         conn.close()
         if existing is None:
             # Brand-new PR — nothing to clean, proceed straight to Stage 1.
-            self.log(f"[{pr_no}] New PR — skipping cleanup")
+            self._safe_log(f"[{pr_no}] New PR — skipping cleanup")
             return
-        self.log(f"[{pr_no}] Existing PR detected — cleaning prior data before reprocessing")
+        self._safe_log(f"[{pr_no}] Existing PR detected — cleaning prior data before reprocessing")
 
         # Single connection for all DB cleanup work (collect IDs + delete tables)
         conn = self._connect(tgt_cs)
@@ -5434,7 +5467,7 @@ class PipelineStage123Node(Node):
             # Old format: only is_selected_quote=1 UUIDs (legacy vectors only existed for selected rows too)
             old_ids = [str(r[0]) for r in rows if r[0] and r[2]]
             pinecone_ids = list(set(old_ids + new_ids))
-            self.log(
+            self._safe_log(
                 f"[{pr_no}] Pinecone cleanup: {len(rows)} extracted rows, "
                 f"{selected_count} is_selected_quote=1 — "
                 f"deleting {len(pinecone_ids)} vector(s): "
@@ -5508,7 +5541,7 @@ class PipelineStage123Node(Node):
                     from agentcore.services.pinecone_service_client import delete_vectors_via_service
                     preview = pinecone_ids[:5]
                     more    = len(pinecone_ids) - 5
-                    self.log(
+                    self._safe_log(
                         f"[{pr_no}] Sending {len(pinecone_ids)} ID(s) to Pinecone delete "
                         f"(index={pinecone_index!r}, namespace={pinecone_ns!r}) — "
                         f"first 5: {preview}" + (f" … +{more} more" if more > 0 else "")
@@ -5517,25 +5550,25 @@ class PipelineStage123Node(Node):
                         index_name=pinecone_index, namespace=pinecone_ns,
                         vector_ids=pinecone_ids,
                     )
-                    self.log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_ids)} ID(s) sent for removal")
+                    self._safe_log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_ids)} ID(s) sent for removal")
                 except Exception as exc:
-                    self.log(f"[{pr_no}] Warning — Pinecone cleanup failed (non-fatal): {exc}")
+                    self._safe_log(f"[{pr_no}] Warning — Pinecone cleanup failed (non-fatal): {exc}")
             else:
-                self.log(
+                self._safe_log(
                     f"[{pr_no}] Warning — pinecone_index or pinecone_namespace not set; "
                     f"{len(pinecone_ids)} vector(s) were NOT deleted from Pinecone. "
                     f"Check the 'Pinecone Index' and 'Pinecone Namespace' inputs on the component."
                 )
         else:
-            self.log(f"[{pr_no}] No Pinecone vectors found in DB for this PR — skipping Pinecone delete")
+            self._safe_log(f"[{pr_no}] No Pinecone vectors found in DB for this PR — skipping Pinecone delete")
 
         # Delete Azure Blob folder (non-fatal)
         try:
             self._delete_blob_folder(pr_no)
         except Exception as exc:
-            self.log(f"[{pr_no}] Warning — Blob folder cleanup failed (non-fatal): {exc}")
+            self._safe_log(f"[{pr_no}] Warning — Blob folder cleanup failed (non-fatal): {exc}")
 
-        self.log(f"[{pr_no}] Cleanup complete — all pipeline tables cleared")
+        self._safe_log(f"[{pr_no}] Cleanup complete — all pipeline tables cleared")
 
     def _reset_for_reprocess(self, tgt_cs: str, pr_no: str) -> None:
         conn = self._connect(tgt_cs)
@@ -5551,7 +5584,7 @@ class PipelineStage123Node(Node):
                  WHERE purchase_req_no = ?
             """, pr_no)
             conn.commit()
-            self.log(f"[{pr_no}] Tracker reset for reprocess")
+            self._safe_log(f"[{pr_no}] Tracker reset for reprocess")
         finally:
             conn.close()
 
@@ -5687,7 +5720,7 @@ class PipelineStage123Node(Node):
             try:
                 result = operation()
                 if attempt > 0:
-                    self.log(
+                    self._safe_log(
                         f"[{pr_no}] {op_name} recovered after {attempt} retry/retries"
                     )
                 return result
@@ -5695,7 +5728,7 @@ class PipelineStage123Node(Node):
                 if not _is_deadlock_error(exc):
                     raise
                 if attempt >= max_retries:
-                    self.log(
+                    self._safe_log(
                         f"[{pr_no}] {op_name} — DEADLOCK retries exhausted "
                         f"(gave up after {max_retries + 1} attempt(s)): {exc}"
                     )
@@ -5706,7 +5739,7 @@ class PipelineStage123Node(Node):
                     raise
                 attempt += 1
                 delay = base_delay * (2 ** attempt) * (1 + random.random() * 0.3)
-                self.log(
+                self._safe_log(
                     f"[{pr_no}] {op_name} — DEADLOCK victim "
                     f"(attempt {attempt}/{max_retries}) — "
                     f"sleeping {delay:.1f}s then retrying"
@@ -5888,7 +5921,7 @@ class PipelineStage123Node(Node):
                 tc.fast_executemany = True
                 tc.executemany(ins_sql, [list(r) for r in rows])
             tgt_conn.commit()
-            self.log(
+            self._safe_log(
                 f"[{pr_no}] BI dashboard synced — "
                 f"deleted {deleted}, inserted {len(rows)} row(s)"
             )
@@ -5927,7 +5960,7 @@ class PipelineStage123Node(Node):
         _BATCH = 256
         for i in range(0, len(blobs), _BATCH):
             cc.delete_blobs(*blobs[i : i + _BATCH])
-        self.log(f"[{pr_no}] Deleted {len(blobs)} blob(s) from {prefix}")
+        self._safe_log(f"[{pr_no}] Deleted {len(blobs)} blob(s) from {prefix}")
 
     def _upload_blob(self, raw: bytes, blob_path: str) -> None:
         self._container_client().get_blob_client(blob_path).upload_blob(raw, overwrite=True)
@@ -5972,12 +6005,12 @@ class PipelineStage123Node(Node):
                          WHERE purchase_req_no  = ?
                     """, pr_no)
                 conn.commit()
-                self.log(f"Source-change detection: re-queued {len(changed)} PR(s) — {changed}")
+                self._safe_log(f"Source-change detection: re-queued {len(changed)} PR(s) — {changed}")
                 return len(changed)
             finally:
                 conn.close()
         except Exception as exc:
-            self.log(f"Warning — source-change detection failed (non-fatal): {exc}")
+            self._safe_log(f"Warning — source-change detection failed (non-fatal): {exc}")
             return 0
 
     # ── Full-pipeline continuation (stages 4-8) ──────────────────────────
@@ -6060,10 +6093,10 @@ class PipelineStage123Node(Node):
 
         try:
             # Stage 4 — Classification
-            self.log(f"[{pr_no}] Stage 4 — classifying attachments…")
+            self._safe_log(f"[{pr_no}] Stage 4 — classifying attachments…")
             _run_classification(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
             self._advance_tracker(tgt_cs, pr_no, _STAGE_CLASSIFICATION)
-            self.log(f"[{pr_no}] Stage 4 — classification complete")
+            self._safe_log(f"[{pr_no}] Stage 4 — classification complete")
 
             # Stage 5 — Extraction
             # Raises an ExtractionAbortError subclass (NoQuotationFoundError,
@@ -6072,17 +6105,17 @@ class PipelineStage123Node(Node):
             # an expected outcome — records ras_pipeline_exceptions, sets
             # tracker.current_stage_fk = 99, and skips stages 6/7/8.
             current_stage = _STAGE_EXTRACTION
-            self.log(f"[{pr_no}] Stage 5 — extracting quotation items…")
+            self._safe_log(f"[{pr_no}] Stage 5 — extracting quotation items…")
             n_items = _run_extraction(self.llm, tgt_cs, blob_cfg, pr_no, prompts)
             self._advance_tracker(tgt_cs, pr_no, _STAGE_EXTRACTION)
-            self.log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
+            self._safe_log(f"[{pr_no}] Stage 5 — {n_items} item(s) extracted")
 
             # Stage 6 — Embeddings
             current_stage = _STAGE_EMBEDDINGS
             _run_embeddings(tgt_cs, pr_no, self.embed_model,
                             self.pinecone_index, self.pinecone_namespace)
             self._advance_tracker(tgt_cs, pr_no, _STAGE_EMBEDDINGS)
-            self.log(f"[{pr_no}] Stage 6 — embeddings done")
+            self._safe_log(f"[{pr_no}] Stage 6 — embeddings done")
 
             # Stage 7 — Benchmark
             current_stage = _STAGE_PRICE_BENCHMARK
@@ -6090,7 +6123,7 @@ class PipelineStage123Node(Node):
                            self.pinecone_index, self.pinecone_namespace, top_k,
                            prompts=prompts)
             self._advance_tracker(tgt_cs, pr_no, _STAGE_PRICE_BENCHMARK)
-            self.log(f"[{pr_no}] Stage 7 — benchmark done")
+            self._safe_log(f"[{pr_no}] Stage 7 — benchmark done")
 
             # Stage 8 — Complete
             self._advance_tracker(tgt_cs, pr_no, _STAGE_COMPLETE)
@@ -6102,7 +6135,7 @@ class PipelineStage123Node(Node):
                 op_name="set_last_processed_at",
                 pr_no=pr_no,
             )
-            self.log(f"[{pr_no}] Stage 8 — pipeline complete")
+            self._safe_log(f"[{pr_no}] Stage 8 — pipeline complete")
             result["status"] = "complete"
 
         except ExtractionAbortError as exc:
@@ -6112,7 +6145,7 @@ class PipelineStage123Node(Node):
             # record in ras_pipeline_exceptions with stage_id=5, set
             # tracker=99 (EXCEPTION), and stop — stages 6/7/8 do not run.
             reason = type(exc).__name__
-            self.log(f"[{pr_no}] Stage 5 (Extraction) — {reason}: {exc}")
+            self._safe_log(f"[{pr_no}] Stage 5 (Extraction) — {reason}: {exc}")
             logger.warning("[{}] Stage 5 (Extraction) — {}: {}", pr_no, reason, exc)
             result["status"] = f"failed_{reason}"
             result["error"]  = f"Stage 5 (Extraction) — {reason}: {exc}"
@@ -6147,7 +6180,7 @@ class PipelineStage123Node(Node):
         result        = {"pr_no": pr_no, "files": [], "status": "failed", "error": ""}
         current_stage = _STAGE_INGESTION
         work_dir      = tempfile.mkdtemp()
-        self.log(f"[{pr_no}] Worker started — work_dir={work_dir}")
+        self._safe_log(f"[{pr_no}] Worker started — work_dir={work_dir}")
 
         # Excel mode: each worker first checks the tracker and short-circuits
         # if the PR is already at stage 8 (COMPLETE) so we do not redo work.
@@ -6159,12 +6192,12 @@ class PipelineStage123Node(Node):
             except Exception as exc:
                 # Failure to check stage is non-fatal — we proceed with full
                 # processing rather than skipping a PR we shouldn't have.
-                self.log(
+                self._safe_log(
                     f"[{pr_no}] Stage check failed (will process anyway): {exc}"
                 )
                 stage_now = -1
             if stage_now == _STAGE_COMPLETE:
-                self.log(
+                self._safe_log(
                     f"[{pr_no}] Already at stage {_STAGE_COMPLETE} (COMPLETE) "
                     f"— skipping (no cleanup, no reprocess)"
                 )
@@ -6186,7 +6219,7 @@ class PipelineStage123Node(Node):
             # can cause one transaction to be picked as the deadlock victim;
             # SQL Server explicitly asks us to rerun, so we do — with
             # exponential backoff and jitter to spread retries.
-            self.log(f"[{pr_no}] Pre-run cleanup check…")
+            self._safe_log(f"[{pr_no}] Pre-run cleanup check…")
             try:
                 self._run_with_deadlock_retry(
                     lambda: self._cleanup_for_pr(tgt_cs, pr_no),
@@ -6209,38 +6242,38 @@ class PipelineStage123Node(Node):
 
             # Stage 1 — INGESTION
             current_stage = _STAGE_INGESTION
-            self.log(f"[{pr_no}] Stage 1 — INGESTION starting…")
+            self._safe_log(f"[{pr_no}] Stage 1 — INGESTION starting…")
             self._advance_tracker(tgt_cs, pr_no, _STAGE_INGESTION)
 
             ras_uuid    = self._get_tracker_uuid(tgt_cs, pr_no)
-            self.log(f"[{pr_no}] Stage 1 — tracker uuid={ras_uuid}, fetching on-prem attachments…")
+            self._safe_log(f"[{pr_no}] Stage 1 — tracker uuid={ras_uuid}, fetching on-prem attachments…")
             attachments = self._fetch_attachments(src_cs, tgt_cs, pr_no)
             total_bytes = sum(len(a.get("content", b"")) for a in attachments)
-            self.log(
+            self._safe_log(
                 f"[{pr_no}] Stage 1 — fetched {len(attachments)} attachment(s) "
                 f"({total_bytes / 1024:.1f} KB total)"
             )
 
             # BI dashboard sync: read on-prem view → refresh Azure row.
             # Non-fatal — log and continue if it fails.
-            self.log(f"[{pr_no}] Stage 1 — syncing BI dashboard row…")
+            self._safe_log(f"[{pr_no}] Stage 1 — syncing BI dashboard row…")
             try:
                 self._sync_bi_dashboard(src_cs, tgt_cs, pr_no)
             except Exception as _bi_exc:
-                self.log(f"[{pr_no}] Warning — BI dashboard sync failed (non-fatal): {_bi_exc}")
+                self._safe_log(f"[{pr_no}] Warning — BI dashboard sync failed (non-fatal): {_bi_exc}")
 
             if not attachments:
-                self.log(f"[{pr_no}] No attachments — skipping (PR has no on-prem files)")
+                self._safe_log(f"[{pr_no}] No attachments — skipping (PR has no on-prem files)")
                 result["status"] = "skipped"
                 return result
 
-            self.log(f"[{pr_no}] Stage 1 — INGESTION complete")
+            self._safe_log(f"[{pr_no}] Stage 1 — INGESTION complete")
 
             safe_pr  = pr_no.replace("/", "_")
             extractor = FileExtractor()
             all_files = []   # dicts: filename, content, blob_path, att_id, is_embedded
 
-            self.log(
+            self._safe_log(
                 f"[{pr_no}] Stage 2 — EMBED_DOC_EXTRACTION starting "
                 f"({len(attachments)} parent attachment(s) to scan for embeds)…"
             )
@@ -6261,7 +6294,7 @@ class PipelineStage123Node(Node):
 
                     parent_size_kb = len(att["content"]) / 1024
                     parent_ext     = os.path.splitext(att["filename"])[1].lower() or "<no-ext>"
-                    self.log(
+                    self._safe_log(
                         f"[{pr_no}] [{att_idx}/{len(attachments)}] [{att_id}] "
                         f"{att['filename']} ({parent_size_kb:.1f} KB, {parent_ext}) "
                         f"— scanning for embedded docs"
@@ -6279,7 +6312,7 @@ class PipelineStage123Node(Node):
                     # blob, but its contents flow through as embedded files.
                     extractor.parent_prefix = os.path.splitext(att["filename"])[0]
                     if att["filename"].lower().endswith(ARCHIVE_EXTENSIONS):
-                        self.log(
+                        self._safe_log(
                             f"[{pr_no}] [{att_id}] expanding archive "
                             f"{att['filename']!r} into embedded set"
                         )
@@ -6339,7 +6372,7 @@ class PipelineStage123Node(Node):
                         "is_embedded": False,
                     })
                     all_files.extend(embedded)
-                    self.log(f"[{pr_no}] [{att_id}] {att['filename']} — {len(embedded)} embedded file(s) extracted")
+                    self._safe_log(f"[{pr_no}] [{att_id}] {att['filename']} — {len(embedded)} embedded file(s) extracted")
 
                 except Exception as att_exc:
                     # Log and continue — one bad attachment must not block the whole PR.
@@ -6351,21 +6384,21 @@ class PipelineStage123Node(Node):
                     failed_atts.append(f"{att_id}({att.get('filename','?')}): {att_exc}")
 
             if failed_atts:
-                self.log(f"[{pr_no}] {len(failed_atts)} attachment(s) skipped due to errors: {'; '.join(failed_atts)}")
+                self._safe_log(f"[{pr_no}] {len(failed_atts)} attachment(s) skipped due to errors: {'; '.join(failed_atts)}")
 
             # Stage 2 — EMBED_DOC_EXTRACTION
             current_stage = _STAGE_EMBED_DOC
             parent_count   = sum(1 for f in all_files if not f["is_embedded"])
             embedded_count = sum(1 for f in all_files if f["is_embedded"])
             self._advance_tracker(tgt_cs, pr_no, _STAGE_EMBED_DOC)
-            self.log(
+            self._safe_log(
                 f"[{pr_no}] Stage 2 — EMBED_DOC_EXTRACTION complete "
                 f"({parent_count} parent + {embedded_count} embedded = {len(all_files)} total file(s))"
             )
 
             # Stage 3 — BLOB_UPLOAD
             current_stage = _STAGE_BLOB_UPLOAD
-            self.log(f"[{pr_no}] Stage 3 — BLOB_UPLOAD starting ({len(all_files)} file(s) → Azure Blob)…")
+            self._safe_log(f"[{pr_no}] Stage 3 — BLOB_UPLOAD starting ({len(all_files)} file(s) → Azure Blob)…")
 
             # Upload all files to blob + build text batch
             file_data = []
@@ -6387,7 +6420,7 @@ class PipelineStage123Node(Node):
                         or upload_idx == 1
                         or upload_idx == len(all_files)
                         or f_size > 1_000_000):
-                    self.log(
+                    self._safe_log(
                         f"[{pr_no}] Stage 3 — uploaded {upload_idx}/{len(all_files)}: "
                         f"{f_info['filename']} ({f_size / 1024:.1f} KB)"
                     )
@@ -6408,7 +6441,7 @@ class PipelineStage123Node(Node):
                 })
 
             self._advance_tracker(tgt_cs, pr_no, _STAGE_BLOB_UPLOAD)
-            self.log(
+            self._safe_log(
                 f"[{pr_no}] Stage 3 — BLOB_UPLOAD complete "
                 f"({len(file_data)} file(s), {uploaded_bytes / 1024:.1f} KB total)"
             )
@@ -6439,11 +6472,95 @@ class PipelineStage123Node(Node):
     # ── Entry point ───────────────────────────────────────────────────────
 
     def build_file_batch(self) -> Message:
+        """Fire-and-forget entry point.
+
+        Returns immediately with a "started" Message so the AgentCore SSE
+        stream closes well before the AKS ingress 300s idle timeout. The
+        actual pipeline (stages 1-8 per PR) runs in a daemon thread and logs
+        progress via loguru / ras_tracker. Frontend can poll
+        `ras_procurement.ras_tracker` to see per-PR stage advancement.
+        """
+        import threading, uuid
+
         if hasattr(self, "_cached_result"):
             return self._cached_result
 
-        src_cs    = self._conn_str(self.source_connection)
-        tgt_cs    = self._conn_str(self.target_connection)
+        # Stamp the main thread so _safe_log can distinguish it from the bg
+        # daemon thread (which has no AgentCore component context).
+        self._main_thread_id = threading.get_ident()
+
+        # Resolve connection strings up-front in the main thread so any
+        # config error fails fast with a readable message rather than dying
+        # silently in the background.
+        try:
+            src_cs = self._conn_str(self.source_connection)
+            tgt_cs = self._conn_str(self.target_connection)
+        except Exception as exc:
+            msg = Message(text=f"❌ Connection config error: {exc}")
+            self._cached_result    = msg
+            self._cached_pr_numbers = []
+            return msg
+
+        # Smoke-test both DB connections — fail fast with a clear message
+        # before kicking off the background run.
+        for label, cs in (("source", src_cs), ("target", tgt_cs)):
+            try:
+                c = self._connect(cs); c.close()
+            except Exception as exc:
+                msg = Message(text=f"❌ Cannot connect to {label} DB: {exc}")
+                self._cached_result    = msg
+                self._cached_pr_numbers = []
+                return msg
+
+        job_id = str(uuid.uuid4())[:8]
+
+        def _bg_run() -> None:
+            try:
+                self._run_full_pipeline(src_cs, tgt_cs, job_id)
+            except Exception as exc:
+                logger.opt(exception=True).error(
+                    f"[pipeline job={job_id}] failed: {exc}"
+                )
+
+        t = threading.Thread(
+            target=_bg_run, daemon=True, name=f"pipeline-{job_id}"
+        )
+        t.start()
+
+        self._safe_log(
+            f"Pipeline started in background | job={job_id} | "
+            f"workers={self.parallel_workers}"
+        )
+
+        msg = Message(text=(
+            f"✅ Pipeline started in background.\n"
+            f"Job ID: {job_id}\n"
+            f"Workers: {self.parallel_workers}\n\n"
+            f"Stages 1-8 are running for each pending PR. Progress can be "
+            f"monitored in `ras_procurement.ras_tracker` (current_stage_fk "
+            f"advances 1 → 8; failures land at 99). Detailed per-PR logs "
+            f"are visible in the AgentCore server logs (filter on "
+            f"`[pipeline job={job_id}]`)."
+        ))
+        self._cached_result    = msg
+        self._cached_pr_numbers = []
+        return msg
+
+    def _run_full_pipeline(self, src_cs: str, tgt_cs: str, job_id: str) -> None:
+        """Heavy lifting — runs in the daemon thread spawned by
+        build_file_batch. All logs in this method (and everything it calls)
+        route through loguru since `_main_thread_id` no longer matches.
+
+        Logging convention (so a single run can be traced with `grep`):
+            [pipeline job=XXXXXXXX] <message>
+        Filter the AgentCore server log with the literal job id printed in
+        the "started" chat message and you will see the full timeline:
+        start → mode + PR count → per-PR completions → final summary.
+        """
+        import time
+        t_start = time.time()
+        tag = f"[pipeline job={job_id}]"
+        logger.info(f"{tag} starting")
         pr_filter = (self.pr_no_filter or "").strip()
 
         # Source resolution order:
@@ -6456,12 +6573,10 @@ class PipelineStage123Node(Node):
             try:
                 excel_pr_list = self._resolve_excel_pr_list()
             except Exception as exc:
-                msg_text = f"[Excel PR list could not be read: {exc}]"
-                self.log(msg_text)
-                msg = Message(text=msg_text)
-                self._cached_result = msg
-                self._cached_pr_numbers = []
-                return msg
+                logger.error(
+                    f"[pipeline job={job_id}] Excel PR list could not be read: {exc}"
+                )
+                return
 
         # Detect completed PRs whose on-prem source data changed (U_DATETIME >
         # last_processed_at) and reset them to stage 1 so they are re-processed
@@ -6479,15 +6594,19 @@ class PipelineStage123Node(Node):
             run_mode = "single" if pr_filter else "pending"
 
         if not pr_list:
-            text = (
-                "[Excel PR list was empty — nothing to process]"
+            reason = (
+                "Excel PR list was empty"
                 if run_mode == "excel"
-                else "[No pending PRs to process]"
+                else "no pending PRs to process"
             )
-            msg = Message(text=text)
-            self._cached_result = msg
-            self._cached_pr_numbers = []
-            return msg
+            elapsed = time.time() - t_start
+            logger.info(f"{tag} done — {reason} (elapsed {elapsed:.1f}s)")
+            return
+
+        logger.info(
+            f"{tag} resolved {len(pr_list)} PR(s) | mode={run_mode} | "
+            f"first={pr_list[0]!r} last={pr_list[-1]!r}"
+        )
 
         if pr_filter:
             # Single-PR mode = explicit force reprocess regardless of state.
@@ -6495,7 +6614,7 @@ class PipelineStage123Node(Node):
             # picks it up cleanly. Actual data cleanup (blobs, Pinecone, DB tables)
             # happens inside _process_pr at the start via _cleanup_for_pr.
             self._reset_for_reprocess(tgt_cs, pr_filter)
-            self.log(f"Single-PR reprocess: {pr_filter!r} — tracker reset, cleanup will run at processing start")
+            self._safe_log(f"Single-PR reprocess: {pr_filter!r} — tracker reset, cleanup will run at processing start")
         elif run_mode == "excel":
             # Excel mode = workers self-filter inside _process_pr via
             # skip_if_complete=True. No serial pre-pass: stage-8 check
@@ -6510,28 +6629,32 @@ class PipelineStage123Node(Node):
             try:
                 sorted_excel = self._sort_excel_pr_list_by_date(tgt_cs, pr_list)
                 if sorted_excel != pr_list:
-                    self.log(
+                    self._safe_log(
                         f"Excel — reordered {len(sorted_excel)} PR(s) by "
                         f"C_DATETIME ASC (oldest first) so historical "
                         f"context is in Pinecone before newer PRs hit Stage 7"
                     )
                     pr_list = sorted_excel
                 else:
-                    self.log("Excel — PR list already in C_DATETIME ASC order")
+                    self._safe_log("Excel — PR list already in C_DATETIME ASC order")
             except Exception as exc:
                 # Non-fatal: if sort fails (e.g. DB hiccup), fall back to
                 # original Excel order rather than aborting the run.
-                self.log(f"Excel — date sort skipped (non-fatal): {exc}")
+                self._safe_log(f"Excel — date sort skipped (non-fatal): {exc}")
 
-            self.log(
+            self._safe_log(
                 f"Excel-driven run: {len(pr_list)} PR(s) queued — "
                 f"each worker will skip if already at stage {_STAGE_COMPLETE}"
             )
 
         workers = max(1, int(self.parallel_workers))
-        self.log(
+        self._safe_log(
             f"Processing {len(pr_list)} PR(s) [mode={run_mode}] "
             f"with {workers} parallel worker(s)…"
+        )
+        logger.info(
+            f"{tag} fan-out begins — {len(pr_list)} PR(s), "
+            f"{workers} parallel worker(s)"
         )
 
         # Pre-warm shared caches before threads start so all workers reuse the
@@ -6547,6 +6670,7 @@ class PipelineStage123Node(Node):
 
         import concurrent.futures
         results: list[dict] = []
+        total = len(pr_list)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
@@ -6555,28 +6679,25 @@ class PipelineStage123Node(Node):
                 ): pr
                 for pr in pr_list
             }
+            completed = 0
             for f in concurrent.futures.as_completed(futures):
-                results.append(f.result())
-
-        parts: list[str] = []
-        for r in results:
-            for fd in r.get("files", []):
-                label = f"{fd['filename']} (PR: {fd['pr_no']}, att_id: {fd['att_id']}"
-                label += ", embedded" if fd["is_embedded"] else ", parent"
-                label += ")"
-                parts.append(
-                    f"=== FILE: {label} ===\n"
-                    f"============================================================\n"
-                    f"FILE METADATA\n"
-                    f"============================================================\n"
-                    f"Filename: {fd['filename']}\n"
-                    f"File Type: {fd['file_type']}\n"
-                    f"{fd['extra']}"
-                    f"============================================================\n"
-                    f"EXTRACTED CONTENT\n"
-                    f"============================================================\n"
-                    f"{fd['text']}\n"
-                    f"============================================================\n\n"
+                pr_no = futures[f]
+                try:
+                    res = f.result()
+                except Exception as exc:
+                    res = {"pr_no": pr_no, "files": [], "status": "failed",
+                           "error": f"worker raised: {exc}"}
+                    logger.opt(exception=True).error(
+                        f"{tag} [{pr_no}] worker raised unhandled exception"
+                    )
+                results.append(res)
+                completed += 1
+                status = res.get("status", "failed")
+                err = res.get("error") or ""
+                err_suffix = f" — {err}" if err else ""
+                logger.info(
+                    f"{tag} progress {completed}/{total} | "
+                    f"[{pr_no}] {status}{err_suffix}"
                 )
 
         # Summary log — one line per status bucket. The "already_complete"
@@ -6588,19 +6709,27 @@ class PipelineStage123Node(Node):
             s = r.get("status", "failed")
             status_counts[s] = status_counts.get(s, 0) + 1
         summary_parts = [f"{v} {k}" for k, v in sorted(status_counts.items())]
-        self.log(f"Run complete — {len(results)} PR(s): {', '.join(summary_parts)}")
+        elapsed = time.time() - t_start
+        rate = (len(results) / elapsed) if elapsed > 0 else 0.0
+        logger.info(
+            f"{tag} RUN COMPLETE — {len(results)} PR(s) in {elapsed:.1f}s "
+            f"({rate:.2f} PR/s) | {', '.join(summary_parts)}"
+        )
         for r in results:
             if r.get("error"):
-                self.log(f"  [{r['pr_no']}] {r['status']}: {r['error']}")
+                logger.warning(
+                    f"{tag} [{r['pr_no']}] {r['status']}: {r['error']}"
+                )
 
-        batch_text = "".join(parts) if parts else "[No files extracted]"
-        msg = Message(text=batch_text)
-        self._cached_result = msg
+        # Late-update _cached_pr_numbers so any poll of get_processed_prs()
+        # after the run finishes returns the actual processed list. The
+        # frontend-facing _cached_result Message was already set in
+        # build_file_batch when the daemon was spawned and is not overwritten.
         self._cached_pr_numbers = [
             r["pr_no"] for r in results
             if r.get("status") in ("complete", "success", "skipped")
         ]
-        return msg
+        return
 
     def get_processed_prs(self) -> Data:
         """Returns the PR numbers that reached stage 3 in this run.
