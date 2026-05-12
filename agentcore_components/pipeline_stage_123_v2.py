@@ -53,6 +53,219 @@ _STAGE_BLOB_UPLOAD = 3
 _STAGE_EXCEPTION  = 99
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection pool — keeps total concurrent DB connections below Azure SQL's
+# per-DB cap (Standard tier defaults: ~75-100 concurrent sessions). Without
+# this, parallel PR workers × inner Stage 4 classification pool ×
+# per-helper _connect() calls would each open their own TCP connection and
+# trip "max connections reached" on Azure side.
+#
+# How it works:
+#   • Bounded — `max_size` caps concurrent OPEN connections globally
+#     (idle + busy combined). New requests block on threading.Condition()
+#     until a slot frees instead of opening yet another socket.
+#   • Reuse — idle connections are checked back in on .close() and handed
+#     to the next acquirer (validated with SELECT 1; stale ones are
+#     discarded silently).
+#   • Per-cs partitioning — different connection strings (source vs target,
+#     different DBs) don't compete; idle entries are tagged with their cs
+#     and only returned to acquirers asking for the same one.
+#   • Transparent close() — _PooledConnection.close() returns the underlying
+#     connection to the pool. Existing `conn.close()` calls in finally
+#     blocks throughout the file Just Work.
+#   • Failure-aware — a connection that raised an exception in cursor() /
+#     commit() / rollback() is marked broken and discarded on release
+#     instead of being recycled.
+#
+# Defaults: max_size=20, login_timeout=30. Resized at startup via the
+# canvas knob `max_db_connections` (see PipelineStage123NodeV2.inputs).
+# ─────────────────────────────────────────────────────────────────────────────
+
+import queue as _queue_mod
+import threading as _threading
+
+_DEFAULT_POOL_SIZE = 20
+
+
+class _PooledConnection:
+    """Wraps a pyodbc.Connection so .close() returns it to the pool
+    instead of tearing down the socket. Forwards every other attribute /
+    method to the underlying connection, marking the wrapper broken if
+    cursor/commit/rollback raise so it won't be recycled."""
+
+    __slots__ = ("_pool", "_cs", "_raw", "_broken")
+
+    def __init__(self, pool: "_ConnectionPool", cs: str, raw: Any) -> None:
+        object.__setattr__(self, "_pool",    pool)
+        object.__setattr__(self, "_cs",      cs)
+        object.__setattr__(self, "_raw",     raw)
+        object.__setattr__(self, "_broken",  False)
+
+    def cursor(self, *args, **kwargs):
+        try:
+            return self._raw.cursor(*args, **kwargs)
+        except Exception:
+            object.__setattr__(self, "_broken", True)
+            raise
+
+    def commit(self):
+        try:
+            return self._raw.commit()
+        except Exception:
+            object.__setattr__(self, "_broken", True)
+            raise
+
+    def rollback(self):
+        try:
+            return self._raw.rollback()
+        except Exception:
+            object.__setattr__(self, "_broken", True)
+            raise
+
+    def close(self) -> None:
+        raw = self._raw
+        if raw is None:
+            return
+        object.__setattr__(self, "_raw", None)
+        self._pool.release(raw, self._cs, broken=self._broken)
+
+    def __getattr__(self, name):
+        raw = object.__getattribute__(self, "_raw")
+        if raw is None:
+            raise AttributeError(f"Pooled connection is closed (attr '{name}')")
+        return getattr(raw, name)
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+        else:
+            raw = object.__getattribute__(self, "_raw")
+            if raw is None:
+                raise AttributeError(f"Pooled connection is closed (attr '{name}')")
+            setattr(raw, name, value)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc is not None:
+            object.__setattr__(self, "_broken", True)
+        self.close()
+        return False
+
+
+class _ConnectionPool:
+    """Thread-safe bounded connection pool for pyodbc. See header comment
+    above for full behaviour."""
+
+    def __init__(self, max_size: int = _DEFAULT_POOL_SIZE) -> None:
+        self.max_size = max(1, int(max_size))
+        self._idle: _queue_mod.Queue = _queue_mod.Queue()
+        self._busy = 0
+        self._cv   = _threading.Condition()
+        self._opened_total = 0
+        self._reused_total = 0
+
+    def resize(self, new_max: int) -> None:
+        """Change the cap. Existing checkouts continue to count; new acquires
+        respect the new cap immediately."""
+        with self._cv:
+            self.max_size = max(1, int(new_max))
+            self._cv.notify_all()
+
+    def stats(self) -> dict:
+        with self._cv:
+            return {
+                "max_size":     self.max_size,
+                "busy":         self._busy,
+                "idle":         self._idle.qsize(),
+                "opened_total": self._opened_total,
+                "reused_total": self._reused_total,
+            }
+
+    def _acquire_slot(self) -> None:
+        with self._cv:
+            while self._busy >= self.max_size:
+                self._cv.wait()
+            self._busy += 1
+
+    def _release_slot(self) -> None:
+        with self._cv:
+            self._busy -= 1
+            self._cv.notify()
+
+    def acquire(self, cs: str, *, login_timeout: int = 30) -> _PooledConnection:
+        """Get a connection (from idle pool or fresh). Caller must call
+        .close() on the returned wrapper — that returns it to the pool."""
+        self._acquire_slot()
+        # Try idle reuse first — drain stale and wrong-cs entries
+        try:
+            while True:
+                try:
+                    cached_cs, conn = self._idle.get_nowait()
+                except _queue_mod.Empty:
+                    break
+                if cached_cs != cs:
+                    # Different connection string parked here — close and try next
+                    try: conn.close()
+                    except Exception: pass
+                    continue
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                    cur.close()
+                    with self._cv:
+                        self._reused_total += 1
+                    return _PooledConnection(self, cs, conn)
+                except Exception:
+                    # Stale — discard and try next idle entry
+                    try: conn.close()
+                    except Exception: pass
+                    continue
+            # No idle entry — open a fresh one
+            import pyodbc
+            raw = pyodbc.connect(cs, timeout=login_timeout)
+            with self._cv:
+                self._opened_total += 1
+            return _PooledConnection(self, cs, raw)
+        except Exception:
+            self._release_slot()
+            raise
+
+    def release(self, conn: Any, cs: str, *, broken: bool = False) -> None:
+        """Return a connection to the pool; close + free slot if broken."""
+        if conn is None:
+            self._release_slot()
+            return
+        if broken:
+            try: conn.close()
+            except Exception: pass
+            self._release_slot()
+            return
+        try:
+            self._idle.put_nowait((cs, conn))
+        except _queue_mod.Full:
+            try: conn.close()
+            except Exception: pass
+        finally:
+            self._release_slot()
+
+
+# Global pool — sized at startup from the canvas knob max_db_connections.
+# Module-level so the same pool is shared across all PR workers.
+_CONN_POOL = _ConnectionPool(max_size=_DEFAULT_POOL_SIZE)
+
+# Belt-and-suspenders — also enable ODBC driver-manager pooling so that
+# anything that bypasses _CONN_POOL (third-party libs that import pyodbc
+# directly) still benefits from lower-level reuse.
+try:
+    import pyodbc as _pyodbc_for_pooling
+    _pyodbc_for_pooling.pooling = True
+except Exception:
+    pass
+
+
 class ExtractionAbortError(RuntimeError):
     """Raised when Stage 5 (Extraction) cannot produce any items.
 
@@ -1660,10 +1873,13 @@ def _is_deadlock_error(exc: Exception) -> bool:
 
 
 def _connect(cs: str):
-    import pyodbc
+    """Get a pooled DB connection. The returned object behaves like a normal
+    pyodbc.Connection — .cursor() / .commit() / .rollback() / .close() all
+    work — but .close() returns it to the shared _CONN_POOL instead of
+    tearing down the socket. Retries on transient errors before giving up."""
     for attempt in range(_MAX_RETRIES + 1):
         try:
-            return pyodbc.connect(cs, timeout=30)
+            return _CONN_POOL.acquire(cs, login_timeout=30)
         except Exception as exc:
             if not _is_transient(exc) or attempt == _MAX_RETRIES:
                 raise
@@ -6255,6 +6471,23 @@ class PipelineStage123NodeV2(Node):
                 "pressure on top of the parallel_workers setting."
             ),
         ),
+        # ── DB connection pool ────────────────────────────────────────────
+        IntInput(
+            name="max_db_connections",
+            display_name="Max DB Connections (Pool Size)",
+            value=20,
+            advanced=True,
+            info=(
+                "Hard cap on concurrent SQL Server connections opened by this Node. "
+                "Connections are pooled and reused — idle ones go back to the pool "
+                "on .close() instead of being torn down. Sized below Azure SQL's "
+                "per-DB session cap (typically 75-100 on Standard tiers). Increase "
+                "only if you see worker threads blocking on connection acquire; "
+                "decrease if Azure reports 'maximum number of connections' errors. "
+                "Default 20 is safe for 4 parallel workers × 8 inner classification "
+                "threads."
+            ),
+        ),
         # ── V2 benchmark tuning ────────────────────────────────────────────
         IntInput(
             name="bench_sql_pool_size",
@@ -6409,15 +6642,10 @@ class PipelineStage123NodeV2(Node):
         return any(k in str(exc).lower() for k in kw)
 
     def _connect(self, conn_str: str):
-        import pyodbc, random, time
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                return pyodbc.connect(conn_str, timeout=30)
-            except Exception as exc:
-                if not self._is_transient(exc) or attempt == _MAX_RETRIES:
-                    raise
-                time.sleep(_BASE_DELAY * (2 ** attempt) * (1 + random.random() * 0.2))
-        raise RuntimeError("unreachable")
+        """Delegate to the module-level pool-backed _connect so the Node's
+        own _connect calls share the same connection budget as every other
+        helper in this file."""
+        return _connect(conn_str)
 
     def _blob_cfg(self) -> dict:
         if not hasattr(self, "_blob_config_cache"):
@@ -7755,6 +7983,19 @@ class PipelineStage123NodeV2(Node):
         # daemon thread (which has no AgentCore component context).
         self._main_thread_id = threading.get_ident()
 
+        # Resize the connection pool from the canvas knob BEFORE any
+        # _connect() call fires. Default 20; user can raise/lower per-Node.
+        try:
+            pool_max = int(getattr(self, "max_db_connections", None) or _DEFAULT_POOL_SIZE)
+        except Exception:
+            pool_max = _DEFAULT_POOL_SIZE
+        if pool_max != _CONN_POOL.max_size:
+            _CONN_POOL.resize(pool_max)
+        logger.info(
+            "V2 connection pool ready | max={} (idle={}, busy={})",
+            _CONN_POOL.max_size, _CONN_POOL.stats()["idle"], _CONN_POOL.stats()["busy"],
+        )
+
         # Resolve connection strings up-front in the main thread so any
         # config error fails fast with a readable message rather than dying
         # silently in the background.
@@ -7767,16 +8008,98 @@ class PipelineStage123NodeV2(Node):
             self._cached_pr_numbers = []
             return msg
 
-        # Smoke-test both DB connections — fail fast with a clear message
-        # before kicking off the background run.
-        for label, cs in (("source", src_cs), ("target", tgt_cs)):
-            try:
-                c = self._connect(cs); c.close()
-            except Exception as exc:
-                msg = Message(text=f"❌ Cannot connect to {label} DB: {exc}")
-                self._cached_result    = msg
-                self._cached_pr_numbers = []
-                return msg
+        # Smoke-test both DB connections IN PARALLEL — source is on-prem
+        # (high-latency over VPN) and target is Azure SQL (low-latency).
+        # Running them sequentially via self._connect (which retries on
+        # transient errors up to 4× with 30s login timeout each) made startup
+        # wait the source DB out before even reaching the target. Probing
+        # them concurrently with a single short-timeout login means total
+        # smoke-test time is max(source, target) ≈ 5-15s instead of summing.
+        try:
+            import concurrent.futures, pyodbc
+        except Exception as exc:
+            # An ImportError here is structural (pyodbc missing) — surface it
+            # clearly instead of letting the daemon thread fail silently.
+            logger.opt(exception=True).error(f"V2 smoke-test bootstrap failed: {exc}")
+            msg = Message(text=f"❌ V2 smoke-test bootstrap failed: {exc}")
+            self._cached_result    = msg
+            self._cached_pr_numbers = []
+            return msg
+
+        def _probe_host(cs: str) -> str:
+            """Pull SERVER=… out of the connection string for log lines —
+            never logs UID/PWD."""
+            m = re.search(r"SERVER=([^;]+)", cs or "", re.IGNORECASE)
+            return m.group(1) if m else "?"
+
+        def _probe(cs: str) -> float:
+            t0 = time.time()
+            c = pyodbc.connect(cs, timeout=15)  # one-shot, no retry loop
+            c.close()
+            return time.time() - t0
+
+        smoke_t0 = time.time()
+        self._safe_log("V2 — smoke-testing source + target DB connections in parallel…")
+        logger.info(
+            "V2 smoke-test starting | source={} target={} (timeout=15s, parallel=2)",
+            _probe_host(src_cs), _probe_host(tgt_cs),
+        )
+        results: dict[str, tuple[Optional[float], Optional[Exception]]] = {
+            "source": (None, None), "target": (None, None),
+        }
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="db-probe",
+            ) as pool:
+                futures = {
+                    pool.submit(_probe, src_cs): "source",
+                    pool.submit(_probe, tgt_cs): "target",
+                }
+                for f in concurrent.futures.as_completed(futures):
+                    label = futures[f]
+                    try:
+                        dt = f.result()
+                        results[label] = (dt, None)
+                        logger.info(f"V2 smoke-test {label} OK in {dt:.2f}s")
+                    except Exception as exc:
+                        results[label] = (None, exc)
+                        logger.warning(
+                            f"V2 smoke-test {label} FAILED after "
+                            f"{time.time() - smoke_t0:.2f}s: {type(exc).__name__}: {exc}"
+                        )
+        except Exception as exc:
+            # Pool-level / scheduling failure (e.g. OS thread limit). Treat as
+            # a hard failure so the chat shows it and the daemon never starts.
+            logger.opt(exception=True).error(
+                f"V2 smoke-test pool failed before probes ran: {exc}"
+            )
+            msg = Message(text=f"❌ V2 smoke-test pool failed: {exc}")
+            self._cached_result    = msg
+            self._cached_pr_numbers = []
+            return msg
+
+        errors = [(lbl, exc) for lbl, (_, exc) in results.items() if exc is not None]
+        smoke_elapsed = time.time() - smoke_t0
+        if errors:
+            err_text = "\n".join(
+                f"❌ Cannot connect to {label} DB: {type(exc).__name__}: {exc}"
+                for label, exc in errors
+            )
+            err_text += f"\n(smoke-test took {smoke_elapsed:.2f}s)"
+            logger.error(
+                f"V2 smoke-test aborting startup — {len(errors)} probe(s) failed: "
+                f"{[lbl for lbl, _ in errors]}"
+            )
+            msg = Message(text=err_text)
+            self._cached_result    = msg
+            self._cached_pr_numbers = []
+            return msg
+        src_dt = results["source"][0] or 0.0
+        tgt_dt = results["target"][0] or 0.0
+        self._safe_log(
+            f"V2 smoke-test passed — source {src_dt:.2f}s, target {tgt_dt:.2f}s "
+            f"(wall {smoke_elapsed:.2f}s)"
+        )
 
         job_id = str(uuid.uuid4())[:8]
 
