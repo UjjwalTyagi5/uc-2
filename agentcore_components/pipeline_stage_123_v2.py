@@ -1591,7 +1591,7 @@ After listing all items, verify:
 # ── V2 constants ───────────────────────────────────────────────────────────────
 
 PURCHASE_CATEGORIES_SEED: list[str] = [
-    "Compressor", "TBE Wiring Harness", "Others", "Tooling Rubber",
+    "Compressor", "TBE Wiring Harness", "Tooling Rubber",
     "Central Portal Purchase", "IT Hardware", "Oil and Lubricants",
     "Measuring Instruments", "HVAC Air Conditioner", "Vehicle Car",
     "Group Company", "TBE Fee and Charges", "Tooling Plastic", "VMC",
@@ -5140,7 +5140,7 @@ def _parse_pr_list_from_excel_bytes(
 def _resolve_category_list(
     tgt_cs: str,
     _SEED: list = (
-        "Compressor", "TBE Wiring Harness", "Others", "Tooling Rubber",
+        "Compressor", "TBE Wiring Harness", "Tooling Rubber",
         "Central Portal Purchase", "IT Hardware", "Oil and Lubricants",
         "Measuring Instruments", "HVAC Air Conditioner", "Vehicle Car",
         "Group Company", "TBE Fee and Charges", "Tooling Plastic", "VMC",
@@ -5195,8 +5195,16 @@ def _resolve_category_list(
             conn.close()
     except Exception as exc:
         logger.warning(f"V2 _resolve_category_list — DB lookup failed: {exc}")
-    seed = {c.strip() for c in _SEED if c and c.strip()}
-    dbset = {str(c).strip() for c in db_categories if c and str(c).strip()}
+    # Filter blanks and sentinel strings ("None", "null", "n/a", "Others")
+    # so they never end up in the canonical category list passed to the LLM.
+    _DROP = {"", "none", "null", "n/a", "na", "others", "other"}
+    def _ok(v) -> bool:
+        if v is None:
+            return False
+        s = str(v).strip()
+        return bool(s) and s.lower() not in _DROP
+    seed  = {str(c).strip() for c in _SEED          if _ok(c)}
+    dbset = {str(c).strip() for c in db_categories if _ok(c)}
     combined = sorted(seed | dbset, key=str.lower)
     cache[tgt_cs] = (now, combined)
     return combined
@@ -5433,9 +5441,14 @@ def _parse_extraction_response_v2(
         # 1. purchase_category_llm — snap to canonical when case-insensitive match
         cat_canon = _normalise_category(v2_src.get("purchase_category_llm"), allowed_categories)
         if not cat_canon:
+            # Defensive fallback chain — LLM didn't emit, so fall back to the
+            # RAS purchase_category from on-prem; if that's also blank leave
+            # it as Unspecified (matches the taxonomy fallback convention).
+            # We no longer fall back to "Others" because that category was
+            # removed from the canonical list.
             cat_canon = (str(ctx.purchase_category).strip()
                          if getattr(ctx, "purchase_category", None) else "")
-            cat_canon = cat_canon or "Others"
+            cat_canon = cat_canon or "Unspecified"
             logger.warning(
                 f"[V2 PR={ctx.purchase_req_no}] dtl_id={dtl} missing purchase_category_llm — "
                 f"defaulting to {cat_canon!r}"
