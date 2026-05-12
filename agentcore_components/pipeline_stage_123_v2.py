@@ -5137,13 +5137,47 @@ def _parse_pr_list_from_excel_bytes(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_category_list(tgt_cs: str) -> list[str]:
+def _resolve_category_list(
+    tgt_cs: str,
+    _SEED: list = (
+        "Compressor", "TBE Wiring Harness", "Others", "Tooling Rubber",
+        "Central Portal Purchase", "IT Hardware", "Oil and Lubricants",
+        "Measuring Instruments", "HVAC Air Conditioner", "Vehicle Car",
+        "Group Company", "TBE Fee and Charges", "Tooling Plastic", "VMC",
+        "Storage Equipment Trolley", "Robot and Gripper", "Wiring Harness",
+        "IMM", "Pump and Motor", "TBE Negotiated by Unit and Overseas Unit",
+        "Gensets", "Environmental Chamber", "Software", "Transformer",
+        "Tooling Die Casting", "Testing", "Electrical work",
+        "Vehicle Motorcycle", "Fabrication", "CCTV", "Chillers",
+        "Service and Repair", "Tool Room Machines", "Storage Equipment",
+        "Consumable", "certification", "UPS", "Spares",
+        "Storage Equipment Racks", "Post Facto",
+        "TBE Customer and JV Partner directed", "Piping", "Electrical Panel",
+        "IMM Spares", "IMM Auxiliary", "Jigs and Fixtures", "MHE",
+        "Wire Extruder and Auxiliary Equip", "SPM", "AMC",
+        "Storage Equipment Bin", "Calibration",
+        "Fire Safety and Alarm System", "TBE Negotiated by MCO Tooling",
+        "Treatment Plant",
+    ),
+    _TTL: int = 300,
+) -> list[str]:
     """Returns the seed list UNION every distinct purchase_category_llm
     previously persisted by V2. Cached in-process for 5 min so the LLM call
-    doesn't hammer the DB on every PR. On DB error, falls back to seed list."""
+    doesn't hammer the DB on every PR. On DB error, falls back to seed list.
+
+    Hardened against MiCore Custom-Component exec contexts where module-level
+    `=` assignments may not be visible to function bodies via LOAD_GLOBAL:
+      • The cache lives on the function object (`__dict__["_cache"]`) — set
+        once on first call, never goes through LOAD_GLOBAL.
+      • The seed list is captured as a default argument at def-time, so the
+        function body never has to resolve PURCHASE_CATEGORIES_SEED from
+        module globals.
+      • TTL is the same — captured as a default arg.
+    """
+    cache = _resolve_category_list.__dict__.setdefault("_cache", {})
     now = time.time()
-    cached = _CATEGORY_CACHE.get(tgt_cs)
-    if cached and now - cached[0] < _CATEGORY_TTL_SECONDS:
+    cached = cache.get(tgt_cs)
+    if cached and now - cached[0] < _TTL:
         return cached[1]
     db_categories: list[str] = []
     try:
@@ -5161,10 +5195,10 @@ def _resolve_category_list(tgt_cs: str) -> list[str]:
             conn.close()
     except Exception as exc:
         logger.warning(f"V2 _resolve_category_list — DB lookup failed: {exc}")
-    seed = {c.strip() for c in PURCHASE_CATEGORIES_SEED if c and c.strip()}
+    seed = {c.strip() for c in _SEED if c and c.strip()}
     dbset = {str(c).strip() for c in db_categories if c and str(c).strip()}
     combined = sorted(seed | dbset, key=str.lower)
-    _CATEGORY_CACHE[tgt_cs] = (now, combined)
+    cache[tgt_cs] = (now, combined)
     return combined
 
 
