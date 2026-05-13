@@ -6772,7 +6772,7 @@ class PipelineStage123NodeV2(Node):
         MessageTextInput(
             name="bench_min_similarity",
             display_name="Benchmark Min Similarity (Stage 7)",
-            value="0.70",
+            value="0.80",
             advanced=True,
             info=(
                 "Minimum cosine similarity (0.0–1.0) for a Pinecone match to count "
@@ -6947,7 +6947,7 @@ class PipelineStage123NodeV2(Node):
         IntInput(
             name="bench_critical_threshold_pct",
             display_name="V2 — Critical Attribute Threshold (%)",
-            value=25,
+            value=10,
             advanced=True,
             info=(
                 "Stage C rejects a candidate if any \"critical\" attribute differs "
