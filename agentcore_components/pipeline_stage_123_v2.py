@@ -5318,12 +5318,38 @@ def _parse_pr_list_from_excel_bytes(
 def _resolve_category_list(
     tgt_cs: str,
     _SEED: list = (
+        # ── Standard procurement taxonomy ──────────────────────────────────
+        "Moulding Machine",
+        "Moulding Machine Auxiliaries",
+        "Assembly / Secondary Equipment",
+        "Robot",
+        "IT and Communications",
+        "Laboratory and Test Equipment",
+        "Packaging",
+        "Fire Protection",
+        "Mould Change Equipment",
+        "Paint Shop",
+        "Plant equipment",
+        "Tooling CapEx",
+        "Wire Processing Equipment",
+        "Facilities Management",
+        "Fleet Management",
+        "Machine Lease",
+        "Maintenance Repair and Operation",
+        "Material Handling Equipment (MHE) - Lease",
+        "Material Handling Equipment (MHE) - Purchase",
+        "Office Supplies Equipment",
+        "Property/Land lease",
+        "Tele Communication",
+        # ── Other categories preserved from the original seed ─────────────
+        # (kept distinct because they're NOT strict duplicates of any item
+        # in the standard taxonomy — only the IMM-family is aliased below)
         "Compressor", "TBE Wiring Harness", "Tooling Rubber",
         "Central Portal Purchase", "IT Hardware", "Oil and Lubricants",
         "Measuring Instruments", "HVAC Air Conditioner", "Vehicle Car",
         "Group Company", "TBE Fee and Charges", "Tooling Plastic", "VMC",
         "Storage Equipment Trolley", "Robot and Gripper", "Wiring Harness",
-        "IMM", "Pump and Motor", "TBE Negotiated by Unit and Overseas Unit",
+        "Pump and Motor", "TBE Negotiated by Unit and Overseas Unit",
         "Gensets", "Environmental Chamber", "Software", "Transformer",
         "Tooling Die Casting", "Testing", "Electrical work",
         "Vehicle Motorcycle", "Fabrication", "CCTV", "Chillers",
@@ -5331,26 +5357,39 @@ def _resolve_category_list(
         "Consumable", "certification", "UPS", "Spares",
         "Storage Equipment Racks", "Post Facto",
         "TBE Customer and JV Partner directed", "Piping", "Electrical Panel",
-        "IMM Spares", "IMM Auxiliary", "Jigs and Fixtures", "MHE",
+        "Jigs and Fixtures", "MHE",
         "Wire Extruder and Auxiliary Equip", "SPM", "AMC",
         "Storage Equipment Bin", "Calibration",
         "Fire Safety and Alarm System", "TBE Negotiated by MCO Tooling",
-        "Treatment Plant",
+        "Treatment Plant", "Moulding Machine Spares",
     ),
+    _ALIASES: dict = {
+        # Strict duplicates only — names confirmed to refer to the SAME
+        # category as a canonical entry in the standard taxonomy.
+        # Historical rows in quotation_extracted_items are normalised on
+        # read so the LLM never sees both "IMM" and "Moulding Machine".
+        "IMM":                          "Moulding Machine",
+        "Injection Moulding Machine":   "Moulding Machine",
+        "Injection Molding Machine":    "Moulding Machine",
+        "IMM Auxiliary":                "Moulding Machine Auxiliaries",
+        "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
+        "IMM Spares":                   "Moulding Machine Spares",
+    },
     _TTL: int = 300,
 ) -> list[str]:
     """Returns the seed list UNION every distinct purchase_category_llm
-    previously persisted by V2. Cached in-process for 5 min so the LLM call
-    doesn't hammer the DB on every PR. On DB error, falls back to seed list.
+    previously persisted by V2, with legacy names normalised via _ALIASES
+    so the LLM never sees duplicates (e.g. both "IMM" and "Moulding Machine").
+    Cached in-process for 5 min so the LLM call doesn't hammer the DB on
+    every PR. On DB error, falls back to seed list.
 
     Hardened against MiCore Custom-Component exec contexts where module-level
     `=` assignments may not be visible to function bodies via LOAD_GLOBAL:
       • The cache lives on the function object (`__dict__["_cache"]`) — set
         once on first call, never goes through LOAD_GLOBAL.
-      • The seed list is captured as a default argument at def-time, so the
-        function body never has to resolve PURCHASE_CATEGORIES_SEED from
+      • The seed list, alias map, and TTL are captured as default arguments
+        at def-time, so the function body never has to resolve them from
         module globals.
-      • TTL is the same — captured as a default arg.
     """
     cache = _resolve_category_list.__dict__.setdefault("_cache", {})
     now = time.time()
@@ -5381,11 +5420,35 @@ def _resolve_category_list(
             return False
         s = str(v).strip()
         return bool(s) and s.lower() not in _DROP
-    seed  = {str(c).strip() for c in _SEED          if _ok(c)}
-    dbset = {str(c).strip() for c in db_categories if _ok(c)}
+    def _canon(v: Any) -> str:
+        s = str(v).strip()
+        return _ALIASES.get(s, s)
+    seed  = {_canon(c) for c in _SEED          if _ok(c)}
+    dbset = {_canon(c) for c in db_categories if _ok(c)}
     combined = sorted(seed | dbset, key=str.lower)
     cache[tgt_cs] = (now, combined)
     return combined
+
+
+def _category_with_aliases(
+    category: str,
+    _ALIASES: dict = {
+        "IMM":                          "Moulding Machine",
+        "Injection Moulding Machine":   "Moulding Machine",
+        "Injection Molding Machine":    "Moulding Machine",
+        "IMM Auxiliary":                "Moulding Machine Auxiliaries",
+        "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
+        "IMM Spares":                   "Moulding Machine Spares",
+    },
+) -> list[str]:
+    """Return the canonical category plus any legacy aliases that map to it.
+    Used by SQL Stage A so a search for "Moulding Machine" also matches
+    historical rows still classified as "IMM" in the DB."""
+    if not category:
+        return []
+    canon = _ALIASES.get(category.strip(), category.strip())
+    legacy = [old for old, new in _ALIASES.items() if new == canon]
+    return [canon] + legacy
 
 
 def _normalise_category(value: Any, allowed: list[str]) -> str:
@@ -5952,6 +6015,12 @@ def _sql_pool_by_category(
     exclude_dtl_ids: dtl_ids from the current PR — always skipped."""
     if not src_category:
         return []
+    # Expand to include legacy DB names so a search for "Moulding Machine"
+    # also matches historical rows still classified as "IMM".
+    cat_names = _category_with_aliases(src_category)
+    if not cat_names:
+        return []
+    cat_placeholders = ",".join("?" * len(cat_names))
     excl = [int(x) for x in (exclude_dtl_ids or []) if x is not None]
     excl_clause = f"AND qi.[purchase_dtl_id] NOT IN ({','.join('?' * len(excl))})" if excl else ""
     conn = _connect(tgt_cs)
@@ -5963,12 +6032,12 @@ def _sql_pool_by_category(
               LEFT JOIN [ras_procurement].[purchase_req_detail] prd
                 ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
              WHERE qi.[is_selected_quote] = 1
-               AND qi.[purchase_category_llm] = ?
+               AND qi.[purchase_category_llm] IN ({cat_placeholders})
                AND prd.[C_DATETIME] < ?
                AND qi.[unit_price_eur] IS NOT NULL
                {excl_clause}
              ORDER BY prd.[C_DATETIME] DESC
-        """, pool_size, src_category, src_created_date, *excl)
+        """, pool_size, *cat_names, src_created_date, *excl)
         return [int(r[0]) for r in cur.fetchall()]
     finally:
         conn.close()
