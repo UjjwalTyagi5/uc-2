@@ -5886,6 +5886,7 @@ def _pinecone_narrow_within_pool(
     pinecone_index: str,
     pinecone_ns: str,
     min_score: float = 0.70,
+    query_text: str = "",
 ) -> list[dict]:
     """Stage B — Pinecone similarity search, then post-filter to the SQL pool.
     Fetches top_k * 5 from Pinecone (filter kwarg not supported by
@@ -5895,12 +5896,14 @@ def _pinecone_narrow_within_pool(
         return []
     pool_set = set(candidate_dtl_ids)
     from agentcore.services.pinecone_service_client import search_via_service
+    # search_via_service requires query to be at least 1 char
+    query = query_text.strip() or "item"
     try:
         raw = search_via_service(
             index_name=pinecone_index,
             namespace=pinecone_ns,
             text_key="page_content",
-            query="",
+            query=query,
             query_embedding=embedding,
             number_of_results=top_k * 5,
         )
@@ -6200,7 +6203,7 @@ def _run_benchmark_v2(
                 embedding = embed_model.embed_query(embed_text)
                 narrowed = _pinecone_narrow_within_pool(
                     embedding, pool, pinecone_top_k, pinecone_index, pinecone_ns,
-                    min_score=min_score,
+                    min_score=min_score, query_text=embed_text,
                 )
                 filter_chain += "+pinecone"
             except Exception as exc:
