@@ -6300,12 +6300,18 @@ def _run_benchmark_v2(
                 # Hard date guard: only use items older than the current PR.
                 # Stage A already enforces this via SQL, but Stage B (Pinecone) does
                 # not, so newer items can slip through the combined pool.
-                if created:
+                if created_iso:
                     before = []
                     skipped_newer = []
                     for c in candidates:
                         c_date = c.get("item_created_date")
-                        if c_date and hasattr(c_date, "__lt__") and c_date >= created:
+                        if c_date is None:
+                            before.append(c)
+                            continue
+                        c_date_str = (
+                            c_date.isoformat() if hasattr(c_date, "isoformat") else str(c_date)
+                        )
+                        if c_date_str >= created_iso:
                             skipped_newer.append(c.get("purchase_dtl_id"))
                         else:
                             before.append(c)
