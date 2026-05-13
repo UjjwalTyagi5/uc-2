@@ -6297,6 +6297,24 @@ def _run_benchmark_v2(
             rejected: list = []
             try:
                 candidates = _fetch_candidate_snapshots(tgt_cs, combined_dtl_ids)
+                # Hard date guard: only use items older than the current PR.
+                # Stage A already enforces this via SQL, but Stage B (Pinecone) does
+                # not, so newer items can slip through the combined pool.
+                if created:
+                    before = []
+                    skipped_newer = []
+                    for c in candidates:
+                        c_date = c.get("item_created_date")
+                        if c_date and hasattr(c_date, "__lt__") and c_date >= created:
+                            skipped_newer.append(c.get("purchase_dtl_id"))
+                        else:
+                            before.append(c)
+                    if skipped_newer:
+                        logger.info(
+                            f"[V2 {pr_no}] dtl_id={dtl_id} Stage C: dropped {len(skipped_newer)} "
+                            f"candidate(s) newer than current PR ({created_iso}): {skipped_newer}"
+                        )
+                    candidates = before
                 source_snapshot = _build_source_snapshot_for_rank(rd)
                 selected, rejected = _llm_rank_candidates(
                     llm, source_snapshot, candidates, llm_shortlist, prompts,
