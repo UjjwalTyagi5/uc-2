@@ -5885,11 +5885,12 @@ def _pinecone_narrow_within_pool(
     top_k: int,
     pinecone_index: str,
     pinecone_ns: str,
+    min_score: float = 0.70,
 ) -> list[dict]:
     """Stage B — Pinecone similarity search, then post-filter to the SQL pool.
-    Fetches top_k * 5 from Pinecone (no filter kwarg — not supported by
-    search_via_service) and keeps only matches whose purchase_dtl_id is in
-    candidate_dtl_ids, returning up to top_k survivors."""
+    Fetches top_k * 5 from Pinecone (filter kwarg not supported by
+    search_via_service), then keeps only matches that are in candidate_dtl_ids
+    AND meet the min_score threshold, returning up to top_k survivors."""
     if not candidate_dtl_ids:
         return []
     pool_set = set(candidate_dtl_ids)
@@ -5911,9 +5912,10 @@ def _pinecone_narrow_within_pool(
     matches = raw if isinstance(raw, list) else (
         raw.get("matches", []) or raw.get("results", []) if isinstance(raw, dict) else []
     )
-    # Keep only results that belong to the SQL pool
     filtered = []
     for m in matches:
+        if float(m.get("score", 0.0)) < min_score:
+            continue
         meta = (m.get("metadata") if isinstance(m, dict) else {}) or {}
         did = meta.get("purchase_dtl_id")
         try:
@@ -6097,6 +6099,7 @@ def _run_benchmark_v2(
     p = prompts or {}
     sql_pool_size     = int(p.get("bench_sql_pool_size",           100))
     pinecone_top_k    = int(p.get("bench_pinecone_top_k",          10))
+    min_score         = float(p.get("bench_min_similarity",        0.70))
     llm_shortlist     = int(p.get("bench_llm_shortlist_size",      max(5, top_k_final)))
     widen_when_sparse = bool(p.get("bench_widen_l1l2_when_sparse", True))
     outlier_factor    = float(p.get("bench_outlier_factor",        3.0))
@@ -6197,6 +6200,7 @@ def _run_benchmark_v2(
                 embedding = embed_model.embed_query(embed_text)
                 narrowed = _pinecone_narrow_within_pool(
                     embedding, pool, pinecone_top_k, pinecone_index, pinecone_ns,
+                    min_score=min_score,
                 )
                 filter_chain += "+pinecone"
             except Exception as exc:
