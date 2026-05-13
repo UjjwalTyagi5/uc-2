@@ -226,6 +226,13 @@ class _ConnectionPool:
             # No idle entry — open a fresh one
             import pyodbc
             raw = pyodbc.connect(cs, timeout=login_timeout)
+            # Set a default query timeout so a slow / locked SQL Server
+            # statement can't silently block a worker thread forever.
+            # 300s is generous for bulk ETL inserts but still bounded.
+            try:
+                raw.timeout = 300
+            except Exception:
+                pass
             with self._cv:
                 self._opened_total += 1
             return _PooledConnection(self, cs, raw)
@@ -262,6 +269,57 @@ _CONN_POOL = _ConnectionPool(max_size=_DEFAULT_POOL_SIZE)
 try:
     import pyodbc as _pyodbc_for_pooling
     _pyodbc_for_pooling.pooling = True
+except Exception:
+    pass
+
+
+def _start_stack_dump_thread(interval_s: int = 300) -> None:
+    """Background thread that periodically logs the current stack of every
+    live thread. Makes silent hangs diagnosable — when MiCore appears
+    stuck mid-batch with no log lines, look in the logs around the next
+    interval to see exactly where each worker is blocked (socket read,
+    SQL execute, threading wait, etc.).
+
+    Idempotent — guarded by a function attribute so repeated component
+    rebuilds within the same process don't spawn multiple dumpers.
+    """
+    if getattr(_start_stack_dump_thread, "_started", False):
+        return
+    object.__setattr__(_start_stack_dump_thread, "_started", True)
+
+    import sys as _sys, traceback as _tb, threading as _th, time as _time
+
+    def _dumper() -> None:
+        while True:
+            try:
+                _time.sleep(interval_s)
+                frames = _sys._current_frames()
+                names = {t.ident: t.name for t in _th.enumerate()}
+                lines = [
+                    f"=== Thread stack dump | {len(frames)} live thread(s) ===",
+                ]
+                for tid, frame in frames.items():
+                    nm = names.get(tid, "?")
+                    lines.append(f"--- Thread {tid} ({nm}) ---")
+                    lines.append("".join(_tb.format_stack(frame)).rstrip())
+                logger.info("\n".join(lines))
+            except Exception as exc:
+                # Never let the diagnostic thread itself crash the pipeline.
+                try:
+                    logger.warning("stack-dumper: {}", exc)
+                except Exception:
+                    pass
+
+    t = _th.Thread(target=_dumper, name="stack-dumper", daemon=True)
+    t.start()
+
+
+# Start the diagnostic thread immediately on module load. Daemon thread so
+# it won't keep the process alive on shutdown. Interval is 5 min by default
+# — short enough that a stuck worker shows up quickly, long enough to keep
+# logs readable on healthy runs.
+try:
+    _start_stack_dump_thread(interval_s=300)
 except Exception:
     pass
 
@@ -2424,6 +2482,47 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     ))
 
 
+def _is_timeout_error(exc: Exception) -> bool:
+    """Return True if the LLM call timed out (our wrapper or the SDK itself).
+
+    A silent stuck call is the #1 cause of MiCore appearing frozen mid-batch
+    on large workloads. Treating timeouts as retryable lets the worker
+    recover instead of hanging forever on a dropped TCP connection or a
+    slow Azure OpenAI gateway response.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "timed out", "timeout", "read timed out", "request timed out",
+        "operation timed out", "deadline exceeded",
+    ))
+
+
+def _invoke_llm_with_timeout(llm, messages: list, timeout_s: int = 120):
+    """Invoke `llm.invoke(messages)` with a hard wall-clock timeout.
+
+    LangChain's `AzureChatOpenAI` has no default request timeout — a hung
+    socket read blocks the worker thread forever with no exception and no
+    log line ("silent stuck"). This helper runs the invoke on a one-shot
+    ThreadPoolExecutor and forces a TimeoutError if it overruns, so the
+    surrounding retry logic can recover.
+    """
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-call") as ex:
+        fut = ex.submit(llm.invoke, messages)
+        try:
+            return fut.result(timeout=timeout_s)
+        except _cf.TimeoutError as exc:
+            # Best-effort cancel — Azure OpenAI HTTP request will still
+            # run to completion in the background, but the worker that
+            # called us is unblocked and the surrounding retry loop fires.
+            fut.cancel()
+            raise TimeoutError(
+                f"LLM call exceeded {timeout_s}s wall-clock — aborted to recover from silent stuck"
+            ) from exc
+
+
 def _is_json_format_error(exc: Exception) -> bool:
     """Detect when the LLM rejects the response_format=json_object kwarg.
 
@@ -2455,8 +2554,9 @@ def _call_llm_with_retry(
     deployments keep working.
     """
     import time
-    max_retries = int((prompts or {}).get("llm_max_retries",  3))
+    max_retries = int((prompts or {}).get("llm_max_retries",   3))
     cooldown_s  = int((prompts or {}).get("llm_retry_cooldown", 60))
+    timeout_s   = int((prompts or {}).get("llm_call_timeout_s", 120))
 
     # Try to bind strict JSON output. Most modern Azure / OpenAI chat models
     # support it; older ones reject the kwarg and we fall back below on first
@@ -2472,7 +2572,7 @@ def _call_llm_with_retry(
 
     for attempt in range(max_retries + 1):
         try:
-            return active_llm.invoke(messages)
+            return _invoke_llm_with_timeout(active_llm, messages, timeout_s=timeout_s)
         except Exception as exc:
             # If JSON mode tripped a model-not-supported error, drop it and
             # retry once with the unbound LLM. This is a recovery path, not a
@@ -2486,12 +2586,17 @@ def _call_llm_with_retry(
                 active_llm = llm
                 json_mode_enabled = False
                 continue
-            if _is_rate_limit_error(exc) and attempt < max_retries:
+            # Treat rate-limit AND timeout as retryable — both indicate a
+            # transient remote condition (quota / hung socket) rather than
+            # a programming error.
+            is_rl = _is_rate_limit_error(exc)
+            is_to = _is_timeout_error(exc)
+            if (is_rl or is_to) and attempt < max_retries:
                 wait = cooldown_s * (attempt + 1)  # 60s → 120s → 180s
+                kind = "rate-limit" if is_rl else "timeout"
                 logger.warning(
-                    "LLM rate-limit / token-quota (attempt {}/{}) — "
-                    "cooling down {}s before retry: {}",
-                    attempt + 1, max_retries, wait, exc,
+                    "LLM {} (attempt {}/{}) — cooling down {}s before retry: {}",
+                    kind, attempt + 1, max_retries, wait, exc,
                 )
                 time.sleep(wait)
             else:
@@ -4840,7 +4945,7 @@ def _estimate_inflation_via_llm(llm, item_name: str | None, category: str | None
             f"Do NOT derive the rate from any historical price data.\n"
             f'Respond ONLY with JSON: {{ "inflation_pct": <number or null> }}'
         )
-        resp = llm.invoke([_HM(content=prompt)])
+        resp = _call_llm_with_retry(llm, [_HM(content=prompt)], prompts=None, force_json=True)
         raw  = (getattr(resp, "content", None) or str(resp)).strip()
         raw  = _re.sub(r"^```(?:json)?\s*", "", raw)
         raw  = _re.sub(r"\s*```$",          "", raw).strip()
@@ -5091,7 +5196,7 @@ def _run_benchmark(
             bout = {}
             llm_succeeded = False
             try:
-                resp = llm.invoke([HumanMessage(content=bench_prompt)])
+                resp = _call_llm_with_retry(llm, [HumanMessage(content=bench_prompt)], prompts=prompts, force_json=True)
                 raw  = (getattr(resp, "content", None) or str(resp)).strip()
                 raw  = re.sub(r"^```(?:json)?\s*", "", raw)
                 raw  = re.sub(r"\s*```$", "", raw)
@@ -6777,7 +6882,7 @@ def _run_benchmark_v2(
             bout = {}
             llm_succeeded = False
             try:
-                resp = llm.invoke([HumanMessage(content=bench_prompt)])
+                resp = _call_llm_with_retry(llm, [HumanMessage(content=bench_prompt)], prompts=prompts, force_json=True)
                 raw_txt = (getattr(resp, "content", None) or str(resp)).strip()
                 raw_txt = re.sub(r"^```(?:json)?\s*", "", raw_txt)
                 raw_txt = re.sub(r"\s*```$", "", raw_txt)
