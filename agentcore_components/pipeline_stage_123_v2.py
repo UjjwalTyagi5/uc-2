@@ -4098,15 +4098,28 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
 
 
 def _fetch_historical_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
-    """Fetch pricing rows from quotation_extracted_items for a list of purchase_dtl_id values."""
+    """Fetch all extraction columns from quotation_extracted_items for the given dtl_ids
+    (is_selected_quote = 1 only). Returns the full row so the pricing LLM has complete
+    item context — name, description, category hierarchy, specs, pricing, and terms."""
     if not dtl_ids:
         return []
     placeholders = ", ".join(["?"] * len(dtl_ids))
     sql = f"""
         SELECT qi.[purchase_dtl_id], qi.[extracted_item_uuid_pk],
-               qi.[unit_price], qi.[total_price], qi.[quantity], qi.[unit],
-               qi.[currency], qi.[quotation_date], qi.[supplier_name], qi.[supplier_country],
+               qi.[item_name], qi.[item_description], qi.[item_summary],
+               qi.[item_level_1], qi.[item_level_2], qi.[item_level_3],
+               qi.[item_level_4], qi.[item_level_5], qi.[item_level_6],
+               qi.[item_level_7], qi.[item_level_8],
+               qi.[commodity_tag], qi.[purchase_category_llm], qi.[critical_attributes],
+               qi.[supplier_name], qi.[supplier_address], qi.[supplier_country],
+               qi.[quotation_ref_no], qi.[quotation_date], qi.[currency],
+               qi.[validity_date], qi.[validity_days], qi.[payment_terms],
+               qi.[quantity], qi.[unit],
+               qi.[unit_price], qi.[total_price],
                qi.[unit_price_eur], qi.[total_price_eur],
+               qi.[discount], qi.[taxation_details],
+               qi.[delivery_date], qi.[delivery_time_days],
+               qi.[supplier_match_conf], qi.[quote_rank],
                rt.[purchase_req_no],
                prd.[C_DATETIME] AS pr_created_date
           FROM [ras_procurement].[quotation_extracted_items] qi
@@ -4121,10 +4134,20 @@ def _fetch_historical_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
     """
     cols = [
         "purchase_dtl_id", "extracted_item_uuid_pk",
-        "unit_price", "total_price", "quantity", "unit",
-        "currency", "quotation_date", "supplier_name", "supplier_country",
-        "unit_price_eur", "total_price_eur", "purchase_req_no",
-        "pr_created_date",
+        "item_name", "item_description", "item_summary",
+        "item_level_1", "item_level_2", "item_level_3", "item_level_4",
+        "item_level_5", "item_level_6", "item_level_7", "item_level_8",
+        "commodity_tag", "purchase_category_llm", "critical_attributes",
+        "supplier_name", "supplier_address", "supplier_country",
+        "quotation_ref_no", "quotation_date", "currency",
+        "validity_date", "validity_days", "payment_terms",
+        "quantity", "unit",
+        "unit_price", "total_price",
+        "unit_price_eur", "total_price_eur",
+        "discount", "taxation_details",
+        "delivery_date", "delivery_time_days",
+        "supplier_match_conf", "quote_rank",
+        "purchase_req_no", "pr_created_date",
     ]
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
@@ -4496,33 +4519,57 @@ def _format_bench_prompt(
     # ── Time-bucketed historical rows ─────────────────────────────────────
     buckets = stats.get("time_buckets") or {}
 
-    def _hist_table(rows: list[dict]) -> str:
+    def _hist_block(rows: list[dict]) -> str:
         if not rows:
             return "  (none in this window)"
-        header = "| # | Supplier | Date | Qty | Unit | Unit Price (EUR) | Orig. Currency |"
-        sep    = "|---|----------|------|-----|------|-----------------|----------------|"
-        out = [header, sep]
+        out = []
         for i, it in enumerate(rows, 1):
             eur_p = it.get("unit_price_eur")
             raw_p = it.get("unit_price")
-            eur_label = str(eur_p) if eur_p is not None else (f"{raw_p} *" if raw_p is not None else "N/A")
-            out.append(
-                f"| {i} | {it.get('supplier_name') or 'N/A'} "
-                f"| {it.get('quotation_date') or 'N/A'} "
-                f"| {it.get('quantity') or 'N/A'} "
-                f"| {it.get('unit') or 'N/A'} "
-                f"| {eur_label} "
-                f"| {it.get('currency') or 'N/A'} |"
+            price_str = (
+                f"{eur_p} EUR (orig: {raw_p} {it.get('currency') or ''})"
+                if eur_p is not None and str(it.get("currency") or "").upper() != "EUR"
+                else (f"{eur_p} EUR" if eur_p is not None else f"{raw_p} {it.get('currency') or ''}")
             )
-        return "\n".join(out)
+            cat_parts = [
+                it.get(f"item_level_{n}") for n in range(1, 9)
+                if it.get(f"item_level_{n}")
+            ]
+            cat = " > ".join(str(p) for p in cat_parts) if cat_parts else "N/A"
+            crit = it.get("critical_attributes")
+            if isinstance(crit, str):
+                try: crit = json.loads(crit)
+                except Exception: crit = []
+            block = [
+                f"[{i}] purchase_dtl_id={it.get('purchase_dtl_id')} | PR={it.get('purchase_req_no') or 'N/A'} | date={it.get('pr_created_date') or 'N/A'}",
+                f"  Item name        : {it.get('item_name') or 'N/A'}",
+                f"  Description      : {it.get('item_description') or 'N/A'}",
+                f"  Summary          : {it.get('item_summary') or 'N/A'}",
+                f"  Category         : {cat}",
+                f"  Commodity tag    : {it.get('commodity_tag') or 'N/A'}",
+                f"  LLM category     : {it.get('purchase_category_llm') or 'N/A'}",
+                f"  Critical attrs   : {json.dumps(crit, ensure_ascii=False) if crit else 'N/A'}",
+                f"  Supplier         : {it.get('supplier_name') or 'N/A'} | country={it.get('supplier_country') or 'N/A'}",
+                f"  Quotation date   : {it.get('quotation_date') or 'N/A'} | ref={it.get('quotation_ref_no') or 'N/A'}",
+                f"  Quantity / Unit  : {it.get('quantity') or 'N/A'} {it.get('unit') or ''}",
+                f"  Unit price       : {price_str}",
+                f"  Total price      : {it.get('total_price_eur') or it.get('total_price') or 'N/A'} EUR",
+                f"  Discount         : {it.get('discount') or 'N/A'}",
+                f"  Payment terms    : {it.get('payment_terms') or 'N/A'}",
+                f"  Delivery         : {it.get('delivery_date') or 'N/A'} ({it.get('delivery_time_days') or 'N/A'} days)",
+                f"  Validity         : {it.get('validity_date') or 'N/A'} ({it.get('validity_days') or 'N/A'} days)",
+                f"  Taxation details : {it.get('taxation_details') or 'N/A'}",
+            ]
+            out.append("\n".join(block))
+        return "\n\n".join(out)
 
     hist_block = (
         "RECENT (last 6 months) — weight these highest:\n"
-        + _hist_table(buckets.get("recent") or []) + "\n\n"
+        + _hist_block(buckets.get("recent") or []) + "\n\n"
         "MID (6-24 months) — weight moderately:\n"
-        + _hist_table(buckets.get("mid") or []) + "\n\n"
+        + _hist_block(buckets.get("mid") or []) + "\n\n"
         "OLDER (>24 months) — apply inflation adjustment if relevant:\n"
-        + _hist_table(buckets.get("old") or [])
+        + _hist_block(buckets.get("old") or [])
     )
 
     # ── Prior benchmark results block ────────────────────────────────────
@@ -5767,25 +5814,30 @@ def _sql_pool_by_category(
     src_category: str,
     src_created_date: Any,
     pool_size: int,
+    exclude_dtl_ids: "list[int] | None" = None,
 ) -> list[int]:
     """Stage A — TOP N historical dtl_ids in the same V2 category, older than
-    source, ordered by C_DATETIME DESC (newest first). Empty if no peers."""
+    source, ordered by C_DATETIME DESC (newest first). Empty if no peers.
+    exclude_dtl_ids: dtl_ids from the current PR — always skipped."""
     if not src_category:
         return []
+    excl = [int(x) for x in (exclude_dtl_ids or []) if x is not None]
+    excl_clause = f"AND qi.[purchase_dtl_id] NOT IN ({','.join('?' * len(excl))})" if excl else ""
     conn = _connect(tgt_cs)
     try:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(f"""
             SELECT TOP (?) qi.[purchase_dtl_id]
               FROM [ras_procurement].[quotation_extracted_items] qi
               LEFT JOIN [ras_procurement].[purchase_req_detail] prd
                 ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
              WHERE qi.[is_selected_quote] = 1
                AND qi.[purchase_category_llm] = ?
-               AND (prd.[C_DATETIME] IS NULL OR prd.[C_DATETIME] < ?)
+               AND prd.[C_DATETIME] < ?
                AND qi.[unit_price_eur] IS NOT NULL
+               {excl_clause}
              ORDER BY prd.[C_DATETIME] DESC
-        """, pool_size, src_category, src_created_date)
+        """, pool_size, src_category, src_created_date, *excl)
         return [int(r[0]) for r in cur.fetchall()]
     finally:
         conn.close()
@@ -5797,15 +5849,19 @@ def _widen_pool_by_levels(
     l2: str,
     src_created_date: Any,
     pool_size: int,
+    exclude_dtl_ids: "list[int] | None" = None,
 ) -> list[int]:
     """Sparse-pool fallback — accepts rows matching item_level_1 + item_level_2
-    instead of LLM category."""
+    instead of LLM category.
+    exclude_dtl_ids: dtl_ids from the current PR — always skipped."""
     if not (l1 and l2):
         return []
+    excl = [int(x) for x in (exclude_dtl_ids or []) if x is not None]
+    excl_clause = f"AND qi.[purchase_dtl_id] NOT IN ({','.join('?' * len(excl))})" if excl else ""
     conn = _connect(tgt_cs)
     try:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(f"""
             SELECT TOP (?) qi.[purchase_dtl_id]
               FROM [ras_procurement].[quotation_extracted_items] qi
               LEFT JOIN [ras_procurement].[purchase_req_detail] prd
@@ -5813,10 +5869,11 @@ def _widen_pool_by_levels(
              WHERE qi.[is_selected_quote] = 1
                AND qi.[item_level_1] = ?
                AND qi.[item_level_2] = ?
-               AND (prd.[C_DATETIME] IS NULL OR prd.[C_DATETIME] < ?)
+               AND prd.[C_DATETIME] < ?
                AND qi.[unit_price_eur] IS NOT NULL
+               {excl_clause}
              ORDER BY prd.[C_DATETIME] DESC
-        """, pool_size, l1, l2, src_created_date)
+        """, pool_size, l1, l2, src_created_date, *excl)
         return [int(r[0]) for r in cur.fetchall()]
     finally:
         conn.close()
@@ -5856,7 +5913,8 @@ def _pinecone_narrow_within_pool(
 
 
 def _fetch_candidate_snapshots(tgt_cs: str, dtl_ids: list[int]) -> list[dict]:
-    """Pull a compact snapshot of each candidate row for the rank LLM."""
+    """Pull full extraction data for each candidate from quotation_extracted_items
+    so the rank LLM can compare specs, category, and price against the source item."""
     if not dtl_ids:
         return []
     placeholders = ",".join("?" * len(dtl_ids))
@@ -5864,37 +5922,64 @@ def _fetch_candidate_snapshots(tgt_cs: str, dtl_ids: list[int]) -> list[dict]:
     try:
         cur = conn.cursor()
         cur.execute(f"""
-            SELECT qi.[purchase_dtl_id], qi.[item_name], qi.[item_description],
+            SELECT qi.[purchase_dtl_id],
+                   qi.[item_name], qi.[item_description], qi.[item_summary],
+                   qi.[item_level_1], qi.[item_level_2], qi.[item_level_3],
+                   qi.[item_level_4], qi.[item_level_5], qi.[item_level_6],
+                   qi.[item_level_7], qi.[item_level_8],
                    qi.[purchase_category_llm], qi.[commodity_tag],
                    qi.[critical_attributes],
-                   qi.[unit_price_eur], qi.[currency], qi.[unit_price],
-                   qi.[unit], qi.[quantity],
+                   qi.[supplier_name], qi.[supplier_country],
+                   qi.[quotation_date], qi.[currency],
+                   qi.[quantity], qi.[unit],
+                   qi.[unit_price], qi.[unit_price_eur],
+                   qi.[total_price], qi.[total_price_eur],
+                   qi.[discount], qi.[payment_terms], qi.[delivery_time_days],
                    prd.[C_DATETIME] AS [item_created_date]
               FROM [ras_procurement].[quotation_extracted_items] qi
               LEFT JOIN [ras_procurement].[purchase_req_detail] prd
                 ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
              WHERE qi.[purchase_dtl_id] IN ({placeholders})
+               AND qi.[is_selected_quote] = 1
         """, *dtl_ids)
-        cols = ["purchase_dtl_id","item_name","item_description","purchase_category_llm",
-                "commodity_tag","critical_attributes","unit_price_eur","currency",
-                "unit_price","unit","quantity","item_created_date"]
+        cols = [
+            "purchase_dtl_id",
+            "item_name", "item_description", "item_summary",
+            "item_level_1", "item_level_2", "item_level_3", "item_level_4",
+            "item_level_5", "item_level_6", "item_level_7", "item_level_8",
+            "purchase_category_llm", "commodity_tag", "critical_attributes",
+            "supplier_name", "supplier_country",
+            "quotation_date", "currency",
+            "quantity", "unit",
+            "unit_price", "unit_price_eur",
+            "total_price", "total_price_eur",
+            "discount", "payment_terms", "delivery_time_days",
+            "item_created_date",
+        ]
         rows = []
         for r in cur.fetchall():
             rd = dict(zip(cols, r))
+            # Parse critical_attributes JSON
             ca = rd.get("critical_attributes")
             if isinstance(ca, str) and ca.strip():
                 try: rd["critical_attributes"] = json.loads(ca)
                 except Exception: rd["critical_attributes"] = []
             else:
                 rd["critical_attributes"] = []
-            for k in ("unit_price_eur","unit_price","quantity"):
+            # Build category string from levels
+            cat_parts = [rd.get(f"item_level_{n}") for n in range(1, 9) if rd.get(f"item_level_{n}")]
+            rd["category"] = " > ".join(str(p) for p in cat_parts) if cat_parts else None
+            # Coerce numerics
+            for k in ("unit_price_eur", "unit_price", "total_price_eur", "total_price", "quantity", "discount"):
                 v = rd.get(k)
                 if v is not None:
                     try: rd[k] = float(v)
                     except Exception: rd[k] = None
-            d = rd.get("item_created_date")
-            if d and hasattr(d, "isoformat"):
-                rd["item_created_date"] = d.isoformat()
+            # Coerce dates
+            for dk in ("item_created_date", "quotation_date"):
+                dv = rd.get(dk)
+                if dv and hasattr(dv, "isoformat"):
+                    rd[dk] = dv.isoformat()
             rows.append(rd)
         return rows
     finally:
@@ -5951,23 +6036,33 @@ def _llm_rank_candidates(
 
 
 def _build_source_snapshot_for_rank(rd: dict) -> dict:
-    """Compact dict the rank LLM receives as the SOURCE."""
+    """Full snapshot the rank LLM receives as the SOURCE item — all fields from
+    quotation_extracted_items that are relevant for relevance judgement."""
     crit = rd.get("critical_attributes")
     if isinstance(crit, str):
         try: crit = json.loads(crit)
         except Exception: crit = []
+    cat_parts = [rd.get(f"item_level_{n}") for n in range(1, 9) if rd.get(f"item_level_{n}")]
     return {
         "purchase_dtl_id":       int(rd.get("purchase_dtl_id") or 0),
-        "purchase_category_llm": rd.get("purchase_category_llm"),
         "item_name":             rd.get("item_name"),
         "item_description":      rd.get("item_description"),
+        "item_summary":          rd.get("item_summary"),
+        "category":              " > ".join(str(p) for p in cat_parts) if cat_parts else None,
+        "purchase_category_llm": rd.get("purchase_category_llm"),
         "commodity_tag":         rd.get("commodity_tag"),
         "critical_attributes":   crit or [],
+        "supplier_name":         rd.get("supplier_name"),
+        "quotation_date":        str(rd["quotation_date"]) if rd.get("quotation_date") else None,
+        "quantity":              float(rd["quantity"]) if rd.get("quantity") is not None else None,
+        "unit":                  rd.get("unit"),
         "unit_price":            float(rd["unit_price"]) if rd.get("unit_price") is not None else None,
         "unit_price_eur":        float(rd["unit_price_eur"]) if rd.get("unit_price_eur") is not None else None,
-        "unit":                  rd.get("unit"),
-        "quantity":              float(rd["quantity"]) if rd.get("quantity") is not None else None,
+        "total_price_eur":       float(rd["total_price_eur"]) if rd.get("total_price_eur") is not None else None,
         "currency":              rd.get("currency"),
+        "discount":              float(rd["discount"]) if rd.get("discount") is not None else None,
+        "payment_terms":         rd.get("payment_terms"),
+        "delivery_time_days":    rd.get("delivery_time_days"),
     }
 
 
@@ -5981,26 +6076,32 @@ def _run_benchmark_v2(
     top_k_final: int,
     prompts: dict | None = None,
 ) -> None:
-    """Stage 7 V2 — 3-stage retrieval (SQL → Pinecone → LLM rank). Each
-    benchmark_result row records the filter chain used + the LLM's top
-    rejection reason (for QA)."""
+    """Stage 7 V2 — 3-stage retrieval (SQL → Pinecone → LLM rank) + V1-identical
+    pricing (low/last/bp_unit_price/inflation) applied to the ranked shortlist.
+    Current PR's own DTL IDs are excluded from the candidate pool at every stage."""
+    from langchain_core.messages import HumanMessage
     p = prompts or {}
-    sql_pool_size   = int(p.get("bench_sql_pool_size",      100))
-    pinecone_top_k  = int(p.get("bench_pinecone_top_k",     10))
-    llm_shortlist   = int(p.get("bench_llm_shortlist_size", max(5, top_k_final)))
+    sql_pool_size     = int(p.get("bench_sql_pool_size",           100))
+    pinecone_top_k    = int(p.get("bench_pinecone_top_k",          10))
+    llm_shortlist     = int(p.get("bench_llm_shortlist_size",      max(5, top_k_final)))
     widen_when_sparse = bool(p.get("bench_widen_l1l2_when_sparse", True))
+    outlier_factor    = float(p.get("bench_outlier_factor",        3.0))
+    max_age_months    = int(p.get("bench_max_age_months",          0))
+    uom_strict        = bool(p.get("bench_uom_strict",             False))
 
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
         cur.execute("""
             SELECT qi.[extracted_item_uuid_pk], qi.[purchase_dtl_id],
-                   qi.[item_name], qi.[item_description],
+                   qi.[item_name], qi.[item_description], qi.[item_summary],
                    qi.[purchase_category_llm], qi.[embed_content],
                    qi.[critical_attributes], qi.[commodity_tag],
-                   qi.[item_level_1], qi.[item_level_2],
+                   qi.[item_level_1], qi.[item_level_2], qi.[item_level_3],
+                   qi.[item_level_4], qi.[item_level_5], qi.[item_level_6],
+                   qi.[item_level_7], qi.[item_level_8],
                    qi.[unit_price], qi.[total_price], qi.[quantity], qi.[unit],
-                   qi.[currency], qi.[supplier_name],
+                   qi.[currency], qi.[quotation_date], qi.[supplier_name],
                    qi.[unit_price_eur], qi.[total_price_eur],
                    prd.[C_DATETIME] AS [item_created_date]
               FROM [ras_procurement].[quotation_extracted_items] qi
@@ -6019,12 +6120,16 @@ def _run_benchmark_v2(
         conn.close()
 
     src_cols = [
-        "extracted_item_uuid_pk","purchase_dtl_id","item_name","item_description",
+        "extracted_item_uuid_pk","purchase_dtl_id","item_name","item_description","item_summary",
         "purchase_category_llm","embed_content","critical_attributes","commodity_tag",
-        "item_level_1","item_level_2",
-        "unit_price","total_price","quantity","unit","currency","supplier_name",
+        "item_level_1","item_level_2","item_level_3","item_level_4",
+        "item_level_5","item_level_6","item_level_7","item_level_8",
+        "unit_price","total_price","quantity","unit","currency","quotation_date","supplier_name",
         "unit_price_eur","total_price_eur","item_created_date",
     ]
+
+    # Collect current PR's own DTL IDs so they are never returned as "similar"
+    current_pr_dtl_ids = {int(r[1]) for r in rows if r[1] is not None}
 
     conn2 = _connect(tgt_cs)
     cur2  = conn2.cursor()
@@ -6035,6 +6140,12 @@ def _run_benchmark_v2(
             item_uuid = str(rd["extracted_item_uuid_pk"] or "")
             src_cat   = (rd.get("purchase_category_llm") or "").strip()
             src_date  = rd.get("item_created_date")
+            qty       = rd.get("quantity") or Decimal("1")
+
+            created = src_date
+            created_iso = (
+                created.isoformat() if created and hasattr(created, "isoformat") else str(created or "")
+            )
 
             embed_text = (rd.get("embed_content") or "").strip() or _build_embed_text(rd)
             if not embed_text:
@@ -6042,13 +6153,14 @@ def _run_benchmark_v2(
                                       "V2 — no embed_content / no descriptor fields")
                 continue
 
-            # Stage A
-            pool = _sql_pool_by_category(tgt_cs, src_cat, src_date, sql_pool_size)
+            # Stage A — SQL category pool; own PR's DTL IDs excluded in SQL
+            own_excl = list(current_pr_dtl_ids)
+            pool = _sql_pool_by_category(tgt_cs, src_cat, src_date, sql_pool_size, own_excl)
             filter_chain = "sql_category"
             if len(pool) < 20 and widen_when_sparse:
                 widened = _widen_pool_by_levels(
                     tgt_cs, rd.get("item_level_1") or "", rd.get("item_level_2") or "",
-                    src_date, sql_pool_size,
+                    src_date, sql_pool_size, own_excl,
                 )
                 seen_ids = set(pool)
                 for did in widened:
@@ -6066,7 +6178,7 @@ def _run_benchmark_v2(
                                       f"V2 — no peer pool for category {src_cat!r}")
                 continue
 
-            # Stage B
+            # Stage B — Pinecone within pool, self-matches removed
             try:
                 embedding = embed_model.embed_query(embed_text)
                 narrowed = _pinecone_narrow_within_pool(
@@ -6089,13 +6201,17 @@ def _run_benchmark_v2(
                     meta = (m.get("metadata") if isinstance(m, dict) else {}) or {}
                     did = meta.get("purchase_dtl_id")
                     if did is not None:
-                        try: stage_b_dtl_ids.append(int(did))
-                        except Exception: continue
+                        try:
+                            did_int = int(did)
+                            if did_int not in current_pr_dtl_ids:
+                                stage_b_dtl_ids.append(did_int)
+                        except Exception:
+                            continue
             else:
-                stage_b_dtl_ids = pool[:pinecone_top_k]
+                stage_b_dtl_ids = [did for did in pool[:pinecone_top_k] if did not in current_pr_dtl_ids]
                 filter_chain += "_skipped"
 
-            # Stage C
+            # Stage C — LLM ranking, self-matches removed
             candidates = _fetch_candidate_snapshots(tgt_cs, stage_b_dtl_ids)
             source_snapshot = _build_source_snapshot_for_rank(rd)
             selected, rejected = _llm_rank_candidates(
@@ -6109,10 +6225,14 @@ def _run_benchmark_v2(
                         continue
                     sid = s.get("purchase_dtl_id")
                     if sid is not None:
-                        try: shortlist_dtl_ids.append(int(sid))
-                        except Exception: continue
+                        try:
+                            sid_int = int(sid)
+                            if sid_int not in current_pr_dtl_ids:
+                                shortlist_dtl_ids.append(sid_int)
+                        except Exception:
+                            continue
             else:
-                shortlist_dtl_ids = stage_b_dtl_ids[:llm_shortlist]
+                shortlist_dtl_ids = [did for did in stage_b_dtl_ids[:llm_shortlist] if did not in current_pr_dtl_ids]
                 filter_chain += "+rank_skipped"
 
             if not shortlist_dtl_ids:
@@ -6123,29 +6243,140 @@ def _run_benchmark_v2(
                 )
                 continue
 
-            similar_dtl_ids_csv = ",".join(str(x) for x in shortlist_dtl_ids)
-            top_reason = ""
-            if selected and isinstance(selected[0], dict):
-                top_reason = str(selected[0].get("reason") or "")[:500]
-            summary = (
-                f"V2 chain={filter_chain} | shortlist={len(shortlist_dtl_ids)} "
-                f"| top: {top_reason}"
+            # ── Pricing logic identical to V1 ────────────────────────────
+            historical_raw   = _fetch_historical_for_dtl_ids(tgt_cs, shortlist_dtl_ids)
+            prior_benchmarks = _fetch_benchmark_for_dtl_ids(tgt_cs, shortlist_dtl_ids)
+
+            historical = _filter_historical_uom(historical_raw, rd.get("unit"), uom_strict)
+            historical = _filter_historical_age(historical, created_iso, max_age_months)
+            historical = _filter_historical_outliers(historical, outlier_factor)
+            if len(historical) != len(historical_raw):
+                logger.info(
+                    f"[V2 {pr_no}] dtl_id={dtl_id}: filtered "
+                    f"{len(historical_raw) - len(historical)}/{len(historical_raw)} historical row(s)"
+                )
+            if shortlist_dtl_ids and not historical:
+                logger.warning(
+                    f"[V2 {pr_no}] dtl_id={dtl_id}: {len(shortlist_dtl_ids)} shortlist item(s) found "
+                    f"but ALL eliminated by post-fetch filters — low_hist/last_hist will be NULL"
+                )
+
+            agg = _benchmark_aggregates(historical, created_iso)
+            low_item, last_item = _compute_low_last(historical)
+            low_uuid  = str(low_item["extracted_item_uuid_pk"])  if low_item  else None
+            last_uuid = str(last_item["extracted_item_uuid_pk"]) if last_item else None
+            similar_dtl_ids_json = json.dumps(shortlist_dtl_ids)
+
+            # Inflation
+            supplier_country = (low_item.get("supplier_country") if low_item else None)
+            ref_dt       = low_item.get("quotation_date") if low_item else None
+            ref_year     = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
+            current_year = created.year if created and hasattr(created, "year") else None
+            item_category = " > ".join(
+                str(rd[f]) for f in [
+                    "item_level_1", "item_level_2", "item_level_3",
+                ] if rd.get(f)
             )
+            infl_dec = cpi_dec = Decimal("0")
+            if ref_year and current_year and ref_year < current_year:
+                infl_raw = _estimate_inflation_via_llm(
+                    llm, rd.get("item_name"), item_category or None,
+                    supplier_country, ref_year, current_year,
+                )
+                if infl_raw is not None:
+                    try: infl_dec = Decimal(str(infl_raw))
+                    except Exception: pass
+                cpi_raw = _compute_cpi_pct(supplier_country, ref_year, current_year)
+                if cpi_raw is not None:
+                    try: cpi_dec = Decimal(str(cpi_raw))
+                    except Exception: pass
+                logger.info(
+                    f"[V2 {pr_no}] dtl_id={dtl_id}: inflation_pct={infl_dec} "
+                    f"cpi_pct={cpi_dec} (country={supplier_country!r} {ref_year}-{current_year})"
+                )
+
+            # LLM benchmark price
+            bench_prompt = _format_bench_prompt(
+                rd, historical[:top_k_final], stats=agg, prior_benchmarks=prior_benchmarks or None,
+            )
+            bout = {}
+            llm_succeeded = False
+            try:
+                resp = llm.invoke([HumanMessage(content=bench_prompt)])
+                raw_txt = (getattr(resp, "content", None) or str(resp)).strip()
+                raw_txt = re.sub(r"^```(?:json)?\s*", "", raw_txt)
+                raw_txt = re.sub(r"\s*```$", "", raw_txt)
+                bout = json.loads(raw_txt)
+                llm_succeeded = True
+            except Exception as exc:
+                logger.error(
+                    f"[V2 {pr_no}] LLM benchmark parse failed dtl_id={dtl_id}: {exc}",
+                    exc_info=True,
+                )
+
+            bp_unit       = bout.get("bp_unit_price")
+            bp_low        = bout.get("bp_low")
+            bp_high       = bout.get("bp_high")
+            bp_confidence = bout.get("confidence")
+            llm_summary   = bout.get("summary", "")
+            llm_succeeded = llm_succeeded and bp_unit is not None
+            try:
+                bp_dec   = Decimal(str(bp_unit)) if bp_unit is not None else Decimal("0")
+                bp_total = round(float(bp_dec) * float(qty or 1), 2)
+            except Exception:
+                bp_dec = Decimal("0")
+                bp_total = 0
+
+            extras = []
+            if bp_low is not None or bp_high is not None:
+                extras.append(f"range={bp_low}-{bp_high} EUR")
+            if bp_confidence is not None:
+                try: extras.append(f"confidence={float(bp_confidence):.2f}")
+                except Exception: extras.append(f"confidence={bp_confidence}")
+            if agg.get("count") is not None:
+                extras.append(f"n={agg['count']} (priced={agg.get('priced_count', 0)})")
+            if "median" in agg:
+                extras.append(f"median={agg['median']} EUR")
+            v2_tag = f"V2 chain={filter_chain} | shortlist={len(shortlist_dtl_ids)}"
+            summary = (
+                f"[{v2_tag} | {', '.join(extras)}] {llm_summary}".strip()
+                if extras else f"[{v2_tag}] {llm_summary}".strip()
+            )
+
+            bp_dec_u   = bp_dec   if llm_succeeded else None
+            bp_total_u = bp_total if llm_succeeded else None
+            summary_u  = summary  if (llm_succeeded and summary) else None
+
             try:
                 cur2.execute("""
                     MERGE [ras_procurement].[benchmark_result] WITH (HOLDLOCK) AS target
                     USING (SELECT ? AS purchase_dtl_id) AS src
                        ON target.purchase_dtl_id = src.purchase_dtl_id
                     WHEN MATCHED THEN
-                        UPDATE SET extracted_item_uuid_fk=?, similar_dtl_ids=?, summary=?,
-                                   updated_at=SYSUTCDATETIME()
+                        UPDATE SET
+                            extracted_item_uuid_fk = ?,
+                            bp_unit_price          = COALESCE(?, target.bp_unit_price),
+                            bp_total_price         = COALESCE(?, target.bp_total_price),
+                            low_hist_item_fk       = ?,
+                            last_hist_item_fk      = ?,
+                            inflation_pct          = ?,
+                            cpi_inflation_pct      = ?,
+                            similar_dtl_ids        = ?,
+                            summary                = COALESCE(?, target.summary),
+                            updated_at             = SYSUTCDATETIME()
                     WHEN NOT MATCHED THEN
-                        INSERT (purchase_dtl_id, extracted_item_uuid_fk,
-                                similar_dtl_ids, summary)
-                        VALUES (?, ?, ?, ?);
+                        INSERT (
+                            purchase_dtl_id, extracted_item_uuid_fk,
+                            bp_unit_price, bp_total_price,
+                            low_hist_item_fk, last_hist_item_fk,
+                            inflation_pct, cpi_inflation_pct,
+                            similar_dtl_ids, summary
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                    dtl_id, item_uuid, similar_dtl_ids_csv, summary,
-                    dtl_id, item_uuid, similar_dtl_ids_csv, summary,
+                    dtl_id,
+                    item_uuid, bp_dec_u, bp_total_u, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary_u,
+                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary,
                 )
                 conn2.commit()
             except Exception as exc:
