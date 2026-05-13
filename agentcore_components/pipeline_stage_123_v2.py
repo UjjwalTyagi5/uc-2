@@ -290,6 +290,15 @@ def _start_stack_dump_thread(interval_s: int = 300) -> None:
     import sys as _sys, traceback as _tb, threading as _th, time as _time
 
     def _dumper() -> None:
+        # Startup beacon — confirms the dumper is actually running so users
+        # know "no error logs" isn't because the dumper itself failed.
+        try:
+            logger.info(
+                f"STACK-DUMP: stack dumper started, will log every {interval_s}s — "
+                "look for '=== Thread stack dump' lines when pipeline appears stuck"
+            )
+        except Exception:
+            pass
         while True:
             try:
                 _time.sleep(interval_s)
@@ -302,7 +311,9 @@ def _start_stack_dump_thread(interval_s: int = 300) -> None:
                     nm = names.get(tid, "?")
                     lines.append(f"--- Thread {tid} ({nm}) ---")
                     lines.append("".join(_tb.format_stack(frame)).rstrip())
-                logger.info("\n".join(lines))
+                # Use a single multi-line message + force a flush via warning
+                # level so MiCore's log capture doesn't drop / buffer it.
+                logger.warning("\n".join(lines))
             except Exception as exc:
                 # Never let the diagnostic thread itself crash the pipeline.
                 try:
@@ -315,11 +326,10 @@ def _start_stack_dump_thread(interval_s: int = 300) -> None:
 
 
 # Start the diagnostic thread immediately on module load. Daemon thread so
-# it won't keep the process alive on shutdown. Interval is 5 min by default
-# — short enough that a stuck worker shows up quickly, long enough to keep
-# logs readable on healthy runs.
+# it won't keep the process alive on shutdown. 90s interval — short enough
+# that a stuck worker shows up quickly while debugging large batches.
 try:
-    _start_stack_dump_thread(interval_s=300)
+    _start_stack_dump_thread(interval_s=90)
 except Exception:
     pass
 
@@ -2499,28 +2509,57 @@ def _is_timeout_error(exc: Exception) -> bool:
     ))
 
 
-def _invoke_llm_with_timeout(llm, messages: list, timeout_s: int = 120):
-    """Invoke `llm.invoke(messages)` with a hard wall-clock timeout.
+def _call_with_timeout(fn, *args, timeout_s: int = 120, label: str = "remote-call", **kwargs):
+    """Run any callable with a hard wall-clock timeout.
 
-    LangChain's `AzureChatOpenAI` has no default request timeout — a hung
-    socket read blocks the worker thread forever with no exception and no
-    log line ("silent stuck"). This helper runs the invoke on a one-shot
-    ThreadPoolExecutor and forces a TimeoutError if it overruns, so the
-    surrounding retry logic can recover.
+    The #1 cause of "silent stuck" pipelines is a network call with no
+    timeout: AzureChatOpenAI, AzureOpenAIEmbeddings, and the MiCore
+    Pinecone helpers (search_via_service / ingest_via_service) all have
+    no default request timeout, so a hung socket read blocks the worker
+    forever with no exception and no log line.
+
+    This helper runs the callable on a one-shot ThreadPoolExecutor and
+    forces a TimeoutError if it overruns, so the surrounding retry logic
+    can recover. `label` is included in the error message so logs make
+    it clear which call timed out (LLM / embedding / pinecone-search /
+    pinecone-ingest / etc.).
     """
     import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-call") as ex:
-        fut = ex.submit(llm.invoke, messages)
+    with _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix=label) as ex:
+        fut = ex.submit(fn, *args, **kwargs)
         try:
             return fut.result(timeout=timeout_s)
         except _cf.TimeoutError as exc:
-            # Best-effort cancel — Azure OpenAI HTTP request will still
-            # run to completion in the background, but the worker that
-            # called us is unblocked and the surrounding retry loop fires.
+            # Best-effort cancel — the underlying HTTP request may still
+            # run in the background, but the calling worker is unblocked
+            # and the surrounding retry loop fires.
             fut.cancel()
             raise TimeoutError(
-                f"LLM call exceeded {timeout_s}s wall-clock — aborted to recover from silent stuck"
+                f"{label} exceeded {timeout_s}s wall-clock — aborted to recover from silent stuck"
             ) from exc
+
+
+def _invoke_llm_with_timeout(llm, messages: list, timeout_s: int = 120):
+    """Thin wrapper kept for backward compatibility — delegates to _call_with_timeout."""
+    return _call_with_timeout(llm.invoke, messages, timeout_s=timeout_s, label="llm-call")
+
+
+def _embed_with_timeout(embed_model, text: str, timeout_s: int = 60):
+    """Embed text with a hard timeout. Default 60s — embedding endpoints
+    are typically faster than chat completions; if we're past 60s on a
+    single embed, the call is hung."""
+    return _call_with_timeout(embed_model.embed_query, text, timeout_s=timeout_s, label="embed-query")
+
+
+def _pinecone_search_with_timeout(search_fn, *args, timeout_s: int = 60, **kwargs):
+    """Pinecone query with hard timeout."""
+    return _call_with_timeout(search_fn, *args, timeout_s=timeout_s, label="pinecone-search", **kwargs)
+
+
+def _pinecone_ingest_with_timeout(ingest_fn, *args, timeout_s: int = 120, **kwargs):
+    """Pinecone upsert with hard timeout. Larger budget than search
+    because upserts can include big batches of vectors + metadata."""
+    return _call_with_timeout(ingest_fn, *args, timeout_s=timeout_s, label="pinecone-ingest", **kwargs)
 
 
 def _is_json_format_error(exc: Exception) -> bool:
@@ -4285,8 +4324,9 @@ def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, p
         if not content:
             continue
         try:
-            embedding = embed_model.embed_query(content)
-            ingest_via_service(
+            embedding = _embed_with_timeout(embed_model, content)
+            _pinecone_ingest_with_timeout(
+                ingest_via_service,
                 index_name=pinecone_index,
                 namespace=pinecone_ns,
                 text_key="page_content",
@@ -5076,8 +5116,9 @@ def _run_benchmark(
             )
 
             try:
-                embedding = embed_model.embed_query(bench_text)
-                raw_similar = search_via_service(
+                embedding = _embed_with_timeout(embed_model, bench_text)
+                raw_similar = _pinecone_search_with_timeout(
+                    search_via_service,
                     index_name=pinecone_index,
                     namespace=pinecone_ns,
                     text_key="page_content",
@@ -6250,8 +6291,9 @@ def _run_embeddings_v2(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str
             logger.warning(f"[V2 {pr_no}] dtl_id={dtl_id}: no text to embed, skipping")
             continue
         try:
-            embedding = embed_model.embed_query(content)
-            ingest_via_service(
+            embedding = _embed_with_timeout(embed_model, content)
+            _pinecone_ingest_with_timeout(
+                ingest_via_service,
                 index_name=pinecone_index,
                 namespace=pinecone_ns,
                 text_key="page_content",
@@ -6376,7 +6418,8 @@ def _pinecone_narrow_within_pool(
     # search_via_service requires query to be at least 1 char
     query = query_text.strip() or "item"
     try:
-        raw = search_via_service(
+        raw = _pinecone_search_with_timeout(
+            search_via_service,
             index_name=pinecone_index,
             namespace=pinecone_ns,
             text_key="page_content",
@@ -6688,7 +6731,7 @@ def _run_benchmark_v2(
             # ── Stage B — Pinecone vector search (independent of SQL pool) ──
             pinecone_dtl_ids: list[int] = []
             try:
-                embedding = embed_model.embed_query(embed_text)
+                embedding = _embed_with_timeout(embed_model, embed_text)
                 narrowed = _pinecone_narrow_within_pool(
                     embedding, [], pinecone_top_k, pinecone_index, pinecone_ns,
                     min_score=min_score, query_text=embed_text,
