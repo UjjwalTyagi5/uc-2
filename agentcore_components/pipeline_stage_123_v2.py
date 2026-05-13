@@ -5888,13 +5888,11 @@ def _pinecone_narrow_within_pool(
     min_score: float = 0.70,
     query_text: str = "",
 ) -> list[dict]:
-    """Stage B — Pinecone similarity search, then post-filter to the SQL pool.
+    """Stage B — Pinecone similarity search with optional pool restriction.
     Fetches top_k * 5 from Pinecone (filter kwarg not supported by
-    search_via_service), then keeps only matches that are in candidate_dtl_ids
-    AND meet the min_score threshold, returning up to top_k survivors."""
-    if not candidate_dtl_ids:
-        return []
-    pool_set = set(candidate_dtl_ids)
+    search_via_service), applies min_score threshold, and optionally restricts
+    to candidate_dtl_ids pool. Pass an empty list to search globally."""
+    pool_set = set(candidate_dtl_ids)  # empty = no pool restriction
     from agentcore.services.pinecone_service_client import search_via_service
     # search_via_service requires query to be at least 1 char
     query = query_text.strip() or "item"
@@ -5922,8 +5920,13 @@ def _pinecone_narrow_within_pool(
         meta = (m.get("metadata") if isinstance(m, dict) else {}) or {}
         did = meta.get("purchase_dtl_id")
         try:
-            if did is not None and int(did) in pool_set:
-                filtered.append(m)
+            did_int = int(did) if did is not None else None
+            if did_int is None:
+                continue
+            # If pool_set is non-empty, restrict to pool; otherwise accept any match
+            if pool_set and did_int not in pool_set:
+                continue
+            filtered.append(m)
         except Exception:
             continue
         if len(filtered) >= top_k:
@@ -6173,51 +6176,44 @@ def _run_benchmark_v2(
                                       "V2 — no embed_content / no descriptor fields")
                 continue
 
-            # Stage A — SQL category pool; own PR's DTL IDs excluded in SQL
+            # ── Stage A — SQL category pool ───────────────────────────────
             own_excl = list(current_pr_dtl_ids)
-            pool = _sql_pool_by_category(tgt_cs, src_cat, src_date, sql_pool_size, own_excl)
-            filter_chain = "sql_category"
-            if len(pool) < 20 and widen_when_sparse:
-                widened = _widen_pool_by_levels(
-                    tgt_cs, rd.get("item_level_1") or "", rd.get("item_level_2") or "",
-                    src_date, sql_pool_size, own_excl,
-                )
-                seen_ids = set(pool)
-                for did in widened:
-                    if did not in seen_ids and len(pool) < sql_pool_size:
-                        pool.append(did); seen_ids.add(did)
-                if widened:
-                    filter_chain += "+widen_l1l2"
-                    logger.info(
-                        f"[V2 {pr_no}] dtl_id={dtl_id} sparse category pool — "
-                        f"widened to L1+L2 added {len(widened)} dtl_ids"
+            filter_chain = ""
+            try:
+                pool: list[int] = _sql_pool_by_category(tgt_cs, src_cat, src_date, sql_pool_size, own_excl)
+                filter_chain = "sql_category"
+                if len(pool) < 20 and widen_when_sparse:
+                    widened = _widen_pool_by_levels(
+                        tgt_cs, rd.get("item_level_1") or "", rd.get("item_level_2") or "",
+                        src_date, sql_pool_size, own_excl,
                     )
+                    seen_ids = set(pool)
+                    for did in widened:
+                        if did not in seen_ids and len(pool) < sql_pool_size:
+                            pool.append(did); seen_ids.add(did)
+                    if widened:
+                        filter_chain += "+widen_l1l2"
+                        logger.info(
+                            f"[V2 {pr_no}] dtl_id={dtl_id} sparse pool — "
+                            f"widened to L1+L2, added {len(widened)} dtl_ids"
+                        )
+                logger.info(f"[V2 {pr_no}] dtl_id={dtl_id} Stage A: {len(pool)} SQL candidate(s)")
+            except Exception as exc:
+                logger.error(
+                    f"[V2 {pr_no}] dtl_id={dtl_id} Stage A (SQL pool) failed: {exc}",
+                    exc_info=True,
+                )
+                pool = []
+                filter_chain = "sql_failed"
 
-            if not pool:
-                _write_benchmark_stub(cur2, dtl_id, item_uuid,
-                                      f"V2 — no peer pool for category {src_cat!r}")
-                continue
-
-            # Stage B — Pinecone within pool, self-matches removed
+            # ── Stage B — Pinecone vector search (independent of SQL pool) ──
+            pinecone_dtl_ids: list[int] = []
             try:
                 embedding = embed_model.embed_query(embed_text)
                 narrowed = _pinecone_narrow_within_pool(
-                    embedding, pool, pinecone_top_k, pinecone_index, pinecone_ns,
+                    embedding, [], pinecone_top_k, pinecone_index, pinecone_ns,
                     min_score=min_score, query_text=embed_text,
                 )
-                filter_chain += "+pinecone"
-            except Exception as exc:
-                if _is_pinecone_server_error(exc):
-                    raise RuntimeError(
-                        f"Pinecone server error during V2 benchmark for PR={pr_no}: {exc}"
-                    ) from exc
-                logger.warning(
-                    f"[V2 {pr_no}] dtl_id={dtl_id} Pinecone within-pool failed: {exc}"
-                )
-                narrowed = []
-
-            if narrowed:
-                stage_b_dtl_ids: list[int] = []
                 for m in narrowed:
                     meta = (m.get("metadata") if isinstance(m, dict) else {}) or {}
                     did = meta.get("purchase_dtl_id")
@@ -6225,22 +6221,50 @@ def _run_benchmark_v2(
                         try:
                             did_int = int(did)
                             if did_int not in current_pr_dtl_ids:
-                                stage_b_dtl_ids.append(did_int)
+                                pinecone_dtl_ids.append(did_int)
                         except Exception:
                             continue
-            else:
-                stage_b_dtl_ids = [did for did in pool[:pinecone_top_k] if did not in current_pr_dtl_ids]
-                filter_chain += "_skipped"
+                filter_chain += "+pinecone"
+                logger.info(f"[V2 {pr_no}] dtl_id={dtl_id} Stage B: {len(pinecone_dtl_ids)} Pinecone match(es)")
+            except Exception as exc:
+                if _is_pinecone_server_error(exc):
+                    raise RuntimeError(
+                        f"Pinecone server error during V2 benchmark for PR={pr_no}: {exc}"
+                    ) from exc
+                logger.error(
+                    f"[V2 {pr_no}] dtl_id={dtl_id} Stage B (Pinecone) failed: {exc}",
+                    exc_info=True,
+                )
+                filter_chain += "+pinecone_failed"
 
-            # Stage C — LLM ranking, self-matches removed
-            candidates = _fetch_candidate_snapshots(tgt_cs, stage_b_dtl_ids)
-            source_snapshot = _build_source_snapshot_for_rank(rd)
-            selected, rejected = _llm_rank_candidates(
-                llm, source_snapshot, candidates, llm_shortlist, prompts,
+            # ── Combine Stage A + Stage B, deduplicate ────────────────────
+            combined_dtl_ids: list[int] = list(pool)
+            seen_combined: set[int] = set(pool)
+            for did in pinecone_dtl_ids:
+                if did not in seen_combined:
+                    combined_dtl_ids.append(did)
+                    seen_combined.add(did)
+            logger.info(
+                f"[V2 {pr_no}] dtl_id={dtl_id} combined A+B: {len(combined_dtl_ids)} unique candidate(s) "
+                f"(sql={len(pool)}, pinecone={len(pinecone_dtl_ids)})"
             )
-            if selected:
-                filter_chain += "+llm_rank"
-                shortlist_dtl_ids: list[int] = []
+
+            if not combined_dtl_ids:
+                _write_benchmark_stub(
+                    cur2, dtl_id, item_uuid,
+                    f"V2 chain={filter_chain} — Stage A and Stage B both returned no candidates",
+                )
+                continue
+
+            # ── Stage C — LLM relevance ranking ───────────────────────────
+            shortlist_dtl_ids: list[int] = []
+            rejected: list = []
+            try:
+                candidates = _fetch_candidate_snapshots(tgt_cs, combined_dtl_ids)
+                source_snapshot = _build_source_snapshot_for_rank(rd)
+                selected, rejected = _llm_rank_candidates(
+                    llm, source_snapshot, candidates, llm_shortlist, prompts,
+                )
                 for s in selected:
                     if not isinstance(s, dict):
                         continue
@@ -6252,14 +6276,22 @@ def _run_benchmark_v2(
                                 shortlist_dtl_ids.append(sid_int)
                         except Exception:
                             continue
-            else:
-                shortlist_dtl_ids = [did for did in stage_b_dtl_ids[:llm_shortlist] if did not in current_pr_dtl_ids]
-                filter_chain += "+rank_skipped"
+                filter_chain += "+llm_rank"
+                logger.info(
+                    f"[V2 {pr_no}] dtl_id={dtl_id} Stage C: {len(shortlist_dtl_ids)} shortlisted, "
+                    f"{len(rejected)} rejected"
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[V2 {pr_no}] dtl_id={dtl_id} Stage C (LLM rank) failed: {exc}",
+                    exc_info=True,
+                )
+                filter_chain += "+llm_rank_failed"
 
             if not shortlist_dtl_ids:
                 _write_benchmark_stub(
                     cur2, dtl_id, item_uuid,
-                    f"V2 chain={filter_chain} — no candidates survived ranking. "
+                    f"V2 chain={filter_chain} — no candidates survived Stage C ranking. "
                     f"rejected={json.dumps(rejected, ensure_ascii=False)[:1500]}",
                 )
                 continue
@@ -6358,10 +6390,9 @@ def _run_benchmark_v2(
                 extras.append(f"n={agg['count']} (priced={agg.get('priced_count', 0)})")
             if "median" in agg:
                 extras.append(f"median={agg['median']} EUR")
-            v2_tag = f"V2 chain={filter_chain} | shortlist={len(shortlist_dtl_ids)}"
             summary = (
-                f"[{v2_tag} | {', '.join(extras)}] {llm_summary}".strip()
-                if extras else f"[{v2_tag}] {llm_summary}".strip()
+                f"[{', '.join(extras)}] {llm_summary}".strip()
+                if extras else llm_summary
             )
 
             bp_dec_u   = bp_dec   if llm_succeeded else None
