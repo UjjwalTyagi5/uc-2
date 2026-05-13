@@ -3722,25 +3722,36 @@ def _apply_price_alignment_boost(items: list[dict], ctx: RASContext, thresholds:
 
 
 def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None = None) -> None:
-    """Per-DTL Union-Find supplier name canonicalization with supplier_country guard.
+    """PR-wide Union-Find supplier name canonicalization with country guard.
 
-    Mirrors doc-intel ExtractionWriter.canonicalize_supplier_names_in_db
-    (the production variant — not the in-memory geo-token variant):
-      1. Group items by purchase_dtl_id.
-      2. Within each DTL_ID, cluster supplier_name variants using four merge
-         rules: exact, substring, SequenceMatcher ratio ≥ 0.82, acronym.
-      3. Country guard: if both items have a non-empty supplier_country and
-         those countries differ, they are NOT merged — different country
-         branches stay separate suppliers.
-      4. Canonical preference: RAS-known supplier_name first, else shortest.
+    Clusters supplier_name variants across ALL DTLs in the current PR (a
+    supplier that quotes on multiple line items can have slightly different
+    name spellings on each quote — e.g. "Motherson Automotive Technologies
+    & Engineering (MATE - ROBIS)" vs "Motherson Automotive Technologies &
+    Engineering (A Division of Motherson Sumi Systems Ltd.)"). Five merge
+    rules — applied in this order so cheaper checks short-circuit:
+      1. Exact (after contact-suffix strip + lowercase).
+      2. Substring.
+      3. Paren-stripped exact ("X (Branch A)" + "X (Branch B)" → both
+         strip to "X" and merge — handles the Motherson case where
+         qualifying parentheticals differ but the legal name is identical).
+      4. SequenceMatcher ratio >= _CANONICALIZE_THRESHOLD (0.82 default).
+      5. Acronym ("MATE" matches "Motherson Automotive Tech & Eng").
 
-    After clustering, supplier_match_conf is recomputed for ALL items against
-    the RAS supplier set (matches doc-intel run.py step 6 — fresh scores so
-    ranking uses canonical names; this also wipes the earlier
-    _apply_price_alignment_boost, same as doc-intel).
+    Country guard — two names do NOT merge when either:
+      - both have non-empty supplier_country and they differ, OR
+      - both have a geo-token (city/country) in the name itself and
+        those tokens differ.
+    So "ENGEL Machinery (Shanghai) Co., Ltd." and "ENGEL Machinery Korea
+    LTD" stay separate even though every other rule would match them.
+
+    Canonical preference within a cluster: RAS-known supplier_name first,
+    else the shortest member. After clustering, supplier_match_conf is
+    recomputed for ALL items against the RAS supplier set so ranking uses
+    canonical names (this also wipes the earlier _apply_price_alignment_boost,
+    same as doc-intel).
     """
     from difflib import SequenceMatcher
-    from collections import defaultdict
 
     # Build RAS-known name set for canonical preference (matches doc-intel)
     ras_known: set[str] = set()
@@ -3754,99 +3765,100 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
 
     threshold = (thresholds or {}).get("canonicalize_threshold", _CANONICALIZE_THRESHOLD)
 
-    # Group items by purchase_dtl_id (None → not clustered, keeps raw name)
-    by_dtl: dict[int, list[dict]] = defaultdict(list)
-    for item in items:
-        dtl_id = item.get("purchase_dtl_id")
-        if dtl_id is not None:
-            by_dtl[dtl_id].append(item)
-
-    # (dtl_id, raw_name) → canonical_name
-    canonical_per_dtl: dict[tuple[int, str], str] = {}
-
-    for dtl_id, dtl_items in by_dtl.items():
-        # Collect unique names + first non-empty country seen per name
-        raw_names: list[str] = []
-        name_country: dict[str, str] = {}
-        for it in dtl_items:
-            n = (it.get("supplier_name") or "").strip()
-            if not n:
-                continue
-            if n not in name_country:
-                raw_names.append(n)
-                name_country[n] = (it.get("supplier_country") or "").strip().lower()
-
-        if len(raw_names) < 2:
+    # Collect unique supplier names across the WHOLE PR (cross-DTL) along
+    # with the first non-empty country seen for each name.
+    raw_names: list[str] = []
+    name_country: dict[str, str] = {}
+    for it in items:
+        n = (it.get("supplier_name") or "").strip()
+        if not n:
             continue
+        if n not in name_country:
+            raw_names.append(n)
+            name_country[n] = (it.get("supplier_country") or "").strip().lower()
 
-        uf: dict[str, str] = {n: n for n in raw_names}
+    if len(raw_names) < 2:
+        # Still recompute supplier_match_conf for consistency with prior
+        # behaviour (fresh scores against RAS suppliers).
+        for item in items:
+            _, new_conf = _compute_supplier_match(item.get("supplier_name"), ctx, thresholds)
+            item["supplier_match_conf"] = new_conf
+        return
 
-        def _find(x: str) -> str:
-            while uf[x] != x:
-                uf[x] = uf[uf[x]]
-                x = uf[x]
-            return x
+    uf: dict[str, str] = {n: n for n in raw_names}
 
-        def _union(a: str, b: str) -> None:
-            uf[_find(a)] = _find(b)
+    def _find(x: str) -> str:
+        while uf[x] != x:
+            uf[x] = uf[uf[x]]
+            x = uf[x]
+        return x
 
-        for i, a in enumerate(raw_names):
-            a_clean   = _strip_contact_suffix(a).lower()
-            a_country = name_country.get(a, "")
-            a_geo     = _name_geo_tokens(a_clean)
-            for b in raw_names[i + 1:]:
-                b_clean   = _strip_contact_suffix(b).lower()
-                b_country = name_country.get(b, "")
-                b_geo     = _name_geo_tokens(b_clean)
+    def _union(a: str, b: str) -> None:
+        uf[_find(a)] = _find(b)
 
-                # Country-branch guard — combines BOTH doc-intel variants:
-                #   1. supplier_country column (writer.py canonicalize_in_db)
-                #   2. geo-token in the supplier_name itself
-                #      (extractor.py canonicalize_supplier_names)
-                # Either signal alone is enough to keep two names separate,
-                # so "ACME Corp India" / "ACME Corp China" don't merge even
-                # when the LLM forgot to extract supplier_country.
-                if a_country and b_country and a_country != b_country:
-                    continue
-                if a_geo and b_geo and a_geo != b_geo:
-                    continue
+    def _strip_parens(s: str) -> str:
+        # Remove parenthetical qualifiers ("(MATE - ROBIS)", "(A Division
+        # of Motherson Sumi Systems Ltd.)") so the legal core name can be
+        # compared directly. Geo info that appears in parens is still
+        # protected by the geo-token guard applied above.
+        return re.sub(r"\([^)]*\)", "", s).strip()
 
-                if a_clean == b_clean:
-                    _union(a, b)
-                elif a_clean in b_clean or b_clean in a_clean:
-                    _union(a, b)
-                elif SequenceMatcher(None, a_clean, b_clean).ratio() >= threshold:
-                    _union(a, b)
-                elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
-                    _union(a, b)
+    for i, a in enumerate(raw_names):
+        a_clean   = _strip_contact_suffix(a).lower()
+        a_country = name_country.get(a, "")
+        a_geo     = _name_geo_tokens(a_clean)
+        a_paren   = _strip_parens(a_clean)
+        for b in raw_names[i + 1:]:
+            b_clean   = _strip_contact_suffix(b).lower()
+            b_country = name_country.get(b, "")
+            b_geo     = _name_geo_tokens(b_clean)
+            b_paren   = _strip_parens(b_clean)
 
-        clusters: dict[str, list[str]] = defaultdict(list)
-        for n in raw_names:
-            clusters[_find(n)].append(n)
+            # Country-branch guard — keeps "ACME Corp India" and
+            # "ACME Corp China" separate even when the LLM forgot to
+            # extract supplier_country for one of them.
+            if a_country and b_country and a_country != b_country:
+                continue
+            if a_geo and b_geo and a_geo != b_geo:
+                continue
 
-        for members in clusters.values():
-            ras_match = next((m for m in members if m.lower() in ras_known), None)
-            canonical = ras_match if ras_match else min(members, key=len)
-            for m in members:
-                canonical_per_dtl[(dtl_id, m)] = canonical
+            if a_clean == b_clean:
+                _union(a, b)
+            elif a_clean in b_clean or b_clean in a_clean:
+                _union(a, b)
+            elif a_paren and b_paren and a_paren == b_paren:
+                _union(a, b)
+            elif SequenceMatcher(None, a_clean, b_clean).ratio() >= threshold:
+                _union(a, b)
+            elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
+                _union(a, b)
 
-    # Apply canonical names + recompute supplier_match_conf for ALL items
-    # (matches doc-intel run.py step 6 — fresh scores against RAS suppliers).
+    from collections import defaultdict
+    clusters: dict[str, list[str]] = defaultdict(list)
+    for n in raw_names:
+        clusters[_find(n)].append(n)
+
+    canonical_names: dict[str, str] = {}
+    for members in clusters.values():
+        ras_match = next((m for m in members if m.lower() in ras_known), None)
+        canonical = ras_match if ras_match else min(members, key=len)
+        for m in members:
+            canonical_names[m] = canonical
+
+    # Apply canonical names + recompute supplier_match_conf for ALL items.
     changed = 0
     for item in items:
-        dtl_id = item.get("purchase_dtl_id")
-        orig   = (item.get("supplier_name") or "").strip()
-        if dtl_id is not None and orig:
-            canon = canonical_per_dtl.get((dtl_id, orig), orig)
+        orig = (item.get("supplier_name") or "").strip()
+        if orig:
+            canon = canonical_names.get(orig, orig)
             if canon != orig:
                 item["supplier_name"] = canon
                 changed += 1
-        # Recompute conf for every item against the (possibly canonical) name
         _, new_conf = _compute_supplier_match(item.get("supplier_name"), ctx, thresholds)
         item["supplier_match_conf"] = new_conf
 
     if changed:
-        logger.info(f"Supplier canonicalization (per-DTL): {changed} name(s) updated")
+        logger.info(f"Supplier canonicalization (PR-wide): {changed} name(s) updated")
 
 
 # ── DB writer: extracted items ─────────────────────────────────────────────────
@@ -5315,6 +5327,30 @@ def _parse_pr_list_from_excel_bytes(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# Single source of truth for legacy → canonical category renames.
+# Used by _resolve_category_list (read-side normalisation), by
+# _category_with_aliases (SQL Stage A expansion), and by _normalise_category
+# (write-side enforcement so LLM-emitted legacy names never land in the DB).
+# Lookups against this map are case-insensitive and punctuation-tolerant.
+_CATEGORY_ALIASES: dict = {
+    "IMM":                          "Moulding Machine",
+    "I.M.M.":                       "Moulding Machine",
+    "Injection Moulding Machine":   "Moulding Machine",
+    "Injection Molding Machine":    "Moulding Machine",
+    "Molding Machine":              "Moulding Machine",
+    "IMM Auxiliary":                "Moulding Machine Auxiliaries",
+    "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
+    "Molding Machine Auxiliary":    "Moulding Machine Auxiliaries",
+    "Molding Machine Auxiliaries":  "Moulding Machine Auxiliaries",
+    "Moulding Machine Auxiliary":   "Moulding Machine Auxiliaries",
+    "IMM Spare":                    "Moulding Machine Spares",
+    "IMM Spares":                   "Moulding Machine Spares",
+    "Moulding Machine Spare":       "Moulding Machine Spares",
+    "Molding Machine Spare":        "Moulding Machine Spares",
+    "Molding Machine Spares":       "Moulding Machine Spares",
+}
+
+
 def _resolve_category_list(
     tgt_cs: str,
     _SEED: list = (
@@ -5363,18 +5399,7 @@ def _resolve_category_list(
         "Fire Safety and Alarm System", "TBE Negotiated by MCO Tooling",
         "Treatment Plant", "Moulding Machine Spares",
     ),
-    _ALIASES: dict = {
-        # Strict duplicates only — names confirmed to refer to the SAME
-        # category as a canonical entry in the standard taxonomy.
-        # Historical rows in quotation_extracted_items are normalised on
-        # read so the LLM never sees both "IMM" and "Moulding Machine".
-        "IMM":                          "Moulding Machine",
-        "Injection Moulding Machine":   "Moulding Machine",
-        "Injection Molding Machine":    "Moulding Machine",
-        "IMM Auxiliary":                "Moulding Machine Auxiliaries",
-        "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
-        "IMM Spares":                   "Moulding Machine Spares",
-    },
+    _ALIASES: dict = _CATEGORY_ALIASES,
     _TTL: int = 300,
 ) -> list[str]:
     """Returns the seed list UNION every distinct purchase_category_llm
@@ -5420,11 +5445,38 @@ def _resolve_category_list(
             return False
         s = str(v).strip()
         return bool(s) and s.lower() not in _DROP
-    def _canon(v: Any) -> str:
+    # Case-insensitive + whitespace-normalised alias lookup so "imm",
+    # "  Injection   Molding Machine  ", "Molding machine" all hit the
+    # same canonical bucket as "Moulding Machine".
+    _alias_norm = {" ".join(k.lower().split()): v for k, v in _ALIASES.items()}
+    seed_clean = [str(c).strip() for c in _SEED if _ok(c)]
+    seed_norm  = {" ".join(c.lower().split()): c for c in seed_clean}
+    def _canon(v: Any, *, use_fuzzy: bool = False) -> str:
         s = str(v).strip()
-        return _ALIASES.get(s, s)
-    seed  = {_canon(c) for c in _SEED          if _ok(c)}
-    dbset = {_canon(c) for c in db_categories if _ok(c)}
+        if not s:
+            return s
+        n = " ".join(s.lower().split())
+        # 1. Explicit alias map (IMM-family, etc.)
+        if n in _alias_norm:
+            return _alias_norm[n]
+        # 2. Already canonical (case/whitespace-normalised)
+        if n in seed_norm:
+            return seed_norm[n]
+        # 3. Fuzzy match against seed — only applied to DB values so the
+        #    LLM never sees near-duplicates like "Compressors" vs "Compressor"
+        if use_fuzzy and seed_norm:
+            import difflib
+            m = difflib.get_close_matches(n, list(seed_norm.keys()), n=1, cutoff=0.88)
+            if m:
+                snapped = seed_norm[m[0]]
+                logger.info(
+                    f"V2 _resolve_category_list: fuzzy-snap DB value "
+                    f"'{s}' → '{snapped}'"
+                )
+                return snapped
+        return s
+    seed  = {_canon(c)                   for c in _SEED          if _ok(c)}
+    dbset = {_canon(c, use_fuzzy=True)   for c in db_categories  if _ok(c)}
     combined = sorted(seed | dbset, key=str.lower)
     cache[tgt_cs] = (now, combined)
     return combined
@@ -5432,36 +5484,121 @@ def _resolve_category_list(
 
 def _category_with_aliases(
     category: str,
-    _ALIASES: dict = {
-        "IMM":                          "Moulding Machine",
-        "Injection Moulding Machine":   "Moulding Machine",
-        "Injection Molding Machine":    "Moulding Machine",
-        "IMM Auxiliary":                "Moulding Machine Auxiliaries",
-        "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
-        "IMM Spares":                   "Moulding Machine Spares",
-    },
+    _ALIASES: dict = _CATEGORY_ALIASES,
 ) -> list[str]:
     """Return the canonical category plus any legacy aliases that map to it.
     Used by SQL Stage A so a search for "Moulding Machine" also matches
-    historical rows still classified as "IMM" in the DB."""
+    historical rows still classified as "IMM" / "Injection Molding Machine"
+    / etc. Lookup is case-insensitive and whitespace-normalised."""
     if not category:
         return []
-    canon = _ALIASES.get(category.strip(), category.strip())
-    legacy = [old for old, new in _ALIASES.items() if new == canon]
-    return [canon] + legacy
+    alias_norm = {" ".join(k.lower().split()): v for k, v in _ALIASES.items()}
+    raw = category.strip()
+    canon = alias_norm.get(" ".join(raw.lower().split()), raw)
+    legacy = [k for k, v in _ALIASES.items() if v == canon]
+    seen: set = set()
+    out: list[str] = []
+    for name in [canon] + legacy:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out
 
 
-def _normalise_category(value: Any, allowed: list[str]) -> str:
-    """Snap an LLM-emitted category to the canonical case from `allowed`
-    when a case-insensitive match exists; otherwise return the stripped
-    raw value (treated as a newly-proposed category)."""
+def _normalise_category(
+    value: Any,
+    allowed: list[str],
+    aliases: dict = _CATEGORY_ALIASES,
+    _FUZZY_CUTOFF: float = 0.85,
+) -> str:
+    """Snap an LLM-emitted category to the canonical name from `allowed`.
+
+    Generic — works for any product category, not IMM-specific. The DB
+    never accumulates near-duplicates regardless of how the LLM spells
+    or punctuates the category. Tiered matching (most specific first):
+
+      0a. Alias map exact   — case-insensitive, whitespace-collapsed key
+                              ("IMM" → "Moulding Machine"; "IMM Auxiliary"
+                              → "Moulding Machine Auxiliaries" — these two
+                              stay DISTINCT because the alias map has
+                              separate entries for each).
+      0b. Alias map punct   — punctuation-stripped key
+                              ("I.M.M." → "Moulding Machine"; "I.M.M.
+                              Auxiliary" → "Moulding Machine Auxiliaries").
+      1.  Canonical exact   — case + whitespace normalised.
+      2.  Canonical punct   — punctuation stripped.
+      3.  Canonical fuzzy   — difflib SequenceMatcher ratio >= 0.85
+                              ("Compressors" → "Compressor"; "Moudling
+                              Machine" → "Moulding Machine"; "Robot Arm"
+                              vs "Robot" stays separate at ~0.62).
+
+    Importantly, IMM-family aliases are checked BEFORE fuzzy matching so
+    "IMM Auxiliary" cannot be mismerged into "IMM" or "Moulding Machine"
+    by accidental string similarity — each alias key maps to its specific
+    canonical target.
+
+    Logs every snap so corrections are auditable.
+    """
     if not value:
         return ""
     raw = str(value).strip()
     if not raw:
         return ""
-    lookup = {c.lower(): c for c in allowed}
-    return lookup.get(raw.lower(), raw)
+    if not allowed:
+        return raw
+
+    def _norm(s: str) -> str:
+        return " ".join(s.lower().split())
+
+    def _strip_punct(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", _norm(s))
+
+    raw_norm  = _norm(raw)
+    raw_punct = _strip_punct(raw)
+
+    # 0. Alias map — check FIRST so "IMM" → "Moulding Machine" works even
+    #    when fuzzy match would fail (IMM too lexically different from
+    #    Moulding Machine). Distinct alias keys keep IMM vs IMM Auxiliary
+    #    routed to their separate canonical targets.
+    if aliases:
+        alias_norm  = {_norm(k): v for k, v in aliases.items()}
+        if raw_norm in alias_norm:
+            return alias_norm[raw_norm]
+        alias_punct = {_strip_punct(k): v for k, v in aliases.items()}
+        if raw_punct and raw_punct in alias_punct:
+            snapped = alias_punct[raw_punct]
+            logger.info(f"_normalise_category: alias-punct-snap '{raw}' → '{snapped}'")
+            return snapped
+
+    # 1. Exact match against canonical list
+    lookup_norm = {_norm(c): c for c in allowed}
+    if raw_norm in lookup_norm:
+        return lookup_norm[raw_norm]
+
+    # 2. Punctuation-stripped match against canonical list
+    lookup_punct = {_strip_punct(c): c for c in allowed}
+    if raw_punct and raw_punct in lookup_punct:
+        snapped = lookup_punct[raw_punct]
+        logger.info(f"_normalise_category: punct-snap '{raw}' → '{snapped}'")
+        return snapped
+
+    # 3. Fuzzy match against canonical (high cutoff — keeps distinct
+    #    concepts like "Robot Arm" vs "Robot" separate)
+    import difflib
+    matches = difflib.get_close_matches(
+        raw_norm, list(lookup_norm.keys()), n=1, cutoff=_FUZZY_CUTOFF
+    )
+    if matches:
+        snapped = lookup_norm[matches[0]]
+        logger.info(
+            f"_normalise_category: fuzzy-snap '{raw}' → '{snapped}' "
+            f"(ratio>={_FUZZY_CUTOFF})"
+        )
+        return snapped
+
+    # 4. Genuinely new category — caller treats as a proposal
+    return raw
 
 
 def _strip_brand_from_embed_content(text: str, brand_tokens: list[str]) -> tuple[str, list[str]]:
