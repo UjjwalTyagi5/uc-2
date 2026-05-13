@@ -5327,28 +5327,13 @@ def _parse_pr_list_from_excel_bytes(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# Single source of truth for legacy → canonical category renames.
-# Used by _resolve_category_list (read-side normalisation), by
-# _category_with_aliases (SQL Stage A expansion), and by _normalise_category
-# (write-side enforcement so LLM-emitted legacy names never land in the DB).
-# Lookups against this map are case-insensitive and punctuation-tolerant.
-_CATEGORY_ALIASES: dict = {
-    "IMM":                          "Moulding Machine",
-    "I.M.M.":                       "Moulding Machine",
-    "Injection Moulding Machine":   "Moulding Machine",
-    "Injection Molding Machine":    "Moulding Machine",
-    "Molding Machine":              "Moulding Machine",
-    "IMM Auxiliary":                "Moulding Machine Auxiliaries",
-    "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
-    "Molding Machine Auxiliary":    "Moulding Machine Auxiliaries",
-    "Molding Machine Auxiliaries":  "Moulding Machine Auxiliaries",
-    "Moulding Machine Auxiliary":   "Moulding Machine Auxiliaries",
-    "IMM Spare":                    "Moulding Machine Spares",
-    "IMM Spares":                   "Moulding Machine Spares",
-    "Moulding Machine Spare":       "Moulding Machine Spares",
-    "Molding Machine Spare":        "Moulding Machine Spares",
-    "Molding Machine Spares":       "Moulding Machine Spares",
-}
+# Legacy → canonical category aliases. Kept inline as a default argument
+# in each function that uses it (NOT as a module-level constant) — MiCore
+# Custom-Component exec contexts don't reliably expose module-level
+# assignments to function bodies via LOAD_GLOBAL, but default args are
+# captured at def-time which IS reliable in that context. The dict
+# is therefore duplicated across three functions; keep them in sync
+# when adding new aliases.
 
 
 def _resolve_category_list(
@@ -5399,7 +5384,25 @@ def _resolve_category_list(
         "Fire Safety and Alarm System", "TBE Negotiated by MCO Tooling",
         "Treatment Plant", "Moulding Machine Spares",
     ),
-    _ALIASES: dict = _CATEGORY_ALIASES,
+    _ALIASES: dict = {
+        # Inline duplicate of category alias map (see comment above the
+        # function — MiCore exec contexts require default-arg capture).
+        "IMM":                          "Moulding Machine",
+        "I.M.M.":                       "Moulding Machine",
+        "Injection Moulding Machine":   "Moulding Machine",
+        "Injection Molding Machine":    "Moulding Machine",
+        "Molding Machine":              "Moulding Machine",
+        "IMM Auxiliary":                "Moulding Machine Auxiliaries",
+        "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
+        "Molding Machine Auxiliary":    "Moulding Machine Auxiliaries",
+        "Molding Machine Auxiliaries":  "Moulding Machine Auxiliaries",
+        "Moulding Machine Auxiliary":   "Moulding Machine Auxiliaries",
+        "IMM Spare":                    "Moulding Machine Spares",
+        "IMM Spares":                   "Moulding Machine Spares",
+        "Moulding Machine Spare":       "Moulding Machine Spares",
+        "Molding Machine Spare":        "Moulding Machine Spares",
+        "Molding Machine Spares":       "Moulding Machine Spares",
+    },
     _TTL: int = 300,
 ) -> list[str]:
     """Returns the seed list UNION every distinct purchase_category_llm
@@ -5484,7 +5487,24 @@ def _resolve_category_list(
 
 def _category_with_aliases(
     category: str,
-    _ALIASES: dict = _CATEGORY_ALIASES,
+    _ALIASES: dict = {
+        # Inline duplicate of category alias map — see _resolve_category_list.
+        "IMM":                          "Moulding Machine",
+        "I.M.M.":                       "Moulding Machine",
+        "Injection Moulding Machine":   "Moulding Machine",
+        "Injection Molding Machine":    "Moulding Machine",
+        "Molding Machine":              "Moulding Machine",
+        "IMM Auxiliary":                "Moulding Machine Auxiliaries",
+        "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
+        "Molding Machine Auxiliary":    "Moulding Machine Auxiliaries",
+        "Molding Machine Auxiliaries":  "Moulding Machine Auxiliaries",
+        "Moulding Machine Auxiliary":   "Moulding Machine Auxiliaries",
+        "IMM Spare":                    "Moulding Machine Spares",
+        "IMM Spares":                   "Moulding Machine Spares",
+        "Moulding Machine Spare":       "Moulding Machine Spares",
+        "Molding Machine Spare":        "Moulding Machine Spares",
+        "Molding Machine Spares":       "Moulding Machine Spares",
+    },
 ) -> list[str]:
     """Return the canonical category plus any legacy aliases that map to it.
     Used by SQL Stage A so a search for "Moulding Machine" also matches
@@ -5509,7 +5529,24 @@ def _category_with_aliases(
 def _normalise_category(
     value: Any,
     allowed: list[str],
-    aliases: dict = _CATEGORY_ALIASES,
+    aliases: dict = {
+        # Inline duplicate of category alias map — see _resolve_category_list.
+        "IMM":                          "Moulding Machine",
+        "I.M.M.":                       "Moulding Machine",
+        "Injection Moulding Machine":   "Moulding Machine",
+        "Injection Molding Machine":    "Moulding Machine",
+        "Molding Machine":              "Moulding Machine",
+        "IMM Auxiliary":                "Moulding Machine Auxiliaries",
+        "IMM Auxiliaries":              "Moulding Machine Auxiliaries",
+        "Molding Machine Auxiliary":    "Moulding Machine Auxiliaries",
+        "Molding Machine Auxiliaries":  "Moulding Machine Auxiliaries",
+        "Moulding Machine Auxiliary":   "Moulding Machine Auxiliaries",
+        "IMM Spare":                    "Moulding Machine Spares",
+        "IMM Spares":                   "Moulding Machine Spares",
+        "Moulding Machine Spare":       "Moulding Machine Spares",
+        "Molding Machine Spare":        "Moulding Machine Spares",
+        "Molding Machine Spares":       "Moulding Machine Spares",
+    },
     _FUZZY_CUTOFF: float = 0.85,
 ) -> str:
     """Snap an LLM-emitted category to the canonical name from `allowed`.
