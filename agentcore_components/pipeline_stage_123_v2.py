@@ -2503,6 +2503,50 @@ def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None =
         if raw_cls not in VALID_CLASSIFICATIONS:
             raw_cls = "Other"
         confidence = float(result.get("confidence", 0.0))
+        
+        # --- ESCALATION LOGIC ---
+        # If classification is 'Other' or confidence is low, and it is a PDF 
+        # (and didn't already use image_b64 for classification), escalate to vision model.
+        needs_escalation = (raw_cls == "Other" or confidence < 0.75)
+        if needs_escalation and not image_b64 and file_type == "pdf":
+            max_pages_vision = max(1, int((prompts or {}).get("cls_max_pages_vision", 1)))
+            vision_samples_b64 = []
+            
+            # Just-In-Time extraction: only open pdfplumber if escalation is truly needed
+            try:
+                import io, base64, pdfplumber
+                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                    pages_to_render = min(len(pdf.pages), max_pages_vision)
+                    for i in range(pages_to_render):
+                        img = pdf.pages[i].to_image(resolution=150)
+                        buf = io.BytesIO()
+                        img.original.save(buf, format="PNG")
+                        vision_samples_b64.append(base64.b64encode(buf.getvalue()).decode())
+            except Exception as e:
+                logger.warning(f"Failed to generate vision sample for {filename}: {e}")
+
+            if vision_samples_b64:
+                logger.info(f"Escalating classification for {filename!r} to vision using {len(vision_samples_b64)} page(s) (conf={confidence:.2f}, cls={raw_cls})")
+                user_prompt = user_image_tmpl.format(
+                    filename=filename, file_type=file_type, extra_metadata=meta_str
+                )
+                
+                content = [{"type": "text", "text": user_prompt}]
+                for b64 in vision_samples_b64:
+                    content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}})
+                    
+                messages = [SystemMessage(content=sys_prompt), HumanMessage(content=content)]
+            response = _call_llm_with_retry(llm, messages, prompts, force_json=True)
+            raw = (getattr(response, "content", None) or str(response)).strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            result = json.loads(raw)
+            
+            raw_cls = result.get("classification", "Other")
+            if raw_cls not in VALID_CLASSIFICATIONS:
+                raw_cls = "Other"
+            confidence = float(result.get("confidence", 0.0))
+
         doc_type   = _CLASSIFICATION_MAP.get(raw_cls, raw_cls)
         return doc_type, confidence
 
@@ -6718,6 +6762,17 @@ class PipelineStage123NodeV2(Node):
             ),
         ),
         IntInput(
+            name="cls_max_pages_vision",
+            display_name="Max Pages — Vision Fallback (Stage 4)",
+            value=5,
+            advanced=True,
+            info=(
+                "Number of pages to capture as high-res images for the vision LLM "
+                "when text-based classification yields 'Other' or low confidence. "
+                "Default is 5 (first 5 pages)."
+            ),
+        ),
+        IntInput(
             name="ext_max_chars",
             display_name="Max Chars — Extraction Document (Stage 5)",
             value=50000,
@@ -7924,6 +7979,8 @@ class PipelineStage123NodeV2(Node):
         # ── Tuning knobs ──────────────────────────────────────────────────
         cls_max = getattr(self, "cls_max_chars", None)
         if cls_max: prompts["cls_max_chars"] = int(cls_max)
+        cls_max_vision = getattr(self, "cls_max_pages_vision", None)
+        if cls_max_vision is not None: prompts["cls_max_pages_vision"] = int(cls_max_vision)
         ext_max = getattr(self, "ext_max_chars", None)
         if ext_max: prompts["ext_max_chars"] = int(ext_max)
         ext_max_pages = getattr(self, "ext_max_pages", None)
