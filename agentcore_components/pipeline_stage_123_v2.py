@@ -1693,34 +1693,85 @@ section — just with these 3 extra fields on each item.
 
 RANK_PROMPT_SYSTEM_V2 = """You are a procurement-benchmark relevance ranker. You receive one source item (a line from a new purchase requisition being benchmarked) and N candidate items (historical purchases retrieved by SQL + vector search). Your job: pick the K candidates most price-relevant to the source.
 
+This pipeline is GENERIC — items can be machines, services, software, raw
+materials, cables, AC units, laptops, anything. Do NOT assume any product
+domain. Apply the rules below as universal procurement-relevance logic.
+
 Apply these rules in order:
 
-1. CRITICAL ATTRIBUTES ARE BARRIERS.
-   For every attribute on the source with importance="critical", compare the
-   candidate's same-name attribute. If the numeric value differs by more than
-   {critical_pct}% (or a string value is not equal), REJECT the candidate
-   regardless of vector similarity. List the rejection under "rejected".
+1. CRITICAL ATTRIBUTE BARRIERS (semantic matching, not strict name matching).
 
-2. IMPORTANT ATTRIBUTES ARE PENALTIES.
-   For every "important" attribute mismatch of more than {important_pct}%,
-   lower the candidate's rank. Two important mismatches start to be
-   disqualifying.
+   For every attribute on the SOURCE with importance="critical":
+
+   a) Find the candidate's matching attribute by MEANING + UNIT, not by exact
+      name. The extraction LLM produces inconsistent names — for example
+      "tonnage" / "machine_tonnage" / "clamping_force_t" can all refer to the
+      same physical quantity; "power_kw" / "motor_power" / "rated_power_kw"
+      likewise. Match using:
+        - Same unit (T, kW, kVA, mm, GB, sqft, months, MHz, etc.)
+        - Synonymous concept (power ~ wattage ~ rating; capacity ~ volume ~
+          size; speed ~ frequency ~ rate; tonnage ~ clamping_force ~ load)
+        - Same order of magnitude on the value
+
+   b) Compare values once matched:
+        - Numeric: if relative difference > {critical_pct}% → REJECT
+        - String / category: if the values differ semantically (ignore
+          casing, whitespace, formatting) → REJECT
+
+   c) If the candidate has NO attribute semantically matching a source
+      critical attribute → REJECT. Missing critical info is a mismatch, not
+      a free pass.
+
+   d) If the candidate has its OWN critical attributes that the source does
+      NOT have (e.g. source has only "tonnage", candidate has "tonnage +
+      injection_units_count=3", or source has "storage_gb" only and
+      candidate adds "graphics_card_vram_gb"), the candidate is a different
+      product variant or configuration → REJECT.
+
+2. PRODUCT TYPE CONSISTENCY (item_level hierarchy).
+
+   The item_level_1..8 chain identifies what the product IS, not just its
+   specs. Reject candidates whose item_level chain diverges from the source
+   even when numeric attributes match. Examples (generic — apply the same
+   logic to any domain):
+     - source level_3="Injection Moulding Machine",
+       candidate level_3="Injection Moulding Machine Upgrade" → REJECT
+       (the candidate is a sub-assembly / service, not the machine itself).
+     - source level_2="Laptop", candidate level_2="Desktop" → REJECT.
+     - source level_3="Diesel Generator", candidate level_3="Generator
+       Maintenance Service" → REJECT.
+
+   Also reject when item_name / item_description clearly indicates the
+   candidate is an upgrade, modification, accessory, spare part, retrofit,
+   installation service, AMC, or warranty — and the source is the parent
+   product itself (or vice versa).
 
 3. SPEC-TO-PRICE RATIO SANITY.
-   When the source has at least one critical numeric attribute, compute
-   ratio = candidate.unit_price_eur / candidate.<that_attribute>. If a
-   candidate's ratio is outside the band [median_ratio * (1 - {ratio_pct}/100),
-   median_ratio * (1 + {ratio_pct}/100)] of the surviving pool, downrank
-   (likely unit confusion, typo, or category drift).
 
-4. BRAND SIMILARITY IS NOT RELEVANCE.
+   Catches subassemblies, accessories, and services that share specs with
+   the parent product but are priced very differently. When the source has
+   at least one critical numeric attribute, compute
+   ratio = candidate.unit_price_eur / candidate.<that_attribute>:
+     - If ratio is more than 5× off the surviving-pool median → REJECT
+       (category drift, e.g. a "1800T servo upgrade" priced at 13k EUR vs
+       a "1800T machine" priced at 400k EUR — same spec value, completely
+       different product).
+     - If within 5× but outside ±{ratio_pct}% of the median → downrank.
+
+4. IMPORTANT ATTRIBUTES ARE PENALTIES.
+   For every "important" attribute mismatch of more than {important_pct}%
+   (matched semantically per Rule 1a), lower the candidate's rank. Two
+   important mismatches start to be disqualifying.
+
+5. BRAND SIMILARITY IS NOT RELEVANCE.
    Same brand alone is not a relevance boost. Specs first.
 
-5. RECENCY TIE-BREAK.
+6. RECENCY TIE-BREAK.
    Among candidates that survive rules 1-3, prefer more recently created PRs.
 
 Return exactly K survivors as `selected`, with a short `reason` per row.
-Every rejected candidate goes under `rejected` with the rejecting rule.
+Every rejected candidate goes under `rejected` with the rejecting rule and
+which attribute / level / ratio triggered the rejection.
 
 Output strict JSON, no fences, no prose:
 
