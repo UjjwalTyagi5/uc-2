@@ -5886,9 +5886,13 @@ def _pinecone_narrow_within_pool(
     pinecone_index: str,
     pinecone_ns: str,
 ) -> list[dict]:
-    """Stage B — Pinecone similarity restricted to the SQL pool by dtl_id."""
+    """Stage B — Pinecone similarity search, then post-filter to the SQL pool.
+    Fetches top_k * 5 from Pinecone (no filter kwarg — not supported by
+    search_via_service) and keeps only matches whose purchase_dtl_id is in
+    candidate_dtl_ids, returning up to top_k survivors."""
     if not candidate_dtl_ids:
         return []
+    pool_set = set(candidate_dtl_ids)
     from agentcore.services.pinecone_service_client import search_via_service
     try:
         raw = search_via_service(
@@ -5897,19 +5901,29 @@ def _pinecone_narrow_within_pool(
             text_key="page_content",
             query="",
             query_embedding=embedding,
-            number_of_results=max(1, min(top_k, len(candidate_dtl_ids))),
-            filter={"purchase_dtl_id": {"$in": candidate_dtl_ids}},
+            number_of_results=top_k * 5,
         )
     except Exception as exc:
         if _is_pinecone_server_error(exc):
             raise
         logger.warning(f"V2 Pinecone within-pool search failed (non-server): {exc}")
         return []
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        return raw.get("matches", []) or raw.get("results", []) or []
-    return []
+    matches = raw if isinstance(raw, list) else (
+        raw.get("matches", []) or raw.get("results", []) if isinstance(raw, dict) else []
+    )
+    # Keep only results that belong to the SQL pool
+    filtered = []
+    for m in matches:
+        meta = (m.get("metadata") if isinstance(m, dict) else {}) or {}
+        did = meta.get("purchase_dtl_id")
+        try:
+            if did is not None and int(did) in pool_set:
+                filtered.append(m)
+        except Exception:
+            continue
+        if len(filtered) >= top_k:
+            break
+    return filtered
 
 
 def _fetch_candidate_snapshots(tgt_cs: str, dtl_ids: list[int]) -> list[dict]:
