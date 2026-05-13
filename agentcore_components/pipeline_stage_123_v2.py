@@ -2642,6 +2642,75 @@ def _call_llm_with_retry(
                 raise
 
 
+def _render_pdf_pages_to_b64(
+    file_bytes: bytes,
+    filename: str,
+    *,
+    max_pages: int = 1,
+    timeout_s: int = 30,
+) -> list[str]:
+    """Render the first `max_pages` pages of a PDF to base64-encoded PNGs.
+
+    Used by vision-escalation in _classify_file. Two safety nets so a
+    single malformed PDF can't silently hang a worker forever (which was
+    a likely cause of 500-PR batches "getting stuck at one point only"):
+
+      1. The entire render runs inside _call_with_timeout with a
+         configurable wall-clock budget (default 30s). pdfplumber's
+         pdfminer-based parser can spin in pure-Python loops on corrupt
+         cross-reference tables; the timeout interrupts those.
+
+      2. If pdfplumber fails or times out, fall back to PyMuPDF (fitz)
+         which uses a completely different parser and often handles
+         malformed PDFs that pdfplumber chokes on.
+
+    Returns an empty list on any failure — caller should treat empty as
+    "vision escalation not possible, keep text classification".
+    """
+    import io as _io, base64 as _b64
+
+    def _render_with_pdfplumber() -> list[str]:
+        import pdfplumber
+        out: list[str] = []
+        with pdfplumber.open(_io.BytesIO(file_bytes)) as pdf:
+            n = min(len(pdf.pages), max_pages)
+            for i in range(n):
+                img = pdf.pages[i].to_image(resolution=150)
+                buf = _io.BytesIO()
+                img.original.save(buf, format="PNG")
+                out.append(_b64.b64encode(buf.getvalue()).decode())
+        return out
+
+    def _render_with_fitz() -> list[str]:
+        import fitz
+        out: list[str] = []
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        try:
+            n = min(len(doc), max_pages)
+            for i in range(n):
+                pix = doc[i].get_pixmap(dpi=150)
+                out.append(_b64.b64encode(pix.tobytes("png")).decode())
+        finally:
+            doc.close()
+        return out
+
+    # Try pdfplumber first (matches prior behaviour); fall back to fitz.
+    for label, fn in (("pdfplumber", _render_with_pdfplumber), ("fitz", _render_with_fitz)):
+        try:
+            return _call_with_timeout(fn, timeout_s=timeout_s, label=f"pdf-render-{label}")
+        except TimeoutError as exc:
+            logger.warning(
+                "PDF render for vision sample timed out ({}) on {}: {} — trying next renderer",
+                label, filename, exc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "PDF render for vision sample failed ({}) on {}: {} — trying next renderer",
+                label, filename, exc,
+            )
+    return []
+
+
 def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None = None) -> tuple:
     """Returns (doc_type: str, confidence: float)."""
     import os
@@ -2700,47 +2769,53 @@ def _classify_file(llm, file_bytes: bytes, filename: str, prompts: dict | None =
         confidence = float(result.get("confidence", 0.0))
         
         # --- ESCALATION LOGIC ---
-        # If classification is 'Other' or confidence is low, and it is a PDF 
-        # (and didn't already use image_b64 for classification), escalate to vision model.
+        # If classification is 'Other' or confidence is low, and it is a PDF
+        # (and didn't already use image_b64 for classification), escalate to
+        # the vision model using a rendered page image.
         needs_escalation = (raw_cls == "Other" or confidence < 0.75)
         if needs_escalation and not image_b64 and file_type == "pdf":
             max_pages_vision = max(1, int((prompts or {}).get("cls_max_pages_vision", 1)))
-            vision_samples_b64 = []
-            
-            # Just-In-Time extraction: only open pdfplumber if escalation is truly needed
-            try:
-                import io, base64, pdfplumber
-                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                    pages_to_render = min(len(pdf.pages), max_pages_vision)
-                    for i in range(pages_to_render):
-                        img = pdf.pages[i].to_image(resolution=150)
-                        buf = io.BytesIO()
-                        img.original.save(buf, format="PNG")
-                        vision_samples_b64.append(base64.b64encode(buf.getvalue()).decode())
-            except Exception as e:
-                logger.warning(f"Failed to generate vision sample for {filename}: {e}")
+            render_timeout_s = max(5, int((prompts or {}).get("cls_render_timeout_s", 30)))
+            vision_samples_b64 = _render_pdf_pages_to_b64(
+                file_bytes, filename,
+                max_pages=max_pages_vision,
+                timeout_s=render_timeout_s,
+            )
 
+            # Only call the vision LLM when we actually have image samples.
+            # The earlier indentation had this call running even when
+            # rendering failed — wasted an LLM call on a redundant text-only
+            # classification using the previous `messages` value.
             if vision_samples_b64:
-                logger.info(f"Escalating classification for {filename!r} to vision using {len(vision_samples_b64)} page(s) (conf={confidence:.2f}, cls={raw_cls})")
+                logger.info(
+                    f"Escalating classification for {filename!r} to vision using "
+                    f"{len(vision_samples_b64)} page(s) (conf={confidence:.2f}, cls={raw_cls})"
+                )
                 user_prompt = user_image_tmpl.format(
                     filename=filename, file_type=file_type, extra_metadata=meta_str
                 )
-                
                 content = [{"type": "text", "text": user_prompt}]
                 for b64 in vision_samples_b64:
-                    content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}})
-                    
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"},
+                    })
                 messages = [SystemMessage(content=sys_prompt), HumanMessage(content=content)]
-            response = _call_llm_with_retry(llm, messages, prompts, force_json=True)
-            raw = (getattr(response, "content", None) or str(response)).strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            result = json.loads(raw)
-            
-            raw_cls = result.get("classification", "Other")
-            if raw_cls not in VALID_CLASSIFICATIONS:
-                raw_cls = "Other"
-            confidence = float(result.get("confidence", 0.0))
+                response = _call_llm_with_retry(llm, messages, prompts, force_json=True)
+                raw = (getattr(response, "content", None) or str(response)).strip()
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                result = json.loads(raw)
+
+                raw_cls = result.get("classification", "Other")
+                if raw_cls not in VALID_CLASSIFICATIONS:
+                    raw_cls = "Other"
+                confidence = float(result.get("confidence", 0.0))
+            else:
+                logger.info(
+                    f"Vision escalation skipped for {filename!r} — render produced no "
+                    f"samples (conf={confidence:.2f}, cls={raw_cls}); keeping text classification"
+                )
 
         doc_type   = _CLASSIFICATION_MAP.get(raw_cls, raw_cls)
         return doc_type, confidence
