@@ -4462,16 +4462,23 @@ def _format_bench_prompt(
 
     if not historical:
         return (
-            "Recommend a benchmark unit price for this item.\n\n"
+            "Recommend a benchmark unit price for this item. "
+            "No historical purchase data is available for comparison — use your market knowledge.\n\n"
             f"CURRENT ITEM:\n{current_block}\n\n"
-            "HISTORICAL DATA: none available — no comparable older purchases found.\n"
-            "Return your best estimate based on the item description alone.\n\n"
-            "Return ONLY JSON (no markdown): "
-            '{ "bp_unit_price": <number EUR or null>, '
-            '"bp_low": <number EUR or null>, '
-            '"bp_high": <number EUR or null>, '
-            '"confidence": <0.0-1.0>, '
-            '"summary": "<2-3 sentences>" }'
+            "HISTORICAL DATA: none available — no comparable older purchases found in the system.\n\n"
+            "Since no historical data exists, set confidence low (≤0.30) and state clearly in the "
+            "summary that the estimate is based on market knowledge only.\n\n"
+            "Return ONLY JSON (no markdown):\n"
+            "{\n"
+            '  "bp_unit_price": <number EUR or null>,\n'
+            '  "bp_low":        <number EUR or null>,\n'
+            '  "bp_high":       <number EUR or null>,\n'
+            '  "confidence":    <0.0-0.30 — low, no historical data>,\n'
+            '  "summary":       "<3-5 sentences: (1) note that no similar historical purchases were found, '
+            "(2) basis for the market estimate (item specs, known market rates), "
+            "(3) key assumptions made, "
+            '(4) negotiation recommendation>"\n'
+            "}"
         )
 
     stats = stats or {}
@@ -4601,6 +4608,21 @@ def _format_bench_prompt(
         "historical set has already been pre-filtered for similarity, "
         "UOM compatibility, age, and price outliers — every row shown is "
         "a valid comparator.\n\n"
+        "PRICING RULES — follow in order:\n"
+        "  1. HISTORICAL ANCHOR: When the historical rows are genuinely comparable "
+        "(same spec, same UOM, similar quantity scale), your bp_unit_price MUST NOT "
+        "exceed the median historical price. The benchmark is a target/fair price — "
+        "not a market estimate. If the quoted price is already below the median, "
+        "anchor the benchmark at or below the quoted price.\n"
+        "  2. INFLATION ADJUSTMENT: You may adjust upward from the oldest comparable "
+        "price only to account for documented inflation — and only if recent data is "
+        "absent. Never inflate above the most recent comparable price.\n"
+        "  3. INCOMPARABLE DATA: If the historical rows are NOT comparable (different "
+        "spec class, wrong UOM, order-of-magnitude size difference), state this "
+        "clearly in the summary and provide a market-knowledge estimate with low "
+        "confidence. Do NOT silently use incomparable prices as anchors.\n"
+        "  4. PRICE CEILING: bp_high must never exceed the quoted price of the "
+        "current item unless the historical data clearly shows the market is higher.\n\n"
         "How to weight the data:\n"
         "  • Recent (≤6m) prices reflect today's market — anchor on these.\n"
         "  • Mid (6-24m) prices are useful trend signals.\n"
@@ -4615,11 +4637,14 @@ def _format_bench_prompt(
         f"{prior_section}"
         "Return ONLY JSON (no markdown):\n"
         "{\n"
-        '  "bp_unit_price": <number EUR — your point estimate>,\n'
-        '  "bp_low":        <number EUR — pessimistic / floor of plausible range>,\n'
-        '  "bp_high":       <number EUR — optimistic / ceiling of plausible range>,\n'
+        '  "bp_unit_price": <number EUR — your point estimate, must not exceed median when data is comparable>,\n'
+        '  "bp_low":        <number EUR — floor of plausible fair range>,\n'
+        '  "bp_high":       <number EUR — ceiling, must not exceed quoted price unless market evidence says otherwise>,\n'
         '  "confidence":    <0.0-1.0 — how reliable this benchmark is given the sample>,\n'
-        '  "summary":       "<2-3 sentences explaining the recommendation, citing which data drove it>"\n'
+        '  "summary":       "<3-5 sentences: (1) which DTL IDs and suppliers were used as benchmark, '
+        "(2) key spec differences vs current item if any, "
+        "(3) how the price was derived from historical data, "
+        '(4) negotiation recommendation>"\n'
         "}"
     )
 
@@ -6288,17 +6313,17 @@ def _run_benchmark_v2(
                 )
                 filter_chain += "+llm_rank_failed"
 
+            # No similar IDs → still run pricing LLM with empty historical so it
+            # can give a market-knowledge estimate with low confidence.
             if not shortlist_dtl_ids:
-                _write_benchmark_stub(
-                    cur2, dtl_id, item_uuid,
-                    f"V2 chain={filter_chain} — no candidates survived Stage C ranking. "
-                    f"rejected={json.dumps(rejected, ensure_ascii=False)[:1500]}",
+                logger.warning(
+                    f"[V2 {pr_no}] dtl_id={dtl_id} Stage C returned no shortlist "
+                    f"(chain={filter_chain}) — proceeding to pricing LLM with no historical data"
                 )
-                continue
 
-            # ── Pricing logic identical to V1 ────────────────────────────
-            historical_raw   = _fetch_historical_for_dtl_ids(tgt_cs, shortlist_dtl_ids)
-            prior_benchmarks = _fetch_benchmark_for_dtl_ids(tgt_cs, shortlist_dtl_ids)
+            # ── Pricing ──────────────────────────────────────────────────
+            historical_raw   = _fetch_historical_for_dtl_ids(tgt_cs, shortlist_dtl_ids) if shortlist_dtl_ids else []
+            prior_benchmarks = _fetch_benchmark_for_dtl_ids(tgt_cs, shortlist_dtl_ids) if shortlist_dtl_ids else []
 
             historical = _filter_historical_uom(historical_raw, rd.get("unit"), uom_strict)
             historical = _filter_historical_age(historical, created_iso, max_age_months)
@@ -6318,7 +6343,7 @@ def _run_benchmark_v2(
             low_item, last_item = _compute_low_last(historical)
             low_uuid  = str(low_item["extracted_item_uuid_pk"])  if low_item  else None
             last_uuid = str(last_item["extracted_item_uuid_pk"]) if last_item else None
-            similar_dtl_ids_json = json.dumps(shortlist_dtl_ids)
+            similar_dtl_ids_json = json.dumps(shortlist_dtl_ids) if shortlist_dtl_ids else None
 
             # Inflation
             supplier_country = (low_item.get("supplier_country") if low_item else None)
