@@ -4191,14 +4191,25 @@ def _fetch_benchmark_for_dtl_ids(tgt_cs: str, dtl_ids: list) -> list[dict]:
 
 
 def _compute_low_last(items: list[dict]) -> tuple:
-    """Return (low_item, last_item) — cheapest EUR price and most recently created PR dtl."""
+    """Return (low_item, last_item) — cheapest EUR price and most recently created PR dtl.
+
+    Guarantees a non-None result whenever `items` is non-empty: if no priced rows exist
+    the cheapest item falls back to the first UUID-valid row (or first row); same for dated.
+    This ensures low_hist_item_fk / last_hist_item_fk are always populated when the
+    shortlist has data.
+    """
     def _eur(it: dict):
         return it.get("unit_price_eur") or it.get("unit_price")
 
-    priced = [it for it in items if _eur(it) is not None]
-    dated  = [it for it in items if it.get("pr_created_date") is not None]
-    low_item  = min(priced, key=_eur) if priced else None
-    last_item = max(dated,  key=lambda it: it["pr_created_date"]) if dated else None
+    # Prefer items that have a valid UUID so the FK write doesn't end up NULL.
+    uuid_items = [it for it in items if it.get("extracted_item_uuid_pk") is not None]
+    pool = uuid_items if uuid_items else items
+
+    priced = [it for it in pool if _eur(it) is not None]
+    dated  = [it for it in pool if it.get("pr_created_date") is not None]
+
+    low_item  = min(priced, key=_eur) if priced else (pool[0] if pool else None)
+    last_item = max(dated,  key=lambda it: it["pr_created_date"]) if dated else (pool[0] if pool else None)
     return low_item, last_item
 
 
@@ -6333,16 +6344,40 @@ def _run_benchmark_v2(
                     f"[V2 {pr_no}] dtl_id={dtl_id}: filtered "
                     f"{len(historical_raw) - len(historical)}/{len(historical_raw)} historical row(s)"
                 )
-            if shortlist_dtl_ids and not historical:
+            if shortlist_dtl_ids and not historical and historical_raw:
                 logger.warning(
                     f"[V2 {pr_no}] dtl_id={dtl_id}: {len(shortlist_dtl_ids)} shortlist item(s) found "
-                    f"but ALL eliminated by post-fetch filters — low_hist/last_hist will be NULL"
+                    f"but ALL {len(historical_raw)} row(s) eliminated by post-fetch filters — "
+                    f"falling back to unfiltered data for low_hist/last_hist FK selection"
                 )
+                historical = historical_raw
 
             agg = _benchmark_aggregates(historical, created_iso)
             low_item, last_item = _compute_low_last(historical)
-            low_uuid  = str(low_item["extracted_item_uuid_pk"])  if low_item  else None
-            last_uuid = str(last_item["extracted_item_uuid_pk"]) if last_item else None
+            low_uuid  = str(low_item["extracted_item_uuid_pk"])  if low_item  and low_item.get("extracted_item_uuid_pk")  else None
+            last_uuid = str(last_item["extracted_item_uuid_pk"]) if last_item and last_item.get("extracted_item_uuid_pk") else None
+            if shortlist_dtl_ids and low_uuid is None:
+                if low_item is None:
+                    logger.warning(
+                        f"[V2 {pr_no}] dtl_id={dtl_id}: low_hist_item_fk is NULL — "
+                        f"historical={len(historical)} row(s) but all have NULL unit_price_eur AND unit_price"
+                    )
+                else:
+                    logger.warning(
+                        f"[V2 {pr_no}] dtl_id={dtl_id}: low_hist_item_fk is NULL — "
+                        f"low_item found (dtl_id={low_item.get('purchase_dtl_id')}) but extracted_item_uuid_pk is NULL in DB"
+                    )
+            if shortlist_dtl_ids and last_uuid is None:
+                if last_item is None:
+                    logger.warning(
+                        f"[V2 {pr_no}] dtl_id={dtl_id}: last_hist_item_fk is NULL — "
+                        f"historical={len(historical)} row(s) but all have NULL pr_created_date"
+                    )
+                else:
+                    logger.warning(
+                        f"[V2 {pr_no}] dtl_id={dtl_id}: last_hist_item_fk is NULL — "
+                        f"last_item found (dtl_id={last_item.get('purchase_dtl_id')}) but extracted_item_uuid_pk is NULL in DB"
+                    )
             similar_dtl_ids_json = json.dumps(shortlist_dtl_ids) if shortlist_dtl_ids else None
 
             # Inflation
