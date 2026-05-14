@@ -8695,13 +8695,12 @@ class PipelineStage123NodeV2(Node):
                     f"[{pr_no}] Stage check failed (will process anyway): {exc}"
                 )
                 stage_now = -1
-            if stage_now == _STAGE_COMPLETE or stage_now == _STAGE_EXCEPTION:
-                stage_label = "COMPLETE" if stage_now == _STAGE_COMPLETE else "EXCEPTION"
+            if stage_now == _STAGE_COMPLETE:
                 self._safe_log(
-                    f"[{pr_no}] Already at stage {stage_now} ({stage_label}) "
+                    f"[{pr_no}] Already at stage {_STAGE_COMPLETE} (COMPLETE) "
                     f"— skipping (no cleanup, no reprocess)"
                 )
-                result["status"] = "already_complete" if stage_now == _STAGE_COMPLETE else "already_exception"
+                result["status"] = "already_complete"
                 shutil.rmtree(work_dir, ignore_errors=True)
                 return result
 
