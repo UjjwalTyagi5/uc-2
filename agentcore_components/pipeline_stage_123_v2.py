@@ -2518,25 +2518,42 @@ def _call_with_timeout(fn, *args, timeout_s: int = 120, label: str = "remote-cal
     no default request timeout, so a hung socket read blocks the worker
     forever with no exception and no log line.
 
-    This helper runs the callable on a one-shot ThreadPoolExecutor and
-    forces a TimeoutError if it overruns, so the surrounding retry logic
-    can recover. `label` is included in the error message so logs make
-    it clear which call timed out (LLM / embedding / pinecone-search /
-    pinecone-ingest / etc.).
+    Uses a daemon thread + queue rather than ThreadPoolExecutor.
+    ThreadPoolExecutor's `with` block calls shutdown(wait=True) on exit,
+    which means a stuck inner thread would deadlock the timeout itself
+    — the caller would wait forever for the executor to clean up. With
+    multiple workers all triggering this concurrently the entire pipeline
+    freezes (worked with 1 worker, hung at 2+).
+
+    The daemon-thread approach: launch the work on a daemon, wait on a
+    queue with timeout, and ORPHAN the inner thread on timeout. The
+    orphaned thread continues running (consuming whatever it was doing)
+    but the caller is unblocked and the surrounding retry logic fires.
+    Daemons don't keep the process alive on shutdown.
     """
-    import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix=label) as ex:
-        fut = ex.submit(fn, *args, **kwargs)
+    import threading as _th
+    import queue as _q
+
+    result_q: _q.Queue = _q.Queue(maxsize=1)
+
+    def _runner() -> None:
         try:
-            return fut.result(timeout=timeout_s)
-        except _cf.TimeoutError as exc:
-            # Best-effort cancel — the underlying HTTP request may still
-            # run in the background, but the calling worker is unblocked
-            # and the surrounding retry loop fires.
-            fut.cancel()
-            raise TimeoutError(
-                f"{label} exceeded {timeout_s}s wall-clock — aborted to recover from silent stuck"
-            ) from exc
+            result_q.put(("ok", fn(*args, **kwargs)))
+        except BaseException as exc:  # noqa: BLE001 — re-raised below
+            result_q.put(("err", exc))
+
+    t = _th.Thread(target=_runner, name=label, daemon=True)
+    t.start()
+    try:
+        kind, value = result_q.get(timeout=timeout_s)
+    except _q.Empty:
+        raise TimeoutError(
+            f"{label} exceeded {timeout_s}s wall-clock — aborted; "
+            f"inner thread orphaned (will finish in background or die with process)"
+        )
+    if kind == "err":
+        raise value
+    return value
 
 
 def _invoke_llm_with_timeout(llm, messages: list, timeout_s: int = 120):
