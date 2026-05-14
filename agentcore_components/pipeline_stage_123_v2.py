@@ -5135,7 +5135,7 @@ def _run_benchmark(
 
     # Read benchmark filtering knobs from prompts dict (canvas-tunable).
     p = prompts or {}
-    min_score       = float(p.get("bench_min_similarity", 0.70))
+    min_score       = float(p.get("bench_min_similarity", 0.80))
     outlier_factor  = float(p.get("bench_outlier_factor", 3.0))
     max_age_months  = int(p.get("bench_max_age_months", 0))
     uom_strict      = bool(p.get("bench_uom_strict", False))
@@ -6638,7 +6638,7 @@ def _llm_rank_candidates(
     p = prompts or {}
     sys_tmpl  = p.get("bench_rank_prompt_system_v2", RANK_PROMPT_SYSTEM_V2)
     user_tmpl = p.get("bench_rank_prompt_user_v2",   RANK_PROMPT_USER_V2)
-    crit_pct  = int(p.get("bench_critical_threshold_pct",  25))
+    crit_pct  = int(p.get("bench_critical_threshold_pct",  10))
     imp_pct   = int(p.get("bench_important_threshold_pct", 20))
     ratio_pct = int(p.get("bench_ratio_band_pct",          50))
     sys_prompt  = sys_tmpl.format(
@@ -6719,7 +6719,7 @@ def _run_benchmark_v2(
     p = prompts or {}
     sql_pool_size     = int(p.get("bench_sql_pool_size",           100))
     pinecone_top_k    = int(p.get("bench_pinecone_top_k",          10))
-    min_score         = float(p.get("bench_min_similarity",        0.70))
+    min_score         = float(p.get("bench_min_similarity",        0.80))
     llm_shortlist     = int(p.get("bench_llm_shortlist_size",      max(5, top_k_final)))
     widen_when_sparse = bool(p.get("bench_widen_l1l2_when_sparse", True))
     outlier_factor    = float(p.get("bench_outlier_factor",        3.0))
@@ -8535,9 +8535,9 @@ class PipelineStage123NodeV2(Node):
             prompts["canonicalize_threshold"] = _CANONICALIZE_THRESHOLD
         # ── Benchmark filtering / quality knobs ──────────────────────────────
         try:
-            prompts["bench_min_similarity"] = float(getattr(self, "bench_min_similarity", None) or "0.70")
+            prompts["bench_min_similarity"] = float(getattr(self, "bench_min_similarity", None) or "0.80")
         except Exception:
-            prompts["bench_min_similarity"] = 0.70
+            prompts["bench_min_similarity"] = 0.80
         try:
             prompts["bench_outlier_factor"] = float(getattr(self, "bench_outlier_factor", None) or "3.0")
         except Exception:

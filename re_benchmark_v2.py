@@ -61,11 +61,11 @@ BENCH_PARAMS = {
 
     # Stage B — Pinecone within-pool
     "bench_pinecone_top_k":          int(os.getenv("BENCH_PINECONE_TOP_K",          "10")),
-    "bench_min_similarity":          float(os.getenv("BENCH_MIN_SIMILARITY",        "0.80")),
+    "bench_min_similarity":          float(os.getenv("BENCH_MIN_SIMILARITY",        "0.80")),  # tightened from 0.70
 
     # Stage C — LLM relevance ranking
     "bench_llm_shortlist_size":      int(os.getenv("BENCH_LLM_SHORTLIST_SIZE",      "5")),
-    "bench_critical_threshold_pct":  int(os.getenv("BENCH_CRITICAL_THRESHOLD_PCT",  "10")),
+    "bench_critical_threshold_pct":  int(os.getenv("BENCH_CRITICAL_THRESHOLD_PCT",  "10")),  # tightened from 25
     "bench_important_threshold_pct": int(os.getenv("BENCH_IMPORTANT_THRESHOLD_PCT", "20")),
     "bench_ratio_band_pct":          int(os.getenv("BENCH_RATIO_BAND_PCT",          "50")),
 
