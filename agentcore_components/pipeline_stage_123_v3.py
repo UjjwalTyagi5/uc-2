@@ -6686,6 +6686,7 @@ def _parse_commercials_response(
         "line_insurance", "line_packing_forwarding", "line_customs_duties",
         "line_installation", "line_other_charges", "line_total_inclusive",
     }),
+    _line_allowed_sources: frozenset = frozenset({"line_explicit", "quote_allocated", "mixed", "none"}),
     _line_allowed_methods: frozenset = frozenset({"proportional_by_total", "proportional_by_qty", "equal_split"}),
 ) -> dict:
     """Parse the commercials LLM JSON response into a normalized dict:
@@ -6753,7 +6754,7 @@ def _parse_commercials_response(
                     row[f] = _commercials_to_decimal(v)
                 elif f == "line_charges_source":
                     sv = str(v).strip().lower()
-                    row[f] = sv if sv in _COMMERCIALS_LINE_ALLOWED_SOURCES else None
+                    row[f] = sv if sv in _line_allowed_sources else None
                 elif f == "line_allocation_method":
                     sv = str(v).strip().lower()
                     row[f] = sv if sv in _line_allowed_methods else None
