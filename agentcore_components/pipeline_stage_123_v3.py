@@ -6655,7 +6655,34 @@ def _commercials_to_decimal(v: Any) -> Optional[Decimal]:
         return None
 
 
-def _parse_commercials_response(raw: str, pr_no: str) -> dict:
+def _parse_commercials_response(
+    raw: str, pr_no: str,
+    _quote_fields: tuple = (
+        "quote_incoterms", "quote_incoterms_named_place",
+        "quote_subtotal", "quote_discount_total",
+        "quote_packing_forwarding", "quote_freight", "quote_insurance",
+        "quote_customs_duties", "quote_installation", "quote_other_charges",
+        "quote_tax_type", "quote_tax_rate_pct", "quote_tax_amount_total",
+        "quote_grand_total", "quote_grand_total_currency",
+        "quote_country_of_origin", "quote_port_of_loading",
+        "quote_port_of_discharge", "quote_mode_of_transport",
+        "quote_delivery_location", "quote_charges_breakdown_json",
+    ),
+    _line_fields: tuple = (
+        "line_incoterms", "line_tax_rate_pct", "line_tax_amount",
+        "line_freight", "line_insurance", "line_packing_forwarding",
+        "line_customs_duties", "line_installation", "line_other_charges",
+        "line_total_inclusive", "line_country_of_origin",
+        "line_hsn_sac_code", "line_charges_source", "line_allocation_method",
+    ),
+    _quote_decimal_fields: frozenset = frozenset({
+        "quote_subtotal", "quote_discount_total",
+        "quote_packing_forwarding", "quote_freight", "quote_insurance",
+        "quote_customs_duties", "quote_installation", "quote_other_charges",
+        "quote_tax_amount_total", "quote_grand_total",
+    }),
+    _line_allowed_methods: frozenset = frozenset({"proportional_by_total", "proportional_by_qty", "equal_split"}),
+) -> dict:
     """Parse the commercials LLM JSON response into a normalized dict:
 
         {
@@ -6680,7 +6707,7 @@ def _parse_commercials_response(raw: str, pr_no: str) -> dict:
         return out
 
     quote: dict = {}
-    for f in _COMMERCIALS_QUOTE_FIELDS:
+    for f in _quote_fields:
         if f == "quote_charges_breakdown_json":
             # The prompt asks for this as an object; we serialise it for DB.
             obj = envelope.get("quote_charges_breakdown")
@@ -6696,7 +6723,7 @@ def _parse_commercials_response(raw: str, pr_no: str) -> dict:
         if v is None or (isinstance(v, str) and not v.strip()):
             quote[f] = None
             continue
-        if f in _COMMERCIALS_QUOTE_DECIMAL_FIELDS:
+        if f in _quote_decimal_fields:
             quote[f] = _commercials_to_decimal(v)
         else:
             quote[f] = str(v).strip() if isinstance(v, str) else v
@@ -6712,7 +6739,7 @@ def _parse_commercials_response(raw: str, pr_no: str) -> dict:
             except Exception:
                 continue
             row: dict = {}
-            for f in _COMMERCIALS_LINE_FIELDS:
+            for f in _line_fields:
                 v = entry.get(f)
                 if v is None or (isinstance(v, str) and not v.strip()):
                     row[f] = None
@@ -6724,7 +6751,7 @@ def _parse_commercials_response(raw: str, pr_no: str) -> dict:
                     row[f] = sv if sv in _COMMERCIALS_LINE_ALLOWED_SOURCES else None
                 elif f == "line_allocation_method":
                     sv = str(v).strip().lower()
-                    row[f] = sv if sv in _COMMERCIALS_LINE_ALLOWED_METHODS else None
+                    row[f] = sv if sv in _line_allowed_methods else None
                 else:
                     row[f] = str(v).strip()
             out["lines_by_dtl"][dtl] = row
@@ -6845,7 +6872,27 @@ def _allocate_quote_charges_to_lines(parsed: dict, items: list, pr_no: str) -> N
             pass
 
 
-def _attach_commercials_to_items(parsed: dict, items: list) -> None:
+def _attach_commercials_to_items(
+    parsed: dict, items: list,
+    _quote_fields: tuple = (
+        "quote_incoterms", "quote_incoterms_named_place",
+        "quote_subtotal", "quote_discount_total",
+        "quote_packing_forwarding", "quote_freight", "quote_insurance",
+        "quote_customs_duties", "quote_installation", "quote_other_charges",
+        "quote_tax_type", "quote_tax_rate_pct", "quote_tax_amount_total",
+        "quote_grand_total", "quote_grand_total_currency",
+        "quote_country_of_origin", "quote_port_of_loading",
+        "quote_port_of_discharge", "quote_mode_of_transport",
+        "quote_delivery_location", "quote_charges_breakdown_json",
+    ),
+    _line_fields: tuple = (
+        "line_incoterms", "line_tax_rate_pct", "line_tax_amount",
+        "line_freight", "line_insurance", "line_packing_forwarding",
+        "line_customs_duties", "line_installation", "line_other_charges",
+        "line_total_inclusive", "line_country_of_origin",
+        "line_hsn_sac_code", "line_charges_source", "line_allocation_method",
+    ),
+) -> None:
     """Stamp the parsed commercial fields onto each item dict in-place.
 
     Quote-level fields are repeated on every item from the same quotation
@@ -6856,7 +6903,7 @@ def _attach_commercials_to_items(parsed: dict, items: list) -> None:
     quote = parsed.get("quote") or {}
     lines = parsed.get("lines_by_dtl") or {}
     for it in items:
-        for f in _COMMERCIALS_QUOTE_FIELDS:
+        for f in _quote_fields:
             it[f] = quote.get(f)
         dtl_raw = it.get("purchase_dtl_id")
         try:
@@ -6864,7 +6911,7 @@ def _attach_commercials_to_items(parsed: dict, items: list) -> None:
         except Exception:
             dtl = None
         row = lines.get(dtl) if dtl is not None else None
-        for f in _COMMERCIALS_LINE_FIELDS:
+        for f in _line_fields:
             it[f] = (row or {}).get(f)
 
 
