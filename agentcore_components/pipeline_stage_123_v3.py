@@ -6681,6 +6681,11 @@ def _parse_commercials_response(
         "quote_customs_duties", "quote_installation", "quote_other_charges",
         "quote_tax_amount_total", "quote_grand_total",
     }),
+    _line_decimal_fields: frozenset = frozenset({
+        "line_tax_rate_pct", "line_tax_amount", "line_freight",
+        "line_insurance", "line_packing_forwarding", "line_customs_duties",
+        "line_installation", "line_other_charges", "line_total_inclusive",
+    }),
     _line_allowed_methods: frozenset = frozenset({"proportional_by_total", "proportional_by_qty", "equal_split"}),
 ) -> dict:
     """Parse the commercials LLM JSON response into a normalized dict:
@@ -6744,7 +6749,7 @@ def _parse_commercials_response(
                 if v is None or (isinstance(v, str) and not v.strip()):
                     row[f] = None
                     continue
-                if f in _COMMERCIALS_LINE_DECIMAL_FIELDS:
+                if f in _line_decimal_fields:
                     row[f] = _commercials_to_decimal(v)
                 elif f == "line_charges_source":
                     sv = str(v).strip().lower()
