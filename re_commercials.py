@@ -427,21 +427,11 @@ def main() -> None:
     if BLOB_ENDPOINT:
         # Direct endpoint with Azure CLI auth (uses DefaultAzureCredential)
         logger.info("Using direct blob endpoint with Azure CLI authentication")
-        try:
-            from azure.identity import DefaultAzureCredential
-            from azure.storage.blob import BlobServiceClient
-            credential = DefaultAzureCredential()
-            blob_service_client = BlobServiceClient(account_url=BLOB_ENDPOINT, credential=credential)
-            blob_cfg = {
-                "type": "azure_direct",
-                "endpoint": BLOB_ENDPOINT,
-                "container": BLOB_CONTAINER,
-                "client": blob_service_client,
-            }
-            logger.info("Connected to blob storage: %s / %s", BLOB_ENDPOINT, BLOB_CONTAINER)
-        except Exception as exc:
-            logger.error("Could not connect to blob endpoint %r: %s", BLOB_ENDPOINT, exc)
-            sys.exit(1)
+        blob_cfg = {
+            "account_url": BLOB_ENDPOINT,
+            "container_name": BLOB_CONTAINER,
+        }
+        logger.info("Configured blob storage: %s / %s", BLOB_ENDPOINT, BLOB_CONTAINER)
     elif BLOB_CONNECTOR_NAME:
         # Legacy: connector name lookup
         logger.info("Using blob connector: %s", BLOB_CONNECTOR_NAME)
