@@ -115,13 +115,14 @@ def _stub_agentcore() -> None:
 
 _stub_agentcore()
 
-# Load pipeline_stage_123_v2 directly by file path so we don't trigger
+# Load pipeline_stage_123_v3 directly by file path so we don't trigger
 # agentcore_components/__init__.py which pulls in sibling modules
 # (etl_sync, pipeline_stage_58) that reference names not used here.
+# V3 includes the commercials extraction (Stage 5b) with the required constants.
 import importlib.util as _ilu  # noqa: E402
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PIPELINE_PATH = os.path.join(_HERE, "agentcore_components", "pipeline_stage_123_v2.py")
-_spec = _ilu.spec_from_file_location("pipeline_stage_123_v2_standalone", _PIPELINE_PATH)
+_PIPELINE_PATH = os.path.join(_HERE, "agentcore_components", "pipeline_stage_123_v3.py")
+_spec = _ilu.spec_from_file_location("pipeline_stage_123_v3_standalone", _PIPELINE_PATH)
 if _spec is None or _spec.loader is None:
     raise ImportError(f"Could not load module spec from {_PIPELINE_PATH}")
 _P = _ilu.module_from_spec(_spec)
