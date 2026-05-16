@@ -1,11 +1,38 @@
 [project]
 name = "purchase-sync"
 version = "0.1.0"
-description = "ETL sync module: on-prem SQL Server → Azure SQL (purchase requisition tables)"
+description = "ETL sync module + V3 Pipeline: on-prem SQL Server → Azure SQL with benchmarking & commercials extraction"
 requires-python = ">=3.8"
 dependencies = [
+    # Core dependencies
     "pyodbc>=4.0.39",
     "loguru>=0.7.0",
     "python-dotenv>=1.0.0",
+
+    # Database & ORM
+    "sqlalchemy>=2.0.0",
+
+    # LLM & Vector Search
+    "langchain-openai>=0.0.1",
+    "pinecone-client>=3.0.0",
+
+    # Azure Services
+    "azure-storage-blob>=12.14.0",
+    "azure-identity>=1.13.0",
+
+    # Document Processing
+    "pypdf>=3.15.0",
+    "openpyxl>=3.10.0",
+    "python-pptx>=0.6.21",
+    "python-docx>=0.8.11",
+    "fitz>=0.0.1.dev2",
+    "pymupdf>=1.23.0",
+    "pillow>=10.0.0",
+    "extract-msg>=0.46.0",
+
+    # Data Processing
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "beautifulsoup4>=4.12.0",
 ]
 
