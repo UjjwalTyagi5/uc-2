@@ -41,13 +41,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Pre-import Azure modules so worker threads can access them
-try:
-    from azure.identity import DefaultAzureCredential  # noqa: F401
-    from azure.storage.blob import BlobServiceClient     # noqa: F401
-except ImportError:
-    pass
-
 # ── DB connection (Azure SQL — target) ───────────────────────────────────────
 # Traditional password auth from .env (AZURE_USER and AZURE_PASS)
 TGT_CS = (
@@ -68,6 +61,7 @@ AZURE_LLM_DEPLOY   = os.getenv("AZURE_OPENAI_DEPLOYMENT",        "gpt-4o")
 # ── Blob (Azure Storage — use endpoint + container or connector name) ────────
 BLOB_CONNECTOR_NAME = os.getenv("BLOB_CONNECTOR_NAME", "")
 BLOB_ENDPOINT = os.getenv("BLOB_ENDPOINT", "")  # e.g., https://<account>.blob.core.windows.net
+BLOB_ACCOUNT_KEY = os.getenv("BLOB_ACCOUNT_KEY", "")  # Storage account access key
 BLOB_CONTAINER = os.getenv("BLOB_CONTAINER", "quotations")
 
 # ── Tuning knobs passed straight through to the commercials helpers ──────────
@@ -431,14 +425,12 @@ def main() -> None:
     # 2. Connector name (legacy, from AgentCore)
 
     blob_cfg = None
-    if BLOB_ENDPOINT:
-        # Direct endpoint with Azure CLI auth (uses DefaultAzureCredential)
-        logger.info("Using direct blob endpoint with Azure CLI authentication")
+    if BLOB_ENDPOINT and BLOB_ACCOUNT_KEY:
+        # Direct endpoint with access key auth
+        logger.info("Using direct blob endpoint with access key authentication")
         try:
-            from azure.identity import DefaultAzureCredential
             from azure.storage.blob import BlobServiceClient
-            credential = DefaultAzureCredential()
-            blob_client = BlobServiceClient(account_url=BLOB_ENDPOINT, credential=credential)
+            blob_client = BlobServiceClient(account_url=BLOB_ENDPOINT, credential=BLOB_ACCOUNT_KEY)
             blob_cfg = {
                 "account_url": BLOB_ENDPOINT,
                 "container_name": BLOB_CONTAINER,
