@@ -191,13 +191,14 @@ def _fetch_existing_rows(tgt_cs: str, pr_no: str) -> dict[tuple, list[dict]]:
              WHERE rt.[purchase_req_no] = ?
         """, pr_no)
         cols = [c[0] for c in cur.description]
-        groups: dict[tuple, list[dict]] = {}
+        groups: dict[str, list[dict]] = {}
         for row in cur.fetchall():
             rd = dict(zip(cols, row))
-            att = str(rd["attachment_classify_fk"]) if rd["attachment_classify_fk"] else None
-            emb = str(rd["embedded_classify_fk"])   if rd["embedded_classify_fk"]   else None
-            key = (att, emb)
-            groups.setdefault(key, []).append(rd)
+            att = rd["attachment_classify_fk"]
+            emb = rd["embedded_classify_fk"]
+            # Priority: if embedded_classify_fk exists, use it; otherwise use attachment_classify_fk
+            source_id = str(emb) if emb else str(att)
+            groups.setdefault(source_id, []).append(rd)
         return groups
     finally:
         conn.close()
@@ -292,16 +293,15 @@ def _update_rows(tgt_cs: str, items: list[dict], *, dry_run: bool) -> int:
 
 def _process_quotation_group(
     *, llm, tgt_cs: str, blob_cfg: dict, pr_no: str,
-    group_key: tuple, rows: list[dict], src_blob_path: str,
+    source_id: str, rows: list[dict], src_blob_path: str,
     reprocess: bool, dry_run: bool,
 ) -> dict:
     """Backfill one quotation source (one blob → one LLM call → UPDATE N rows).
 
     Returns a result dict for the summary table.
     """
-    att_fk, emb_fk = group_key
     result = {
-        "pr_no": pr_no, "att_fk": att_fk, "emb_fk": emb_fk,
+        "pr_no": pr_no, "source_id": source_id,
         "rows": len(rows), "updated": 0, "status": "ok", "reason": "",
     }
 
@@ -453,22 +453,24 @@ def main() -> None:
         except Exception as exc:
             logger.warning("[%s] could not resolve quotation sources: %s — skipping", pr_no, exc)
             continue
-        blob_by_key: dict[tuple, str] = {}
+        blob_by_key: dict[str, str] = {}
         for src in sources:
-            att = str(src["attachment_classify_fk"]) if src["attachment_classify_fk"] else None
-            emb = str(src["embedded_classify_fk"])   if src["embedded_classify_fk"]   else None
-            blob_by_key[(att, emb)] = src["blob_path"]
+            att = src["attachment_classify_fk"]
+            emb = src["embedded_classify_fk"]
+            # Priority: if embedded_classify_fk exists, use it; otherwise use attachment_classify_fk
+            source_id = str(emb) if emb else str(att)
+            blob_by_key[source_id] = src["blob_path"]
 
-        for key, rows in row_groups.items():
-            blob_path = blob_by_key.get(key)
+        for source_id, rows in row_groups.items():
+            blob_path = blob_by_key.get(source_id)
             if not blob_path:
                 logger.warning(
-                    "[%s] no blob path for group att=%s emb=%s — skipping (%d rows)",
-                    pr_no, key[0], key[1], len(rows),
+                    "[%s] no blob path for source %s — skipping (%d rows)",
+                    pr_no, source_id, len(rows),
                 )
                 continue
             jobs.append({
-                "pr_no": pr_no, "group_key": key,
+                "pr_no": pr_no, "source_id": source_id,
                 "rows": rows, "blob_path": blob_path,
             })
 
@@ -494,14 +496,14 @@ def main() -> None:
         try:
             return _process_quotation_group(
                 llm=llm, tgt_cs=TGT_CS, blob_cfg=blob_cfg,
-                pr_no=job["pr_no"], group_key=job["group_key"],
+                pr_no=job["pr_no"], source_id=job["source_id"],
                 rows=job["rows"], src_blob_path=job["blob_path"],
                 reprocess=args.reprocess, dry_run=args.dry_run,
             )
         except Exception as exc:
             return {
-                "pr_no": job["pr_no"], "att_fk": job["group_key"][0],
-                "emb_fk": job["group_key"][1], "rows": len(job["rows"]),
+                "pr_no": job["pr_no"], "source_id": job["source_id"],
+                "rows": len(job["rows"]),
                 "updated": 0, "status": "failed", "reason": f"unhandled: {exc}",
             }
 
@@ -510,8 +512,8 @@ def main() -> None:
             r = _run(job)
             results.append(r)
             logger.info(
-                "[%d/%d] PR=%s att=%s emb=%s — %s (%d row(s), reason=%s)",
-                i, len(jobs), r["pr_no"], r["att_fk"], r["emb_fk"],
+                "[%d/%d] PR=%s source=%s — %s (%d row(s), reason=%s)",
+                i, len(jobs), r["pr_no"], r["source_id"],
                 r["status"], r["updated"], r["reason"] or "-",
             )
     else:
@@ -522,8 +524,8 @@ def main() -> None:
                 r = fut.result()
                 results.append(r)
                 logger.info(
-                    "[%d/%d] PR=%s att=%s emb=%s — %s (%d row(s), reason=%s)",
-                    i, len(jobs), r["pr_no"], r["att_fk"], r["emb_fk"],
+                    "[%d/%d] PR=%s source=%s — %s (%d row(s), reason=%s)",
+                    i, len(jobs), r["pr_no"], r["source_id"],
                     r["status"], r["updated"], r["reason"] or "-",
                 )
 
