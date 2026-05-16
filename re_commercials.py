@@ -41,6 +41,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Pre-import Azure modules so worker threads can access them
+try:
+    from azure.identity import DefaultAzureCredential  # noqa: F401
+    from azure.storage.blob import BlobServiceClient     # noqa: F401
+except ImportError:
+    pass
+
 # ── DB connection (Azure SQL — target) ───────────────────────────────────────
 # Traditional password auth from .env (AZURE_USER and AZURE_PASS)
 TGT_CS = (
