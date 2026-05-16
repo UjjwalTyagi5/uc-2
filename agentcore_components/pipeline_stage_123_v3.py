@@ -2216,8 +2216,16 @@ def _get_blob_config_by_name(connector_name: str) -> dict:
 
 
 def _download_blob(blob_path: str, blob_cfg: dict) -> bytes:
-    from azure.identity import DefaultAzureCredential
-    from azure.storage.blob import BlobServiceClient
+    import sys
+    try:
+        from azure.identity import DefaultAzureCredential
+        from azure.storage.blob import BlobServiceClient
+    except ImportError as e:
+        # If imports fail, provide diagnostic info
+        logger.error(f"Failed to import azure modules: {e}")
+        logger.error(f"sys.path: {sys.path[:3]}")
+        logger.error(f"azure in sys.modules: {'azure' in sys.modules}")
+        raise
     credential = DefaultAzureCredential(
         exclude_environment_credential=True,
         exclude_interactive_browser_credential=True,
