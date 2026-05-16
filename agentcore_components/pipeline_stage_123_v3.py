@@ -2216,25 +2216,24 @@ def _get_blob_config_by_name(connector_name: str) -> dict:
 
 
 def _download_blob(blob_path: str, blob_cfg: dict) -> bytes:
-    import sys
-    try:
+    if "blob_client" in blob_cfg:
+        # Direct client passed from re_commercials.py (pre-created with Azure CLI auth)
+        client = blob_cfg["blob_client"]
+        blob = client.get_blob_client(container=blob_cfg["container_name"], blob=blob_path)
+        return blob.download_blob().readall()
+    else:
+        # Fallback: legacy connector config (from AgentCore)
         from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
-    except ImportError as e:
-        # If imports fail, provide diagnostic info
-        logger.error(f"Failed to import azure modules: {e}")
-        logger.error(f"sys.path: {sys.path[:3]}")
-        logger.error(f"azure in sys.modules: {'azure' in sys.modules}")
-        raise
-    credential = DefaultAzureCredential(
-        exclude_environment_credential=True,
-        exclude_interactive_browser_credential=True,
-    )
-    client = BlobServiceClient(
-        account_url=blob_cfg["account_url"], credential=credential
-    )
-    blob = client.get_blob_client(container=blob_cfg["container_name"], blob=blob_path)
-    return blob.download_blob().readall()
+        credential = DefaultAzureCredential(
+            exclude_environment_credential=True,
+            exclude_interactive_browser_credential=True,
+        )
+        client = BlobServiceClient(
+            account_url=blob_cfg["account_url"], credential=credential
+        )
+        blob = client.get_blob_client(container=blob_cfg["container_name"], blob=blob_path)
+        return blob.download_blob().readall()
 
 
 # ── File type detection ────────────────────────────────────────────────────────
