@@ -42,14 +42,30 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── DB connection (Azure SQL — target) ───────────────────────────────────────
-TGT_CS = (
-    "DRIVER={ODBC Driver 18 for SQL Server};"
-    f"SERVER={os.getenv('AZURE_SERVER', '')};"
-    f"DATABASE={os.getenv('AZURE_DB', '')};"
-    f"UID={os.getenv('AZURE_USER', '')};"
-    f"PWD={os.getenv('AZURE_PASS', '')};"
-    "TrustServerCertificate=yes;"
-)
+# Support both password auth (legacy) and Azure CLI / Managed Identity (recommended)
+_USE_AZURE_CLI = os.getenv('USE_AZURE_CLI', 'true').lower() in ('true', '1', 'yes')
+_AZURE_USER = os.getenv('AZURE_USER', '')
+_AZURE_PASS = os.getenv('AZURE_PASS', '')
+
+if _USE_AZURE_CLI and not _AZURE_PASS:
+    # Azure CLI / Managed Identity (no password needed)
+    TGT_CS = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={os.getenv('AZURE_SERVER', '')};"
+        f"DATABASE={os.getenv('AZURE_DB', '')};"
+        "Authentication=ActiveDirectoryInteractive;"
+        "TrustServerCertificate=yes;"
+    )
+else:
+    # Traditional password auth (for backward compatibility)
+    TGT_CS = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={os.getenv('AZURE_SERVER', '')};"
+        f"DATABASE={os.getenv('AZURE_DB', '')};"
+        f"UID={_AZURE_USER};"
+        f"PWD={_AZURE_PASS};"
+        "TrustServerCertificate=yes;"
+    )
 
 # ── Azure OpenAI ─────────────────────────────────────────────────────────────
 AZURE_ENDPOINT     = os.getenv("AZURE_OPENAI_ENDPOINT")
