@@ -40,6 +40,13 @@ from typing import Any, Optional
 
 from loguru import logger
 
+# Pre-import Azure modules for blob operations
+try:
+    from azure.identity import DefaultAzureCredential  # noqa: F401
+    from azure.storage.blob import BlobServiceClient     # noqa: F401
+except ImportError:
+    pass
+
 from agentcore.custom import Node
 from agentcore.io import BoolInput, HandleInput, IntInput, MessageTextInput, MultilineInput, Output
 from agentcore.schema.data import Data
