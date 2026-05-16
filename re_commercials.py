@@ -42,30 +42,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── DB connection (Azure SQL — target) ───────────────────────────────────────
-# Support both password auth (legacy) and Azure CLI / Managed Identity (recommended)
-_USE_AZURE_CLI = os.getenv('USE_AZURE_CLI', 'true').lower() in ('true', '1', 'yes')
-_AZURE_USER = os.getenv('AZURE_USER', '')
-_AZURE_PASS = os.getenv('AZURE_PASS', '')
-
-if _USE_AZURE_CLI and not _AZURE_PASS:
-    # Azure CLI / Managed Identity (no password needed)
-    TGT_CS = (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
-        f"SERVER={os.getenv('AZURE_SERVER', '')};"
-        f"DATABASE={os.getenv('AZURE_DB', '')};"
-        "Authentication=ActiveDirectoryInteractive;"
-        "TrustServerCertificate=yes;"
-    )
-else:
-    # Traditional password auth (for backward compatibility)
-    TGT_CS = (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
-        f"SERVER={os.getenv('AZURE_SERVER', '')};"
-        f"DATABASE={os.getenv('AZURE_DB', '')};"
-        f"UID={_AZURE_USER};"
-        f"PWD={_AZURE_PASS};"
-        "TrustServerCertificate=yes;"
-    )
+# Traditional password auth from .env (AZURE_USER and AZURE_PASS)
+TGT_CS = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    f"SERVER={os.getenv('AZURE_SERVER', '')};"
+    f"DATABASE={os.getenv('AZURE_DB', '')};"
+    f"UID={os.getenv('AZURE_USER', '')};"
+    f"PWD={os.getenv('AZURE_PASS', '')};"
+    "TrustServerCertificate=yes;"
+)
 
 # ── Azure OpenAI ─────────────────────────────────────────────────────────────
 AZURE_ENDPOINT     = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -73,8 +58,10 @@ AZURE_API_KEY      = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_API_VERSION  = os.getenv("AZURE_OPENAI_API_VERSION",      "2024-10-21")
 AZURE_LLM_DEPLOY   = os.getenv("AZURE_OPENAI_DEPLOYMENT",        "gpt-4o")
 
-# ── Blob (same connector the AgentCore node uses) ────────────────────────────
+# ── Blob (Azure Storage — use endpoint + container or connector name) ────────
 BLOB_CONNECTOR_NAME = os.getenv("BLOB_CONNECTOR_NAME", "")
+BLOB_ENDPOINT = os.getenv("BLOB_ENDPOINT", "")  # e.g., https://<account>.blob.core.windows.net
+BLOB_CONTAINER = os.getenv("BLOB_CONTAINER", "quotations")
 
 # ── Tuning knobs passed straight through to the commercials helpers ──────────
 COMMERCIALS_PROMPTS: dict = {
@@ -432,13 +419,39 @@ def main() -> None:
     )
 
     # ── Blob config ──────────────────────────────────────────────────────────
-    if not BLOB_CONNECTOR_NAME:
-        logger.error("BLOB_CONNECTOR_NAME env var is not set — cannot download quotation blobs.")
-        sys.exit(1)
-    try:
-        blob_cfg = _get_blob_config_by_name(BLOB_CONNECTOR_NAME)
-    except Exception as exc:
-        logger.error("Could not resolve blob connector %r: %s", BLOB_CONNECTOR_NAME, exc)
+    # Two options:
+    # 1. Direct endpoint + container (recommended with Azure CLI)
+    # 2. Connector name (legacy, from AgentCore)
+
+    blob_cfg = None
+    if BLOB_ENDPOINT:
+        # Direct endpoint with Azure CLI auth (uses DefaultAzureCredential)
+        logger.info("Using direct blob endpoint with Azure CLI authentication")
+        try:
+            from azure.identity import DefaultAzureCredential
+            from azure.storage.blob import BlobServiceClient
+            credential = DefaultAzureCredential()
+            blob_service_client = BlobServiceClient(account_url=BLOB_ENDPOINT, credential=credential)
+            blob_cfg = {
+                "type": "azure_direct",
+                "endpoint": BLOB_ENDPOINT,
+                "container": BLOB_CONTAINER,
+                "client": blob_service_client,
+            }
+            logger.info("Connected to blob storage: %s / %s", BLOB_ENDPOINT, BLOB_CONTAINER)
+        except Exception as exc:
+            logger.error("Could not connect to blob endpoint %r: %s", BLOB_ENDPOINT, exc)
+            sys.exit(1)
+    elif BLOB_CONNECTOR_NAME:
+        # Legacy: connector name lookup
+        logger.info("Using blob connector: %s", BLOB_CONNECTOR_NAME)
+        try:
+            blob_cfg = _get_blob_config_by_name(BLOB_CONNECTOR_NAME)
+        except Exception as exc:
+            logger.error("Could not resolve blob connector %r: %s", BLOB_CONNECTOR_NAME, exc)
+            sys.exit(1)
+    else:
+        logger.error("Either BLOB_ENDPOINT or BLOB_CONNECTOR_NAME must be set")
         sys.exit(1)
 
     # ── PR list ──────────────────────────────────────────────────────────────
