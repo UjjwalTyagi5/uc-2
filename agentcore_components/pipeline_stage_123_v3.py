@@ -1960,6 +1960,15 @@ Apply these rules in order:
       candidate adds "graphics_card_vram_gb"), the candidate is a different
       product variant or configuration → REJECT.
 
+   e) Absence principle: if the candidate has 2+ "important" attributes
+      (importance != "critical") that the source completely lacks — and those
+      attributes are domain-specific (e.g., machine_model, tube_diameter,
+      voltage_rating, injection_units) — the candidate likely belongs to a
+      different product family → REJECT. One missing important attr is a
+      penalty (Rule 4); two or more missing domain-specific important attrs
+      are disqualifying. Use this to distinguish variants: a "basic mould"
+      (few attributes) from a "precision mould variant" (many more attributes).
+
 2. PRODUCT TYPE CONSISTENCY (item_level hierarchy).
 
    The item_level_1..8 chain identifies what the product IS, not just its
@@ -1993,7 +2002,10 @@ Apply these rules in order:
 4. IMPORTANT ATTRIBUTES ARE PENALTIES.
    For every "important" attribute mismatch of more than {important_pct}%
    (matched semantically per Rule 1a), lower the candidate's rank. Two
-   important mismatches start to be disqualifying.
+   important mismatches start to be disqualifying. Additionally, an
+   "important" attribute present on the candidate but entirely absent from
+   the source counts as a 100% mismatch penalty (Rule 1e absence principle).
+   Two such absences are disqualifying — do not pick.
 
 5. BRAND SIMILARITY IS NOT RELEVANCE.
    Same brand alone is not a relevance boost. Specs first.
@@ -7352,6 +7364,29 @@ def _fetch_candidate_snapshots(tgt_cs: str, dtl_ids: list[int]) -> list[dict]:
         conn.close()
 
 
+def _pre_filter_candidates(source: dict, candidates: list[dict], config: dict | None) -> list[dict]:
+    """Drop structurally incompatible candidates before LLM ranking.
+    Catches obvious outliers (extreme price ratios) that would waste LLM tokens.
+    Does NOT filter by category or item_level — those vary intentionally within
+    purchase_category_llm and should be decided by the LLM."""
+    if not candidates:
+        return []
+    cfg = config or {}
+    max_ratio = cfg.get("bench_max_price_ratio", 10.0)
+    src_price = source.get("unit_price_eur")
+    if not src_price or src_price <= 0:
+        return candidates
+    filtered = []
+    for c in candidates:
+        cand_price = c.get("unit_price_eur")
+        if cand_price and cand_price > 0:
+            ratio = max(src_price, cand_price) / min(src_price, cand_price)
+            if ratio > max_ratio:
+                continue
+        filtered.append(c)
+    return filtered
+
+
 def _llm_rank_candidates(
     llm,
     source_item: dict,
@@ -7629,6 +7664,8 @@ def _run_benchmark_v2(
                             f"candidate(s) newer than current PR ({created_iso}): {skipped_newer}"
                         )
                     candidates = before
+                # Pre-filter: drop extreme price outliers before LLM ranking
+                candidates = _pre_filter_candidates(rd, candidates, config)
                 source_snapshot = _build_source_snapshot_for_rank(rd)
                 selected, rejected = _llm_rank_candidates(
                     llm, source_snapshot, candidates, llm_shortlist, prompts,
