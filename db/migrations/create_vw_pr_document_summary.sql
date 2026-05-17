@@ -96,34 +96,26 @@ SELECT
     MAX(CASE WHEN [doc_type] = 'E-Auction Results' AND rn = 1 THEN [file_path]           END) AS eauction_file_path,
 
     -- Quotation (selected quotes only - all file paths aggregated)
-    (SELECT CAST(STRING_AGG(
-        CASE
-            WHEN qi.[embedded_classify_fk] IS NOT NULL
-            THEN eac.[file_path]
+    (SELECT SUBSTRING(
+        (SELECT '; ' + CASE
+            WHEN qi.[embedded_classify_fk] IS NOT NULL THEN eac.[file_path]
             ELSE ac.[file_path]
-        END,
-        '; '
-     ) AS NVARCHAR(MAX))
-     FROM [ras_procurement].[quotation_extracted_items] qi
-     LEFT JOIN [ras_procurement].[attachment_classification] ac
-       ON ac.[attachment_classify_uuid_pk] = qi.[attachment_classify_fk]
-     LEFT JOIN [ras_procurement].[embedded_attachment_classification] eac
-       ON eac.[embedded_attachment_classification_id] = qi.[embedded_classify_fk]
-     WHERE qi.[is_selected_quote] = 1
-       AND EXISTS (
-           SELECT 1 FROM [ras_procurement].[ras_tracker] rt2
-           WHERE rt2.[purchase_req_no] = ranked.[purchase_req_no]
+        END
+         FROM [ras_procurement].[quotation_extracted_items] qi
+         LEFT JOIN [ras_procurement].[attachment_classification] ac
+           ON ac.[attachment_classify_uuid_pk] = qi.[attachment_classify_fk]
+         LEFT JOIN [ras_procurement].[embedded_attachment_classification] eac
+           ON eac.[embedded_attachment_classification_id] = qi.[embedded_classify_fk]
+         WHERE qi.[is_selected_quote] = 1
            AND qi.[purchase_dtl_id] IN (
                SELECT prd.[PURCHASE_DTL_ID]
                FROM [ras_procurement].[purchase_req_detail] prd
-               WHERE prd.[PURCHASE_REQ_ID] = (
-                   SELECT prm.[PURCHASE_REQ_ID]
-                   FROM [ras_procurement].[purchase_req_mst] prm
-                   WHERE prm.[PURCHASE_REQ_NO] = ranked.[purchase_req_no]
-               )
+               JOIN [ras_procurement].[purchase_req_mst] prm
+                 ON prm.[PURCHASE_REQ_ID] = prd.[PURCHASE_REQ_ID]
+               WHERE prm.[PURCHASE_REQ_NO] = ranked.[purchase_req_no]
            )
-       )
-    ) AS quotation_file_paths
+         FOR XML PATH('')
+        ), 3, 2147483647)) AS quotation_file_paths
 
 FROM ranked
 GROUP BY [purchase_req_no];
