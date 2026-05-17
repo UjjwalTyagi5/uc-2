@@ -50,7 +50,6 @@ TGT_CS = (
     f"UID={os.getenv('AZURE_USER', '')};"
     f"PWD={os.getenv('AZURE_PASS', '')};"
     "TrustServerCertificate=yes;"
-    "Timeout=30;"  # 30 second query timeout to prevent hanging on slow queries
 )
 
 # ── Azure OpenAI ─────────────────────────────────────────────────────────────
@@ -478,11 +477,7 @@ def main() -> None:
         try:
             sources = _resolve_quotation_sources(TGT_CS, pr_no)
         except Exception as exc:
-            error_msg = str(exc).lower()
-            if 'timeout' in error_msg or 'query timeout' in error_msg:
-                logger.warning("[%s] query timeout (slow PR) — skipping", pr_no)
-            else:
-                logger.warning("[%s] could not resolve quotation sources: %s — skipping", pr_no, exc)
+            logger.warning("[%s] could not resolve quotation sources: %s — skipping", pr_no, exc)
             continue
         blob_by_key: dict[str, str] = {}
         for src in sources:
