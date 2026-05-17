@@ -7374,16 +7374,31 @@ def _pre_filter_candidates(source: dict, candidates: list[dict], prompts: dict |
     p = prompts or {}
     max_ratio = float(p.get("bench_max_price_ratio", 10.0))
     src_price = source.get("unit_price_eur")
-    if not src_price or src_price <= 0:
+    if not src_price:
+        return candidates
+    try:
+        src_price = float(src_price)
+    except (ValueError, TypeError):
+        return candidates
+    if src_price <= 0:
         return candidates
     filtered = []
     for c in candidates:
         cand_price = c.get("unit_price_eur")
-        if cand_price and cand_price > 0:
-            ratio = max(src_price, cand_price) / min(src_price, cand_price)
-            if ratio > max_ratio:
-                continue
-        filtered.append(c)
+        if not cand_price:
+            filtered.append(c)
+            continue
+        try:
+            cand_price = float(cand_price)
+        except (ValueError, TypeError):
+            filtered.append(c)
+            continue
+        if cand_price <= 0:
+            filtered.append(c)
+            continue
+        ratio = max(src_price, cand_price) / min(src_price, cand_price)
+        if ratio <= max_ratio:
+            filtered.append(c)
     return filtered
 
 
