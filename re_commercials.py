@@ -60,8 +60,7 @@ AZURE_LLM_DEPLOY   = os.getenv("AZURE_OPENAI_DEPLOYMENT",        "gpt-4o")
 
 # ── Blob (Azure Storage — use endpoint + container or connector name) ────────
 BLOB_CONNECTOR_NAME = os.getenv("BLOB_CONNECTOR_NAME", "")
-BLOB_ENDPOINT = os.getenv("BLOB_ENDPOINT", "")  # e.g., https://<account>.blob.core.windows.net
-BLOB_ACCOUNT_KEY = os.getenv("BLOB_ACCOUNT_KEY", "")  # Storage account access key
+BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING", "")  # Full connection string
 BLOB_CONTAINER = os.getenv("BLOB_CONTAINER", "quotations")
 
 # ── Tuning knobs passed straight through to the commercials helpers ──────────
@@ -425,18 +424,17 @@ def main() -> None:
     # 2. Connector name (legacy, from AgentCore)
 
     blob_cfg = None
-    if BLOB_ENDPOINT and BLOB_ACCOUNT_KEY:
-        # Direct endpoint with access key auth
-        logger.info("Using direct blob endpoint with access key authentication")
+    if BLOB_CONNECTION_STRING:
+        # Direct connection string auth
+        logger.info("Using blob storage connection string")
         try:
             from azure.storage.blob import BlobServiceClient
-            blob_client = BlobServiceClient(account_url=BLOB_ENDPOINT, credential=BLOB_ACCOUNT_KEY)
+            blob_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
             blob_cfg = {
-                "account_url": BLOB_ENDPOINT,
                 "container_name": BLOB_CONTAINER,
                 "blob_client": blob_client,
             }
-            logger.info("Connected to blob storage: %s / %s", BLOB_ENDPOINT, BLOB_CONTAINER)
+            logger.info("Connected to blob storage: %s", BLOB_CONTAINER)
         except Exception as exc:
             logger.error("Failed to initialize blob client: %s", exc)
             sys.exit(1)
