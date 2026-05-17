@@ -96,14 +96,14 @@ SELECT
     MAX(CASE WHEN [doc_type] = 'E-Auction Results' AND rn = 1 THEN [file_path]           END) AS eauction_file_path,
 
     -- Quotation (selected quotes only - all file paths aggregated)
-    (SELECT STRING_AGG(
+    (SELECT CAST(STRING_AGG(
         CASE
             WHEN qi.[embedded_classify_fk] IS NOT NULL
             THEN eac.[file_path]
             ELSE ac.[file_path]
         END,
         '; '
-     )
+     ) AS NVARCHAR(MAX))
      FROM [ras_procurement].[quotation_extracted_items] qi
      LEFT JOIN [ras_procurement].[attachment_classification] ac
        ON ac.[attachment_classify_uuid_pk] = qi.[attachment_classify_fk]
