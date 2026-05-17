@@ -95,27 +95,27 @@ SELECT
     MAX(CASE WHEN [doc_type] = 'E-Auction Results' AND rn = 1 THEN [classification_conf] END) AS eauction_conf,
     MAX(CASE WHEN [doc_type] = 'E-Auction Results' AND rn = 1 THEN [file_path]           END) AS eauction_file_path,
 
-    -- Quotation (selected quotes only - all file paths aggregated)
-    (SELECT SUBSTRING(
-        (SELECT '; ' + CASE
-            WHEN qi.[embedded_classify_fk] IS NOT NULL THEN eac.[file_path]
-            ELSE ac.[file_path]
-        END
-         FROM [ras_procurement].[quotation_extracted_items] qi
-         LEFT JOIN [ras_procurement].[attachment_classification] ac
-           ON ac.[attachment_classify_uuid_pk] = qi.[attachment_classify_fk]
-         LEFT JOIN [ras_procurement].[embedded_attachment_classification] eac
-           ON eac.[embedded_attachment_classification_id] = qi.[embedded_classify_fk]
-         WHERE qi.[is_selected_quote] = 1
-           AND qi.[purchase_dtl_id] IN (
-               SELECT prd.[PURCHASE_DTL_ID]
-               FROM [ras_procurement].[purchase_req_detail] prd
-               JOIN [ras_procurement].[purchase_req_mst] prm
-                 ON prm.[PURCHASE_REQ_ID] = prd.[PURCHASE_REQ_ID]
-               WHERE prm.[PURCHASE_REQ_NO] = ranked.[purchase_req_no]
-           )
-         FOR XML PATH('')
-        ), 3, 2147483647)) AS quotation_file_paths
+    -- Quotation (classified as Quotation, selected only)
+    (SELECT TOP 1 CASE
+        WHEN qi.[embedded_classify_fk] IS NOT NULL THEN eac.[file_path]
+        ELSE ac.[file_path]
+     END
+     FROM [ras_procurement].[quotation_extracted_items] qi
+     LEFT JOIN [ras_procurement].[attachment_classification] ac
+       ON ac.[attachment_classify_uuid_pk] = qi.[attachment_classify_fk]
+     LEFT JOIN [ras_procurement].[embedded_attachment_classification] eac
+       ON eac.[embedded_attachment_classification_id] = qi.[embedded_classify_fk]
+     WHERE qi.[is_selected_quote] = 1
+       AND qi.[purchase_dtl_id] IN (
+           SELECT prd.[PURCHASE_DTL_ID]
+           FROM [ras_procurement].[purchase_req_detail] prd
+           JOIN [ras_procurement].[purchase_req_mst] prm
+             ON prm.[PURCHASE_REQ_ID] = prd.[PURCHASE_REQ_ID]
+           WHERE prm.[PURCHASE_REQ_NO] = ranked.[purchase_req_no]
+       )
+       AND (ac.[doc_type] = 'Quotation' OR eac.[doc_type] = 'Quotation')
+     ORDER BY CASE WHEN eac.[classification_conf] IS NOT NULL THEN eac.[classification_conf] ELSE ac.[classification_conf] END DESC
+    ) AS quotation_file_path
 
 FROM ranked
 GROUP BY [purchase_req_no];
