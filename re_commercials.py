@@ -388,8 +388,8 @@ def main() -> None:
         help="Specific PR numbers. Omit to process all stage-8 PRs.",
     )
     parser.add_argument(
-        "--workers", type=int, default=4,
-        help="Parallel quotation groups (default 4, same as pipeline's parallel_workers).",
+        "--workers", type=int, default=1,
+        help="Parallel quotation groups (default 1 for sequential processing; set >1 for parallel).",
     )
     parser.add_argument(
         "--limit", type=int, default=0,
@@ -557,6 +557,27 @@ def main() -> None:
 
     dt = time.time() - t0
     logger.info("Done in %.1fs — %s", dt, _format_summary(results))
+
+    # Write results to Excel tracking file
+    try:
+        import pandas as pd
+        from datetime import datetime
+
+        excel_file = "re_commercials_progress.xlsx"
+        df = pd.DataFrame(results)
+        df["timestamp"] = datetime.now().isoformat()
+
+        # Append to existing file if it exists
+        try:
+            existing = pd.read_excel(excel_file)
+            df = pd.concat([existing, df], ignore_index=True)
+        except FileNotFoundError:
+            pass
+
+        df.to_excel(excel_file, index=False)
+        logger.info("Progress saved to %s", excel_file)
+    except Exception as exc:
+        logger.warning("Could not save Excel file: %s", exc)
 
     # Non-zero exit code if anything genuinely failed (skips & dry-runs are OK)
     failed = sum(1 for r in results if r["status"] == "failed")
