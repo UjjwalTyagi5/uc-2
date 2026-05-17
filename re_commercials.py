@@ -538,6 +538,14 @@ def main() -> None:
             results.append({"pr_no": pr_no, "status": "failed", "reason": str(exc), "timestamp": datetime.now().isoformat()})
             logger.warning("[%s] error: %s", pr_no, exc)
 
+        # Write to Excel after each PR (real-time tracking)
+        try:
+            import pandas as pd
+            df = pd.DataFrame(results)
+            df.to_excel(excel_file, index=False)
+        except Exception as exc:
+            logger.warning("Could not update Excel: %s", exc)
+
     # ── Save results to Excel ────────────────────────────────────────────────────
     t0 = time.time()
     dt = time.time() - t0
