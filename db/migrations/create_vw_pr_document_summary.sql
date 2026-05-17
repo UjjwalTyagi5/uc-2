@@ -95,10 +95,35 @@ SELECT
     MAX(CASE WHEN [doc_type] = 'E-Auction Results' AND rn = 1 THEN [classification_conf] END) AS eauction_conf,
     MAX(CASE WHEN [doc_type] = 'E-Auction Results' AND rn = 1 THEN [file_path]           END) AS eauction_file_path,
 
-    -- Quotation
-    MAX(CASE WHEN [doc_type] = 'Quotation' AND rn = 1 THEN [file_name]           END) AS quotation_file_name,
-    MAX(CASE WHEN [doc_type] = 'Quotation' AND rn = 1 THEN [classification_conf] END) AS quotation_conf,
-    MAX(CASE WHEN [doc_type] = 'Quotation' AND rn = 1 THEN [file_path]           END) AS quotation_file_path
+    -- Quotation (selected quotes only - all file paths aggregated)
+    (SELECT STRING_AGG(
+        CASE
+            WHEN qi.[embedded_classify_fk] IS NOT NULL
+            THEN eac.[file_path]
+            ELSE ac.[file_path]
+        END,
+        '; '
+     )
+     FROM [ras_procurement].[quotation_extracted_items] qi
+     LEFT JOIN [ras_procurement].[attachment_classification] ac
+       ON ac.[attachment_classify_uuid_pk] = qi.[attachment_classify_fk]
+     LEFT JOIN [ras_procurement].[embedded_attachment_classification] eac
+       ON eac.[embedded_attachment_classification_id] = qi.[embedded_classify_fk]
+     WHERE qi.[is_selected_quote] = 1
+       AND EXISTS (
+           SELECT 1 FROM [ras_procurement].[ras_tracker] rt2
+           WHERE rt2.[purchase_req_no] = ranked.[purchase_req_no]
+           AND qi.[purchase_dtl_id] IN (
+               SELECT prd.[PURCHASE_DTL_ID]
+               FROM [ras_procurement].[purchase_req_detail] prd
+               WHERE prd.[PURCHASE_REQ_ID] = (
+                   SELECT prm.[PURCHASE_REQ_ID]
+                   FROM [ras_procurement].[purchase_req_mst] prm
+                   WHERE prm.[PURCHASE_REQ_NO] = ranked.[purchase_req_no]
+               )
+           )
+       )
+    ) AS quotation_file_paths
 
 FROM ranked
 GROUP BY [purchase_req_no];
