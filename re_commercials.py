@@ -450,113 +450,98 @@ def main() -> None:
         logger.error("Either BLOB_ENDPOINT or BLOB_CONNECTOR_NAME must be set")
         sys.exit(1)
 
-    # ── PR list ──────────────────────────────────────────────────────────────
+    # ── PR list & Excel tracking ────────────────────────────────────────────────
+    try:
+        import pandas as pd
+        from datetime import datetime
+        excel_file = "re_commercials_progress.xlsx"
+    except ImportError:
+        logger.error("pandas required for progress tracking — pip install pandas openpyxl")
+        sys.exit(1)
+
     if args.pr_nos:
         pr_nos = args.pr_nos
         logger.info("Processing %d PR(s) supplied on the command line", len(pr_nos))
     else:
         pr_nos = _get_stage8_prs(TGT_CS)
         logger.info("Found %d stage-8 PR(s) in DB", len(pr_nos))
+
     if not pr_nos:
         logger.info("Nothing to do.")
         return
 
-    # ── Resolve quotation groups for each PR ─────────────────────────────────
-    # Build a flat list of jobs first so --limit and --workers operate at the
-    # quotation-source granularity (not the PR level).
-    jobs: list[dict] = []
-    for pr_no in pr_nos:
-        try:
-            row_groups = _fetch_existing_rows(TGT_CS, pr_no)
-        except Exception as exc:
-            logger.warning("[%s] could not fetch rows: %s — skipping", pr_no, exc)
-            continue
-        if not row_groups:
-            logger.info("[%s] no quotation_extracted_items rows — skipping", pr_no)
-            continue
-        try:
-            sources = _resolve_quotation_sources(TGT_CS, pr_no)
-        except Exception as exc:
-            logger.warning("[%s] could not resolve quotation sources: %s — skipping", pr_no, exc)
-            continue
-        blob_by_key: dict[str, str] = {}
-        for src in sources:
-            att = src["attachment_classify_fk"]
-            emb = src["embedded_classify_fk"]
-            # Priority: if embedded_classify_fk exists, use it; otherwise use attachment_classify_fk
-            source_id = str(emb) if emb else str(att)
-            blob_by_key[source_id] = src["blob_path"]
+    # Write PR list to Excel (for tracking) if not already there
+    try:
+        existing_df = pd.read_excel(excel_file)
+        processed_prs = set(existing_df[existing_df["status"].notna()]["pr_no"])
+    except FileNotFoundError:
+        processed_prs = set()
+        existing_df = pd.DataFrame()
 
-        for source_id, rows in row_groups.items():
-            blob_path = blob_by_key.get(source_id)
-            if not blob_path:
-                logger.warning(
-                    "[%s] no blob path for source %s — skipping (%d rows)",
-                    pr_no, source_id, len(rows),
-                )
-                continue
-            jobs.append({
-                "pr_no": pr_no, "source_id": source_id,
-                "rows": rows, "blob_path": blob_path,
-            })
-
-    if args.limit > 0:
-        jobs = jobs[: args.limit]
-        logger.info("--limit %d applied; processing %d quotation group(s)", args.limit, len(jobs))
-    else:
-        logger.info("Resolved %d quotation group(s) across %d PR(s)", len(jobs), len(pr_nos))
-    if not jobs:
-        logger.info("Nothing to do.")
+    # Filter out already-processed PRs
+    pending_prs = [p for p in pr_nos if p not in processed_prs]
+    if not pending_prs and existing_df.empty:
+        pending_prs = pr_nos  # Process all if no prior runs
+    elif not pending_prs:
+        logger.info("All PRs already processed. Use --reprocess to retry.")
         return
 
-    # ── Execute (parallel quotation groups) ──────────────────────────────────
-    t0 = time.time()
+    logger.info("Pending: %d/%d PR(s)", len(pending_prs), len(pr_nos))
+
+    # ── Process one PR at a time, updating Excel ────────────────────────────────
     results: list[dict] = []
-    workers = max(1, int(args.workers))
-    logger.info(
-        "Starting backfill — workers=%d, dry_run=%s, reprocess=%s",
-        workers, args.dry_run, args.reprocess,
-    )
+    for pr_idx, pr_no in enumerate(pending_prs, 1):
+        logger.info("[%d/%d] Processing PR=%s", pr_idx, len(pending_prs), pr_no)
 
-    def _run(job: dict) -> dict:
+        # Fetch & resolve for this PR only
         try:
-            return _process_quotation_group(
-                llm=llm, tgt_cs=TGT_CS, blob_cfg=blob_cfg,
-                pr_no=job["pr_no"], source_id=job["source_id"],
-                rows=job["rows"], src_blob_path=job["blob_path"],
-                reprocess=args.reprocess, dry_run=args.dry_run,
-            )
+            row_groups = _fetch_existing_rows(TGT_CS, pr_no)
+            if not row_groups:
+                logger.info("[%s] no quotation_extracted_items rows — skipping", pr_no)
+                results.append({"pr_no": pr_no, "status": "skipped", "reason": "no_rows", "timestamp": datetime.now().isoformat()})
+                continue
+
+            sources = _resolve_quotation_sources(TGT_CS, pr_no)
+            blob_by_key = {str(s.get("embedded_classify_fk") or s.get("attachment_classify_fk")): s["blob_path"] for s in sources if s.get("blob_path")}
+
+            # Process all quotation groups for this PR
+            pr_results = []
+            for source_id, rows in row_groups.items():
+                blob_path = blob_by_key.get(source_id)
+                if not blob_path:
+                    continue
+
+                try:
+                    result = _process_quotation_group(
+                        llm=llm, tgt_cs=TGT_CS, blob_cfg=blob_cfg,
+                        pr_no=pr_no, source_id=source_id,
+                        rows=rows, src_blob_path=blob_path,
+                        reprocess=args.reprocess, dry_run=args.dry_run,
+                    )
+                    pr_results.append(result)
+                except Exception as exc:
+                    pr_results.append({"pr_no": pr_no, "source_id": source_id, "status": "failed", "reason": str(exc)})
+
+            # Aggregate results for this PR
+            if pr_results:
+                ok_count = sum(1 for r in pr_results if r["status"] == "ok")
+                total_updated = sum(r.get("updated", 0) for r in pr_results)
+                results.append({
+                    "pr_no": pr_no,
+                    "status": "ok" if ok_count > 0 else "failed",
+                    "groups": len(pr_results),
+                    "rows_updated": total_updated,
+                    "timestamp": datetime.now().isoformat()
+                })
+                logger.info("[%s] completed: %d group(s), %d row(s) updated", pr_no, len(pr_results), total_updated)
         except Exception as exc:
-            return {
-                "pr_no": job["pr_no"], "source_id": job["source_id"],
-                "rows": len(job["rows"]),
-                "updated": 0, "status": "failed", "reason": f"unhandled: {exc}",
-            }
+            results.append({"pr_no": pr_no, "status": "failed", "reason": str(exc), "timestamp": datetime.now().isoformat()})
+            logger.warning("[%s] error: %s", pr_no, exc)
 
-    if workers == 1:
-        for i, job in enumerate(jobs, 1):
-            r = _run(job)
-            results.append(r)
-            logger.info(
-                "[%d/%d] PR=%s source=%s — %s (%d row(s), reason=%s)",
-                i, len(jobs), r["pr_no"], r["source_id"],
-                r["status"], r["updated"], r["reason"] or "-",
-            )
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            future_to_idx = {pool.submit(_run, job): i for i, job in enumerate(jobs, 1)}
-            for fut in concurrent.futures.as_completed(future_to_idx):
-                i = future_to_idx[fut]
-                r = fut.result()
-                results.append(r)
-                logger.info(
-                    "[%d/%d] PR=%s source=%s — %s (%d row(s), reason=%s)",
-                    i, len(jobs), r["pr_no"], r["source_id"],
-                    r["status"], r["updated"], r["reason"] or "-",
-                )
-
+    # ── Save results to Excel ────────────────────────────────────────────────────
+    t0 = time.time()
     dt = time.time() - t0
-    logger.info("Done in %.1fs — %s", dt, _format_summary(results))
+    logger.info("Done in %.1fs", dt)
 
     # Write results to Excel tracking file
     try:
