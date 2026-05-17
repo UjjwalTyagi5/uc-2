@@ -71,6 +71,8 @@ SELECT
     low.[currency]             AS low_hist_currency,
     low.[unit_price]           AS low_hist_unit_price,
     low.[unit_price_eur]       AS low_hist_unit_price_eur,
+    low.[total_price]          AS low_hist_total_price,
+    low.[total_price_eur]      AS low_hist_total_price_eur,
     low.[supplier_name]        AS low_hist_supplier_name,
     low.[supplier_country]     AS low_hist_supplier_country,
     low.[quotation_date]       AS low_hist_quotation_date,
@@ -82,6 +84,8 @@ SELECT
     lst.[currency]             AS last_hist_currency,
     lst.[unit_price]           AS last_hist_unit_price,
     lst.[unit_price_eur]       AS last_hist_unit_price_eur,
+    lst.[total_price]          AS last_hist_total_price,
+    lst.[total_price_eur]      AS last_hist_total_price_eur,
     lst.[supplier_name]        AS last_hist_supplier_name,
     lst.[quotation_date]       AS last_hist_quotation_date,
 
