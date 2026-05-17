@@ -155,11 +155,28 @@ OUTER APPLY (
             p.[supplier_name],
             p.[supplier_country],
             ROW_NUMBER() OVER (
-                ORDER BY COALESCE(p.[unit_price_eur], p.[unit_price]) ASC
+                ORDER BY COALESCE(p.[unit_price_eur], p.[unit_price]) ASC, p.[supplier_name] ASC
             ) AS rn
-        FROM [ras_procurement].[quotation_extracted_items] p
-        WHERE p.[purchase_dtl_id] = br.[purchase_dtl_id]
-          AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
+        FROM (
+            SELECT
+                p.[quantity],
+                p.[currency],
+                p.[unit_price],
+                p.[unit_price_eur],
+                p.[total_price],
+                p.[total_price_eur],
+                p.[payment_terms],
+                p.[supplier_name],
+                p.[supplier_country],
+                ROW_NUMBER() OVER (
+                    PARTITION BY p.[supplier_name]
+                    ORDER BY COALESCE(p.[unit_price_eur], p.[unit_price]) ASC
+                ) AS supplier_rn
+            FROM [ras_procurement].[quotation_extracted_items] p
+            WHERE p.[purchase_dtl_id] = br.[purchase_dtl_id]
+              AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
+        ) p
+        WHERE p.supplier_rn = 1
     ) p
 ) proposals
 
