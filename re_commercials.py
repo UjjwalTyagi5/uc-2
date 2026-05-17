@@ -72,6 +72,7 @@ COMMERCIALS_PROMPTS: dict = {
     # LLM retry knobs reuse the pipeline defaults
     "llm_max_retries":    int(os.getenv("LLM_MAX_RETRIES",    "3")),
     "llm_retry_cooldown": int(os.getenv("LLM_RETRY_COOLDOWN", "60")),
+    "llm_call_timeout":   int(os.getenv("LLM_CALL_TIMEOUT",   "120")),  # seconds
 }
 
 logging.basicConfig(
