@@ -70,9 +70,9 @@ COMMERCIALS_PROMPTS: dict = {
     "ext_max_pages":  int(os.getenv("EXT_MAX_PAGES",  "20")),
     "ext_max_images": int(os.getenv("EXT_MAX_IMAGES", "50")),
     # LLM retry knobs reuse the pipeline defaults
-    "llm_max_retries":    int(os.getenv("LLM_MAX_RETRIES",    "3")),
-    "llm_retry_cooldown": int(os.getenv("LLM_RETRY_COOLDOWN", "60")),
-    "llm_call_timeout":   int(os.getenv("LLM_CALL_TIMEOUT",   "120")),  # seconds
+    "llm_max_retries":      int(os.getenv("LLM_MAX_RETRIES",      "3")),
+    "llm_retry_cooldown":   int(os.getenv("LLM_RETRY_COOLDOWN",   "60")),
+    "llm_call_timeout_s":   int(os.getenv("LLM_CALL_TIMEOUT_S",   "120")),  # seconds
 }
 
 logging.basicConfig(
