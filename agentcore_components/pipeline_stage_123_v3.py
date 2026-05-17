@@ -7364,15 +7364,15 @@ def _fetch_candidate_snapshots(tgt_cs: str, dtl_ids: list[int]) -> list[dict]:
         conn.close()
 
 
-def _pre_filter_candidates(source: dict, candidates: list[dict], config: dict | None) -> list[dict]:
+def _pre_filter_candidates(source: dict, candidates: list[dict], prompts: dict | None) -> list[dict]:
     """Drop structurally incompatible candidates before LLM ranking.
     Catches obvious outliers (extreme price ratios) that would waste LLM tokens.
     Does NOT filter by category or item_level — those vary intentionally within
     purchase_category_llm and should be decided by the LLM."""
     if not candidates:
         return []
-    cfg = config or {}
-    max_ratio = cfg.get("bench_max_price_ratio", 10.0)
+    p = prompts or {}
+    max_ratio = float(p.get("bench_max_price_ratio", 10.0))
     src_price = source.get("unit_price_eur")
     if not src_price or src_price <= 0:
         return candidates
@@ -7665,7 +7665,7 @@ def _run_benchmark_v2(
                         )
                     candidates = before
                 # Pre-filter: drop extreme price outliers before LLM ranking
-                candidates = _pre_filter_candidates(rd, candidates, config)
+                candidates = _pre_filter_candidates(rd, candidates, prompts)
                 source_snapshot = _build_source_snapshot_for_rank(rd)
                 selected, rejected = _llm_rank_candidates(
                     llm, source_snapshot, candidates, llm_shortlist, prompts,
