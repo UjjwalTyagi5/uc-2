@@ -107,20 +107,25 @@ def _get_benchmarked_prs(tgt_cs: str) -> list[str]:
     cur  = conn.cursor()
     try:
         cur.execute("""
-            SELECT rt.[purchase_req_no]
-              FROM [ras_procurement].[ras_tracker] rt
-              JOIN [ras_procurement].[benchmark_result] br
-                ON rt.[ras_uuid_pk] IN (
-                    SELECT ac.[ras_uuid_pk]
-                    FROM [ras_procurement].[attachment_classification] ac
-                    WHERE ac.[attachment_classify_uuid_pk] IN (
-                        SELECT qi.[attachment_classify_fk]
-                        FROM [ras_procurement].[quotation_extracted_items] qi
-                        WHERE qi.[purchase_dtl_id] = br.[purchase_dtl_id]
-                    )
-                )
-             WHERE rt.[current_stage_fk] = 8
-             ORDER BY rt.[updated_at] DESC
+            WITH filtered AS (
+              SELECT DISTINCT rt.[purchase_req_no], rt.[updated_at]
+                FROM [ras_procurement].[ras_tracker] rt
+               WHERE rt.[current_stage_fk] = 8
+                 AND EXISTS (
+                     SELECT 1
+                       FROM [ras_procurement].[benchmark_result] br
+                      WHERE br.[purchase_dtl_id] IN (
+                          SELECT qi.[purchase_dtl_id]
+                            FROM [ras_procurement].[quotation_extracted_items] qi
+                            JOIN [ras_procurement].[attachment_classification] ac
+                              ON qi.[attachment_classify_fk] = ac.[attachment_classify_uuid_pk]
+                           WHERE ac.[ras_uuid_pk] = rt.[ras_uuid_pk]
+                      )
+                 )
+            )
+            SELECT [purchase_req_no]
+              FROM filtered
+             ORDER BY [updated_at] DESC
         """)
         return [r[0] for r in cur.fetchall()]
     finally:
