@@ -20,7 +20,7 @@ SELECT
     prd.[ITEMDESCRIPTION]        AS item_description_user,
     prt.[PURCHASE_REQ_TYPE]      AS item_category,
     prd.[Insourcing_flag]        AS insourcing_flag,
-    [ras_procurement].[fn_clean_html](prm.[JUSTIFICATION]) AS project_justification_user,
+    prm.[JUSTIFICATION]          AS project_justification_user,
     prm.[LAST_APPROVED_COMMENTS] AS last_approver_comments,
 
     -- ========== CURRENT/PRIMARY QUOTE ==========
