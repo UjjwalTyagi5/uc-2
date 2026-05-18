@@ -5557,23 +5557,24 @@ def _run_benchmark(
 
             # Also calculate inflation for last_hist_item (most recent)
             if last_item and current_year:
+                supplier_country_last = last_item.get("supplier_country") or rd.get("supplier_country")
                 ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_item.get("purchase_dtl_id"))
                 ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
                 if ref_year_last and current_year and ref_year_last < current_year:
                     infl_raw_last = _estimate_inflation_via_llm(
                         llm, rd.get("item_name"), item_category or None,
-                        supplier_country, ref_year_last, current_year,
+                        supplier_country_last, ref_year_last, current_year,
                     )
                     if infl_raw_last is not None:
                         try: infl_dec_last = Decimal(str(infl_raw_last))
                         except Exception: pass
-                    cpi_raw_last = _compute_cpi_pct(supplier_country, ref_year_last, current_year)
+                    cpi_raw_last = _compute_cpi_pct(supplier_country_last, ref_year_last, current_year)
                     if cpi_raw_last is not None:
                         try: cpi_dec_last = Decimal(str(cpi_raw_last))
                         except Exception: pass
                     logger.info(
                         f"[{pr_no}] dtl_id={dtl_id}: inflation_pct_last={infl_dec_last} "
-                        f"cpi_pct_last={cpi_dec_last} (country={supplier_country!r} {ref_year_last}-{current_year})"
+                        f"cpi_pct_last={cpi_dec_last} (country={supplier_country_last!r} {ref_year_last}-{current_year})"
                     )
 
             # LLM benchmark analysis — uses pre-computed aggregates so the
@@ -7844,17 +7845,18 @@ def _run_benchmark_v2(
 
             # Also calculate inflation for last_hist_item (most recent)
             if last_item and current_year:
+                supplier_country_last = last_item.get("supplier_country") or rd.get("supplier_country")
                 ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_item.get("purchase_dtl_id"))
                 ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
                 if ref_year_last and current_year and ref_year_last < current_year:
                     infl_raw_last = _estimate_inflation_via_llm(
                         llm, rd.get("item_name"), item_category or None,
-                        supplier_country, ref_year_last, current_year,
+                        supplier_country_last, ref_year_last, current_year,
                     )
                     if infl_raw_last is not None:
                         try: infl_dec_last = Decimal(str(infl_raw_last))
                         except Exception: pass
-                    cpi_raw_last = _compute_cpi_pct(supplier_country, ref_year_last, current_year)
+                    cpi_raw_last = _compute_cpi_pct(supplier_country_last, ref_year_last, current_year)
                     if cpi_raw_last is not None:
                         try: cpi_dec_last = Decimal(str(cpi_raw_last))
                         except Exception: pass
