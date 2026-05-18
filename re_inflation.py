@@ -135,8 +135,8 @@ def _get_benchmark_rows(tgt_cs: str, pr_no: str) -> list[dict]:
         cur.execute("""
             SELECT
                 br.[purchase_dtl_id],
-                COALESCE(low_qi.[purchase_dtl_id], br.[low_hist_item_fk]) AS [low_hist_dtl_id],
-                COALESCE(last_qi.[purchase_dtl_id], br.[last_hist_item_fk]) AS [last_hist_dtl_id],
+                low_qi.[purchase_dtl_id] AS [low_hist_dtl_id],
+                last_qi.[purchase_dtl_id] AS [last_hist_dtl_id],
                 qi.[item_name],
                 qi.[item_level_1],
                 qi.[item_level_2],
