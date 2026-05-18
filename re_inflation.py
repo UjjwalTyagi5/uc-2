@@ -92,6 +92,13 @@ _P = _ilu.module_from_spec(_spec)
 sys.modules[_spec.name] = _P
 _spec.loader.exec_module(_P)
 
+# Disable stack dumper thread (not needed for sequential backfill)
+if hasattr(_P, '_DUMPER_STOP'):
+    _P._DUMPER_STOP = True
+for t in __import__('threading').enumerate():
+    if 'dump' in t.name.lower():
+        t.daemon = True
+
 _connect                   = _P._connect
 _compute_cpi_pct           = _P._compute_cpi_pct
 _get_pr_master_date_for_dtl_id = _P._get_pr_master_date_for_dtl_id
