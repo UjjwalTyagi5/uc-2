@@ -21,6 +21,13 @@ BEGIN
     SET @output = REPLACE(@output, '&quot;', '"');
     SET @output = REPLACE(@output, '&#39;', '''');
     SET @output = REPLACE(@output, '&apos;', '''');
+    SET @output = REPLACE(@output, '&rsquo;', '''');
+    SET @output = REPLACE(@output, '&lsquo;', '''');
+    SET @output = REPLACE(@output, '&rdquo;', '"');
+    SET @output = REPLACE(@output, '&ldquo;', '"');
+    SET @output = REPLACE(@output, '&ndash;', '-');
+    SET @output = REPLACE(@output, '&mdash;', '-');
+    SET @output = REPLACE(@output, '&bull;', '•');
 
     -- Remove HTML tags
     SET @output = REPLACE(@output, '<br />', ' ');
@@ -44,6 +51,19 @@ BEGIN
     SET @output = REPLACE(@output, '}', '');
     SET @output = REPLACE(@output, '[', '');
     SET @output = REPLACE(@output, ']', '');
+    SET @output = REPLACE(@output, '|', '');
+    SET @output = REPLACE(@output, '`', '');
+    SET @output = REPLACE(@output, '~', '');
+    SET @output = REPLACE(@output, '^', '');
+
+    -- Replace control characters with spaces
+    SET @output = REPLACE(@output, CHAR(9), ' ');    -- Tab
+    SET @output = REPLACE(@output, CHAR(10), ' ');   -- Line feed
+    SET @output = REPLACE(@output, CHAR(13), ' ');   -- Carriage return
+
+    -- Remove duplicate dashes
+    WHILE CHARINDEX('--', @output) > 0
+        SET @output = REPLACE(@output, '--', '-');
 
     -- Clean up multiple spaces
     WHILE CHARINDEX('  ', @output) > 0
