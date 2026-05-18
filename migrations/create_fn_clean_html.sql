@@ -39,6 +39,12 @@ BEGIN
     SET @output = REPLACE(@output, '<div>', '');
     SET @output = REPLACE(@output, '</div>', ' ');
 
+    -- Remove special characters
+    SET @output = REPLACE(@output, '{', '');
+    SET @output = REPLACE(@output, '}', '');
+    SET @output = REPLACE(@output, '[', '');
+    SET @output = REPLACE(@output, ']', '');
+
     -- Clean up multiple spaces
     WHILE CHARINDEX('  ', @output) > 0
         SET @output = REPLACE(@output, '  ', ' ');
