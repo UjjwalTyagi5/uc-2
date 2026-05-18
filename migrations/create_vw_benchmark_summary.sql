@@ -20,7 +20,16 @@ SELECT
     prd.[ITEMDESCRIPTION]        AS item_description_user,
     prt.[PURCHASE_REQ_TYPE]      AS item_category,
     prd.[Insourcing_flag]        AS insourcing_flag,
-    prm.[JUSTIFICATION]          AS project_justification_user,
+    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+        prm.[JUSTIFICATION],
+        '&nbsp;', ' '),
+        '&amp;', '&'),
+        '<br />', ' '),
+        '<br/>', ' '),
+        '<strong>', ''),
+        '</strong>', ''),
+        '<em>', ''),
+        '</em>', '') AS project_justification_user,
     prm.[LAST_APPROVED_COMMENTS] AS last_approver_comments,
 
     -- ========== CURRENT/PRIMARY QUOTE ==========
