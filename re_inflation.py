@@ -107,7 +107,7 @@ def _get_benchmarked_prs(tgt_cs: str) -> list[str]:
     cur  = conn.cursor()
     try:
         cur.execute("""
-            SELECT DISTINCT rt.[purchase_req_no]
+            SELECT rt.[purchase_req_no]
               FROM [ras_procurement].[ras_tracker] rt
               JOIN [ras_procurement].[benchmark_result] br
                 ON rt.[ras_uuid_pk] IN (
