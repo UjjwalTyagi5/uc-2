@@ -173,14 +173,14 @@ OUTER APPLY (
                 p.[supplier_name],
                 p.[supplier_country],
                 ROW_NUMBER() OVER (
-                    PARTITION BY p.[supplier_name]
-                    ORDER BY COALESCE(p.[unit_price_eur], p.[unit_price]) ASC
-                ) AS supplier_rn
+                    PARTITION BY p.[supplier_name], COALESCE(p.[unit_price_eur], p.[unit_price])
+                    ORDER BY p.[supplier_name] ASC
+                ) AS duplicate_rn
             FROM [ras_procurement].[quotation_extracted_items] p
             WHERE p.[purchase_dtl_id] = br.[purchase_dtl_id]
               AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
         ) p
-        WHERE p.supplier_rn = 1
+        WHERE p.duplicate_rn = 1
     ) p
 ) proposals
 
