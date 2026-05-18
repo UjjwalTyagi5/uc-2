@@ -193,6 +193,8 @@ def _get_benchmark_rows(tgt_cs: str, pr_no: str) -> list[dict]:
                 qi.[item_level_3],
                 prd.[C_DATETIME],
                 qi.[supplier_country],
+                low_qi.[supplier_country] AS [low_supplier_country],
+                last_qi.[supplier_country] AS [last_supplier_country],
                 qi.[quotation_date]
               FROM [ras_procurement].[benchmark_result] br
               LEFT JOIN [ras_procurement].[quotation_extracted_items] qi
@@ -241,18 +243,19 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
     # Inflation for low_hist_item
     if low_dtl_id:
         try:
+            low_supplier_country = row.get("low_supplier_country") or supplier_country
             ref_dt = _get_pr_master_date_for_dtl_id(tgt_cs, low_dtl_id)
             ref_year = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
 
-            if ref_year and current_year and ref_year < current_year:
+            if ref_year and current_year and ref_year < current_year and low_supplier_country:
                 infl_raw = _estimate_inflation(
                     llm, item_name, item_category or None,
-                    supplier_country, ref_year, current_year,
+                    low_supplier_country, ref_year, current_year,
                 )
                 if infl_raw is not None:
                     infl_dec = Decimal(str(infl_raw))
 
-                cpi_raw = _compute_cpi_pct_with_retry(supplier_country, ref_year, current_year)
+                cpi_raw = _compute_cpi_pct_with_retry(low_supplier_country, ref_year, current_year)
                 if cpi_raw is not None:
                     cpi_dec = Decimal(str(cpi_raw))
 
@@ -263,18 +266,19 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
     # Inflation for last_hist_item
     if last_dtl_id:
         try:
+            last_supplier_country = row.get("last_supplier_country") or supplier_country
             ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_dtl_id)
             ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
 
-            if ref_year_last and current_year and ref_year_last < current_year:
+            if ref_year_last and current_year and ref_year_last < current_year and last_supplier_country:
                 infl_raw_last = _estimate_inflation(
                     llm, item_name, item_category or None,
-                    supplier_country, ref_year_last, current_year,
+                    last_supplier_country, ref_year_last, current_year,
                 )
                 if infl_raw_last is not None:
                     infl_dec_last = Decimal(str(infl_raw_last))
 
-                cpi_raw_last = _compute_cpi_pct_with_retry(supplier_country, ref_year_last, current_year)
+                cpi_raw_last = _compute_cpi_pct_with_retry(last_supplier_country, ref_year_last, current_year)
                 if cpi_raw_last is not None:
                     cpi_dec_last = Decimal(str(cpi_raw_last))
 
