@@ -176,8 +176,8 @@ def _get_benchmark_rows(tgt_cs: str, pr_no: str) -> list[dict]:
 
 def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     """Recalculate inflation for low_hist_item and last_hist_item."""
-    infl_dec = cpi_dec = Decimal("0")
-    infl_dec_last = cpi_dec_last = Decimal("0")
+    infl_dec = cpi_dec = None
+    infl_dec_last = cpi_dec_last = None
 
     dtl_id = row.get("purchase_dtl_id")
     low_dtl_id = row.get("low_hist_dtl_id")
