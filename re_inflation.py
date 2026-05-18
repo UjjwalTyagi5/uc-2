@@ -92,9 +92,17 @@ _P = _ilu.module_from_spec(_spec)
 sys.modules[_spec.name] = _P
 _spec.loader.exec_module(_P)
 
-# Disable stack dumper thread (not needed for sequential backfill)
+# Stop stack dumper thread (not needed for sequential backfill)
+import threading as _threading
 if hasattr(_P, '_DUMPER_STOP'):
     _P._DUMPER_STOP = True
+for _t in _threading.enumerate():
+    if _t.name == 'dumper' and _t.is_alive():
+        try:
+            _P._DUMPER_STOP = True
+            _t.join(timeout=1)
+        except:
+            pass
 
 _connect                   = _P._connect
 _compute_cpi_pct           = _P._compute_cpi_pct
