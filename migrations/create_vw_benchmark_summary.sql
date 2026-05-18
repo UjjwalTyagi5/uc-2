@@ -75,10 +75,10 @@ SELECT
     low.[unit_price_eur]           AS low_hist_unit_price_eur,
     low.[total_price]              AS low_hist_total_price,
     low.[total_price_eur]          AS low_hist_total_price_eur,
-    br.[inflation_pct]             AS lowest_inflation_pct,
-    br.[cpi_inflation_pct]         AS lowest_cpi_inflation_pct,
-    low.[unit_price_eur] * (1 + br.[inflation_pct] / 100)   AS lowest_normalized_unit_price_eur,
-    low.[total_price_eur] * (1 + br.[inflation_pct] / 100)  AS lowest_normalized_total_price_eur,
+    br.[inflation_pct]             AS low_hist_inflation_pct,
+    br.[cpi_inflation_pct]         AS low_hist_cpi_inflation_pct,
+    low.[unit_price_eur] * (1 + br.[inflation_pct] / 100)   AS low_hist_normalized_unit_price_eur,
+    low.[total_price_eur] * (1 + br.[inflation_pct] / 100)  AS low_hist_normalized_total_price_eur,
 
     -- ========== HISTORICAL COMPARISON: MOST RECENT MATCH ==========
     lst.[purchase_dtl_id]          AS last_hist_dtl_id,
@@ -92,10 +92,10 @@ SELECT
     lst.[unit_price_eur]           AS last_hist_unit_price_eur,
     lst.[total_price]              AS last_hist_total_price,
     lst.[total_price_eur]          AS last_hist_total_price_eur,
-    br.[inflation_pct_last]        AS last_inflation_pct,
-    br.[cpi_inflation_pct_last]    AS last_cpi_inflation_pct,
-    lst.[unit_price_eur] * (1 + br.[inflation_pct_last] / 100)   AS last_normalized_unit_price_eur,
-    lst.[total_price_eur] * (1 + br.[inflation_pct_last] / 100)  AS last_normalized_total_price_eur,
+    br.[inflation_pct_last]        AS last_hist_inflation_pct,
+    br.[cpi_inflation_pct_last]    AS last_hist_cpi_inflation_pct,
+    lst.[unit_price_eur] * (1 + br.[inflation_pct_last] / 100)   AS last_hist_normalized_unit_price_eur,
+    lst.[total_price_eur] * (1 + br.[inflation_pct_last] / 100)  AS last_hist_normalized_total_price_eur,
 
     -- ========== MARKET CONTEXT & STATISTICS ==========
     quot_stats.[supplier_count],
