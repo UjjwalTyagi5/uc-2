@@ -135,8 +135,8 @@ def _get_benchmark_rows(tgt_cs: str, pr_no: str) -> list[dict]:
         cur.execute("""
             SELECT
                 br.[purchase_dtl_id],
-                br.[low_hist_item_fk],
-                br.[last_hist_item_fk],
+                COALESCE(low_qi.[purchase_dtl_id], br.[low_hist_item_fk]) AS [low_hist_dtl_id],
+                COALESCE(last_qi.[purchase_dtl_id], br.[last_hist_item_fk]) AS [last_hist_dtl_id],
                 qi.[item_name],
                 qi.[item_level_1],
                 qi.[item_level_2],
@@ -149,6 +149,10 @@ def _get_benchmark_rows(tgt_cs: str, pr_no: str) -> list[dict]:
                 ON br.[purchase_dtl_id] = qi.[purchase_dtl_id]
               LEFT JOIN [ras_procurement].[purchase_req_detail] prd
                 ON qi.[purchase_dtl_id] = prd.[PURCHASE_DTL_ID]
+              LEFT JOIN [ras_procurement].[quotation_extracted_items] low_qi
+                ON br.[low_hist_item_fk] = low_qi.[extracted_item_uuid_pk]
+              LEFT JOIN [ras_procurement].[quotation_extracted_items] last_qi
+                ON br.[last_hist_item_fk] = last_qi.[extracted_item_uuid_pk]
              WHERE qi.[purchase_dtl_id] IN (
                 SELECT qi2.[purchase_dtl_id]
                 FROM [ras_procurement].[quotation_extracted_items] qi2
@@ -171,8 +175,8 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
     infl_dec_last = cpi_dec_last = Decimal("0")
 
     dtl_id = row.get("purchase_dtl_id")
-    low_fk = row.get("low_hist_item_fk")
-    last_fk = row.get("last_hist_item_fk")
+    low_dtl_id = row.get("low_hist_dtl_id")
+    last_dtl_id = row.get("last_hist_dtl_id")
     current_created = row.get("C_DATETIME")
     current_year = current_created.year if current_created and hasattr(current_created, "year") else None
     supplier_country = row.get("supplier_country")
@@ -185,9 +189,9 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
         return infl_dec, cpi_dec, infl_dec_last, cpi_dec_last
 
     # Inflation for low_hist_item
-    if low_fk:
+    if low_dtl_id:
         try:
-            ref_dt = _get_pr_master_date_for_dtl_id(tgt_cs, low_fk)
+            ref_dt = _get_pr_master_date_for_dtl_id(tgt_cs, low_dtl_id)
             ref_year = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
 
             if ref_year and current_year and ref_year < current_year:
@@ -207,9 +211,9 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
             logger.warning(f"dtl_id={dtl_id}: failed to calculate inflation for low_hist_item: {exc}")
 
     # Inflation for last_hist_item
-    if last_fk:
+    if last_dtl_id:
         try:
-            ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_fk)
+            ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_dtl_id)
             ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
 
             if ref_year_last and current_year and ref_year_last < current_year:
