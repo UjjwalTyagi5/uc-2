@@ -243,11 +243,15 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
     # Inflation for low_hist_item
     if low_dtl_id:
         try:
-            low_supplier_country = row.get("low_supplier_country") or supplier_country
+            low_supplier_country = row.get("low_supplier_country")
+            if not low_supplier_country:
+                logger.warning(f"dtl_id={dtl_id}: low_hist_item missing supplier_country, skipping")
+                return infl_dec, cpi_dec, infl_dec_last, cpi_dec_last
+
             ref_dt = _get_pr_master_date_for_dtl_id(tgt_cs, low_dtl_id)
             ref_year = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
 
-            if ref_year and current_year and ref_year < current_year and low_supplier_country:
+            if ref_year and current_year and ref_year < current_year:
                 infl_raw = _estimate_inflation(
                     llm, item_name, item_category or None,
                     low_supplier_country, ref_year, current_year,
@@ -266,11 +270,15 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
     # Inflation for last_hist_item
     if last_dtl_id:
         try:
-            last_supplier_country = row.get("last_supplier_country") or supplier_country
+            last_supplier_country = row.get("last_supplier_country")
+            if not last_supplier_country:
+                logger.warning(f"dtl_id={dtl_id}: last_hist_item missing supplier_country, skipping")
+                return infl_dec, cpi_dec, infl_dec_last, cpi_dec_last
+
             ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_dtl_id)
             ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
 
-            if ref_year_last and current_year and ref_year_last < current_year and last_supplier_country:
+            if ref_year_last and current_year and ref_year_last < current_year:
                 infl_raw_last = _estimate_inflation(
                     llm, item_name, item_category or None,
                     last_supplier_country, ref_year_last, current_year,
