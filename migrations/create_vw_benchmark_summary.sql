@@ -31,20 +31,20 @@ SELECT
                                     REPLACE(
                                         REPLACE(
                                             REPLACE(
-                                                REPLACE(prm.[JUSTIFICATION], '&nbsp;', ' '),
-                                                '&amp;', '&'),
-                                            '<br />', ' '),
-                                        '<br/>', ' '),
-                                    '<br>', ' '),
-                                '<strong>', ''),
-                            '</strong>', ''),
-                        '<em>', ''),
-                    '</em>', ''),
-                '<b>', ''),
-            '</b>', ''),
-        '<i>', ''),
-    '</i>', ''
-    ))  AS project_justification_user,
+                                                REPLACE(
+                                                    REPLACE(prm.[JUSTIFICATION], '&nbsp;', ' '),
+                                                    '&amp;', '&'),
+                                                '<br />', ' '),
+                                            '<br/>', ' '),
+                                        '<br>', ' '),
+                                    '<strong>', ''),
+                                '</strong>', ''),
+                            '<em>', ''),
+                        '</em>', ''),
+                    '<b>', ''),
+                '</b>', ''),
+            '<i>', ''),
+        '</i>', ''))) AS project_justification_user,
     prm.[LAST_APPROVED_COMMENTS] AS last_approver_comments,
 
     -- ========== CURRENT/PRIMARY QUOTE ==========
