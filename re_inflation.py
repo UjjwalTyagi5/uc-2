@@ -122,7 +122,7 @@ Return ONLY a number (0-100) representing the estimated inflation percentage. No
 
     try:
         msg = llm.invoke(prompt)
-        result = msg.content.strip()
+        result = msg.content.strip().rstrip('%')
         return float(result)
     except Exception as exc:
         logger.warning(f"LLM inflation estimate failed: {exc}")
@@ -267,7 +267,7 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
             ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
 
             if ref_year_last and current_year and ref_year_last < current_year:
-                infl_raw_last = _estimate_inflation_via_llm(
+                infl_raw_last = _estimate_inflation(
                     llm, item_name, item_category or None,
                     supplier_country, ref_year_last, current_year,
                 )
