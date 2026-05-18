@@ -94,12 +94,28 @@ _spec.loader.exec_module(_P)
 
 _connect                   = _P._connect
 _compute_cpi_pct           = _P._compute_cpi_pct
-_estimate_inflation_via_llm = _P._estimate_inflation_via_llm
 _get_pr_master_date_for_dtl_id = _P._get_pr_master_date_for_dtl_id
-_call_llm_with_retry       = _P._call_llm_with_retry
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _estimate_inflation(llm, item_name: str, item_category: str, supplier_country: str, ref_year: int, current_year: int) -> float:
+    """Estimate inflation % using LLM."""
+    prompt = f"""Estimate the inflation percentage for this item from {ref_year} to {current_year}:
+- Item: {item_name}
+- Category: {item_category or 'N/A'}
+- Supplier Country: {supplier_country}
+
+Return ONLY a number (0-100) representing the estimated inflation percentage. No explanation."""
+
+    try:
+        msg = llm.invoke(prompt)
+        result = msg.content.strip()
+        return float(result)
+    except Exception as exc:
+        logger.warning(f"LLM inflation estimate failed: {exc}")
+        return None
+
 
 def _compute_cpi_pct_with_retry(country: str, ref_year: int, current_year: int, max_retries: int = 3, cooldown_s: int = 60) -> float:
     """Compute CPI % with retry logic on timeout."""
@@ -217,7 +233,7 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
             ref_year = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
 
             if ref_year and current_year and ref_year < current_year:
-                infl_raw = _estimate_inflation_via_llm(
+                infl_raw = _estimate_inflation(
                     llm, item_name, item_category or None,
                     supplier_country, ref_year, current_year,
                 )
