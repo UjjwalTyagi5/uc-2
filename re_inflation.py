@@ -101,6 +101,23 @@ _call_llm_with_retry       = _P._call_llm_with_retry
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _compute_cpi_pct_with_retry(country: str, ref_year: int, current_year: int, max_retries: int = 3, cooldown_s: int = 60) -> float:
+    """Compute CPI % with retry logic on timeout."""
+    import time
+    for attempt in range(max_retries):
+        try:
+            result = _compute_cpi_pct(country, ref_year, current_year)
+            if result is not None:
+                return result
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                logger.warning(f"CPI API failed for {country} {ref_year}-{current_year} (attempt {attempt + 1}/{max_retries}), retrying in {cooldown_s}s: {exc}")
+                time.sleep(cooldown_s)
+            else:
+                logger.warning(f"CPI API failed for {country} {ref_year}-{current_year} after {max_retries} retries: {exc}")
+    return None
+
+
 def _get_benchmarked_prs(tgt_cs: str) -> list[str]:
     """Get all PRs at stage 8 that have benchmark_result rows."""
     conn = _connect(tgt_cs)
@@ -207,7 +224,7 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
                 if infl_raw is not None:
                     infl_dec = Decimal(str(infl_raw))
 
-                cpi_raw = _compute_cpi_pct(supplier_country, ref_year, current_year)
+                cpi_raw = _compute_cpi_pct_with_retry(supplier_country, ref_year, current_year)
                 if cpi_raw is not None:
                     cpi_dec = Decimal(str(cpi_raw))
 
@@ -229,7 +246,7 @@ def _recalculate_inflation(llm, tgt_cs: str, row: dict) -> tuple[Decimal, Decima
                 if infl_raw_last is not None:
                     infl_dec_last = Decimal(str(infl_raw_last))
 
-                cpi_raw_last = _compute_cpi_pct(supplier_country, ref_year_last, current_year)
+                cpi_raw_last = _compute_cpi_pct_with_retry(supplier_country, ref_year_last, current_year)
                 if cpi_raw_last is not None:
                     cpi_dec_last = Decimal(str(cpi_raw_last))
 
