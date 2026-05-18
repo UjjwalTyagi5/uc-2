@@ -417,6 +417,9 @@ def main() -> None:
         api_key=AZURE_API_KEY,
         api_version=AZURE_API_VERSION,
         azure_deployment=AZURE_LLM_DEPLOY,
+        client_kwargs={
+            "timeout": float(os.getenv("HTTPX_TIMEOUT_S", "300")),
+        },
     )
 
     # ── Blob config ──────────────────────────────────────────────────────────
