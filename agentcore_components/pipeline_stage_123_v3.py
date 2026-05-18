@@ -5297,6 +5297,28 @@ def _estimate_inflation_via_llm(llm, item_name: str | None, category: str | None
         return None
 
 
+def _get_pr_master_date_for_dtl_id(tgt_cs: str, dtl_id: int):
+    """Get purchase_req_mst.C_DATETIME for a purchase_dtl_id."""
+    if not dtl_id:
+        return None
+    try:
+        conn = _connect(tgt_cs)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT TOP 1 prm.[C_DATETIME]
+            FROM [ras_procurement].[purchase_req_detail] prd
+            JOIN [ras_procurement].[purchase_req_mst] prm
+              ON prd.[PURCHASE_REQ_ID] = prm.[PURCHASE_REQ_ID]
+            WHERE prd.[PURCHASE_DTL_ID] = ?
+        """, dtl_id)
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as exc:
+        logger.warning(f"Could not fetch PR master date for dtl_id={dtl_id}: {exc}")
+        return None
+
+
 def _is_pinecone_server_error(exc: Exception) -> bool:
     """True for hard server/connectivity errors that mean Pinecone is unavailable."""
     msg = str(exc).lower()
@@ -5507,13 +5529,15 @@ def _run_benchmark(
 
             # Inflation estimates (non-fatal — both return None on failure)
             supplier_country = (low_item.get("supplier_country") if low_item else None) or rd.get("supplier_country")
-            ref_dt       = low_item.get("quotation_date") if low_item else None
+            # Use purchase_req_mst.C_DATETIME instead of quotation_date for consistency
+            ref_dt       = _get_pr_master_date_for_dtl_id(tgt_cs, low_item.get("purchase_dtl_id")) if low_item else None
             ref_year     = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
             current_year = created.year if created and hasattr(created, "year") else None
             item_category = " > ".join(
                 str(rd[f]) for f in ["item_level_1", "item_level_2", "item_level_3"] if rd.get(f)
             )
             infl_dec = cpi_dec = Decimal("0")
+            infl_dec_last = cpi_dec_last = Decimal("0")
             if ref_year and current_year and ref_year < current_year:
                 infl_raw = _estimate_inflation_via_llm(
                     llm, rd.get("item_name"), item_category or None,
@@ -5530,6 +5554,27 @@ def _run_benchmark(
                     f"[{pr_no}] dtl_id={dtl_id}: inflation_pct={infl_dec} "
                     f"cpi_pct={cpi_dec} (country={supplier_country!r} {ref_year}-{current_year})"
                 )
+
+            # Also calculate inflation for last_hist_item (most recent)
+            if last_item and current_year:
+                ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_item.get("purchase_dtl_id"))
+                ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
+                if ref_year_last and current_year and ref_year_last < current_year:
+                    infl_raw_last = _estimate_inflation_via_llm(
+                        llm, rd.get("item_name"), item_category or None,
+                        supplier_country, ref_year_last, current_year,
+                    )
+                    if infl_raw_last is not None:
+                        try: infl_dec_last = Decimal(str(infl_raw_last))
+                        except Exception: pass
+                    cpi_raw_last = _compute_cpi_pct(supplier_country, ref_year_last, current_year)
+                    if cpi_raw_last is not None:
+                        try: cpi_dec_last = Decimal(str(cpi_raw_last))
+                        except Exception: pass
+                    logger.info(
+                        f"[{pr_no}] dtl_id={dtl_id}: inflation_pct_last={infl_dec_last} "
+                        f"cpi_pct_last={cpi_dec_last} (country={supplier_country!r} {ref_year_last}-{current_year})"
+                    )
 
             # LLM benchmark analysis — uses pre-computed aggregates so the
             # LLM can anchor on the median + P25-P75 band + time buckets
@@ -5604,6 +5649,8 @@ def _run_benchmark(
                             last_hist_item_fk      = ?,
                             inflation_pct          = ?,
                             cpi_inflation_pct      = ?,
+                            inflation_pct_last     = ?,
+                            cpi_inflation_pct_last = ?,
                             similar_dtl_ids        = ?,
                             summary                = COALESCE(?, target.summary),
                             updated_at             = SYSUTCDATETIME()
@@ -5613,13 +5660,14 @@ def _run_benchmark(
                             bp_unit_price, bp_total_price,
                             low_hist_item_fk, last_hist_item_fk,
                             inflation_pct, cpi_inflation_pct,
+                            inflation_pct_last, cpi_inflation_pct_last,
                             similar_dtl_ids, summary
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                     dtl_id,
-                    item_uuid, bp_dec_u, bp_total_u, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary_u,
-                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary,
+                    item_uuid, bp_dec_u, bp_total_u, low_uuid, last_uuid, infl_dec, cpi_dec, infl_dec_last, cpi_dec_last, similar_dtl_ids_json, summary_u,
+                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, infl_dec_last, cpi_dec_last, similar_dtl_ids_json, summary,
                 )
             except Exception as exc:
                 logger.warning(f"[{pr_no}] Benchmark write failed dtl_id={dtl_id}: {exc}")
@@ -7766,7 +7814,8 @@ def _run_benchmark_v2(
 
             # Inflation
             supplier_country = (low_item.get("supplier_country") if low_item else None)
-            ref_dt       = low_item.get("quotation_date") if low_item else None
+            # Use purchase_req_mst.C_DATETIME instead of quotation_date for consistency
+            ref_dt       = _get_pr_master_date_for_dtl_id(tgt_cs, low_item.get("purchase_dtl_id")) if low_item else None
             ref_year     = ref_dt.year if ref_dt and hasattr(ref_dt, "year") else None
             current_year = created.year if created and hasattr(created, "year") else None
             item_category = " > ".join(
@@ -7775,6 +7824,7 @@ def _run_benchmark_v2(
                 ] if rd.get(f)
             )
             infl_dec = cpi_dec = Decimal("0")
+            infl_dec_last = cpi_dec_last = Decimal("0")
             if ref_year and current_year and ref_year < current_year:
                 infl_raw = _estimate_inflation_via_llm(
                     llm, rd.get("item_name"), item_category or None,
@@ -7791,6 +7841,27 @@ def _run_benchmark_v2(
                     f"[V2 {pr_no}] dtl_id={dtl_id}: inflation_pct={infl_dec} "
                     f"cpi_pct={cpi_dec} (country={supplier_country!r} {ref_year}-{current_year})"
                 )
+
+            # Also calculate inflation for last_hist_item (most recent)
+            if last_item and current_year:
+                ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_item.get("purchase_dtl_id"))
+                ref_year_last = ref_dt_last.year if ref_dt_last and hasattr(ref_dt_last, "year") else None
+                if ref_year_last and current_year and ref_year_last < current_year:
+                    infl_raw_last = _estimate_inflation_via_llm(
+                        llm, rd.get("item_name"), item_category or None,
+                        supplier_country, ref_year_last, current_year,
+                    )
+                    if infl_raw_last is not None:
+                        try: infl_dec_last = Decimal(str(infl_raw_last))
+                        except Exception: pass
+                    cpi_raw_last = _compute_cpi_pct(supplier_country, ref_year_last, current_year)
+                    if cpi_raw_last is not None:
+                        try: cpi_dec_last = Decimal(str(cpi_raw_last))
+                        except Exception: pass
+                    logger.info(
+                        f"[V2 {pr_no}] dtl_id={dtl_id}: inflation_pct_last={infl_dec_last} "
+                        f"cpi_pct_last={cpi_dec_last} (country={supplier_country!r} {ref_year_last}-{current_year})"
+                    )
 
             # LLM benchmark price
             bench_prompt = _format_bench_prompt(
@@ -7857,6 +7928,8 @@ def _run_benchmark_v2(
                             last_hist_item_fk      = ?,
                             inflation_pct          = ?,
                             cpi_inflation_pct      = ?,
+                            inflation_pct_last     = ?,
+                            cpi_inflation_pct_last = ?,
                             similar_dtl_ids        = ?,
                             summary                = COALESCE(?, target.summary),
                             updated_at             = SYSUTCDATETIME()
@@ -7866,13 +7939,14 @@ def _run_benchmark_v2(
                             bp_unit_price, bp_total_price,
                             low_hist_item_fk, last_hist_item_fk,
                             inflation_pct, cpi_inflation_pct,
+                            inflation_pct_last, cpi_inflation_pct_last,
                             similar_dtl_ids, summary
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                     dtl_id,
-                    item_uuid, bp_dec_u, bp_total_u, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary_u,
-                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, similar_dtl_ids_json, summary,
+                    item_uuid, bp_dec_u, bp_total_u, low_uuid, last_uuid, infl_dec, cpi_dec, infl_dec_last, cpi_dec_last, similar_dtl_ids_json, summary_u,
+                    dtl_id, item_uuid, bp_dec, bp_total, low_uuid, last_uuid, infl_dec, cpi_dec, infl_dec_last, cpi_dec_last, similar_dtl_ids_json, summary,
                 )
                 conn2.commit()
             except Exception as exc:
