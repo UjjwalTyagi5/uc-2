@@ -1,5 +1,6 @@
 -- Migration: Create function to clean HTML tags and entities
 -- Purpose: Remove HTML tags and decode common HTML entities from text
+-- Production-safe: Only removes HTML, not valid text content
 
 CREATE OR ALTER FUNCTION [ras_procurement].[fn_clean_html]
 (
@@ -13,7 +14,7 @@ BEGIN
 
     DECLARE @output NVARCHAR(MAX) = @input;
 
-    -- Decode HTML entities (common)
+    -- Decode HTML entities
     SET @output = REPLACE(@output, '&nbsp;', ' ');
     SET @output = REPLACE(@output, '&ensp;', ' ');
     SET @output = REPLACE(@output, '&emsp;', ' ');
@@ -30,17 +31,17 @@ BEGIN
     SET @output = REPLACE(@output, '&ldquo;', '"');
     SET @output = REPLACE(@output, '&ndash;', '-');
     SET @output = REPLACE(@output, '&mdash;', '-');
-    SET @output = REPLACE(@output, '&bull;', '•');
+    SET @output = REPLACE(@output, '&bull;', '-');
     SET @output = REPLACE(@output, '&hellip;', '...');
-    SET @output = REPLACE(@output, '&copy;', '©');
-    SET @output = REPLACE(@output, '&reg;', '®');
-    SET @output = REPLACE(@output, '&trade;', '™');
-    SET @output = REPLACE(@output, '&deg;', '°');
-    SET @output = REPLACE(@output, '&euro;', '€');
-    SET @output = REPLACE(@output, '&pound;', '£');
-    SET @output = REPLACE(@output, '&yen;', '¥');
+    SET @output = REPLACE(@output, '&copy;', '(C)');
+    SET @output = REPLACE(@output, '&reg;', '(R)');
+    SET @output = REPLACE(@output, '&trade;', '(TM)');
+    SET @output = REPLACE(@output, '&deg;', 'deg');
+    SET @output = REPLACE(@output, '&euro;', 'EUR');
+    SET @output = REPLACE(@output, '&pound;', 'GBP');
+    SET @output = REPLACE(@output, '&yen;', 'JPY');
 
-    -- Remove HTML tags (common and variants)
+    -- Remove HTML tags (only tags, preserve text)
     SET @output = REPLACE(@output, '<br />', ' ');
     SET @output = REPLACE(@output, '<br/>', ' ');
     SET @output = REPLACE(@output, '<br>', ' ');
@@ -63,13 +64,13 @@ BEGIN
     SET @output = REPLACE(@output, '</i>', '');
     SET @output = REPLACE(@output, '<I>', '');
     SET @output = REPLACE(@output, '</I>', '');
-    SET @output = REPLACE(@output, '<p>', '');
+    SET @output = REPLACE(@output, '<p>', ' ');
     SET @output = REPLACE(@output, '</p>', ' ');
-    SET @output = REPLACE(@output, '<P>', '');
+    SET @output = REPLACE(@output, '<P>', ' ');
     SET @output = REPLACE(@output, '</P>', ' ');
-    SET @output = REPLACE(@output, '<div>', '');
+    SET @output = REPLACE(@output, '<div>', ' ');
     SET @output = REPLACE(@output, '</div>', ' ');
-    SET @output = REPLACE(@output, '<DIV>', '');
+    SET @output = REPLACE(@output, '<DIV>', ' ');
     SET @output = REPLACE(@output, '</DIV>', ' ');
     SET @output = REPLACE(@output, '<span>', '');
     SET @output = REPLACE(@output, '</span>', '');
@@ -79,50 +80,24 @@ BEGIN
     SET @output = REPLACE(@output, '</a>', '');
     SET @output = REPLACE(@output, '<A ', '');
     SET @output = REPLACE(@output, '</A>', '');
-    SET @output = REPLACE(@output, '<ul>', '');
-    SET @output = REPLACE(@output, '</ul>', '');
-    SET @output = REPLACE(@output, '<ol>', '');
-    SET @output = REPLACE(@output, '</ol>', '');
-    SET @output = REPLACE(@output, '<li>', '');
+    SET @output = REPLACE(@output, '<ul>', ' ');
+    SET @output = REPLACE(@output, '</ul>', ' ');
+    SET @output = REPLACE(@output, '<ol>', ' ');
+    SET @output = REPLACE(@output, '</ol>', ' ');
+    SET @output = REPLACE(@output, '<li>', ' ');
     SET @output = REPLACE(@output, '</li>', ' ');
 
-    -- Remove special characters that cause issues
-    SET @output = REPLACE(@output, '{', '');
-    SET @output = REPLACE(@output, '}', '');
-    SET @output = REPLACE(@output, '[', '');
-    SET @output = REPLACE(@output, ']', '');
-    SET @output = REPLACE(@output, '|', '');
-    SET @output = REPLACE(@output, '`', '');
-    SET @output = REPLACE(@output, '~', '');
-    SET @output = REPLACE(@output, '^', '');
-    SET @output = REPLACE(@output, '?', '');
-    SET @output = REPLACE(@output, '§', '');
-    SET @output = REPLACE(@output, '¶', '');
-    SET @output = REPLACE(@output, '†', '');
-    SET @output = REPLACE(@output, '‡', '');
-    SET @output = REPLACE(@output, '‰', '');
+    -- Remove only problematic special characters (keep normal text)
+    SET @output = REPLACE(@output, '|', ' ');
+    SET @output = REPLACE(@output, '~', ' ');
 
     -- Replace control characters with spaces
     SET @output = REPLACE(@output, CHAR(9), ' ');    -- Tab
     SET @output = REPLACE(@output, CHAR(10), ' ');   -- Line feed
-    SET @output = REPLACE(@output, CHAR(11), ' ');   -- Vertical tab
-    SET @output = REPLACE(@output, CHAR(12), ' ');   -- Form feed
     SET @output = REPLACE(@output, CHAR(13), ' ');   -- Carriage return
     SET @output = REPLACE(@output, CHAR(160), ' ');  -- Non-breaking space
-    SET @output = REPLACE(@output, CHAR(8192), ' '); -- En quad
-    SET @output = REPLACE(@output, CHAR(8193), ' '); -- Em quad
-    SET @output = REPLACE(@output, CHAR(8194), ' '); -- En space
-    SET @output = REPLACE(@output, CHAR(8195), ' '); -- Em space
-    SET @output = REPLACE(@output, CHAR(8201), ' '); -- Thin space
-    SET @output = REPLACE(@output, CHAR(8203), ' '); -- Zero-width space
-    SET @output = REPLACE(@output, CHAR(8204), ' '); -- Zero-width non-joiner
-    SET @output = REPLACE(@output, CHAR(8205), ' '); -- Zero-width joiner
 
-    -- Remove duplicate punctuation
-    WHILE CHARINDEX('--', @output) > 0
-        SET @output = REPLACE(@output, '--', '-');
-    WHILE CHARINDEX('..', @output) > 0
-        SET @output = REPLACE(@output, '..', '.');
+    -- Remove duplicate spaces
     WHILE CHARINDEX('  ', @output) > 0
         SET @output = REPLACE(@output, '  ', ' ');
 
