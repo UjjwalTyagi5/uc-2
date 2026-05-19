@@ -412,31 +412,7 @@ else:
 
 ---
 
-## 8. Important Notes
-
-### Year Comparison Bug Fix (2026-05-20)
-
-**The Issue:** Initial SQL implementation incorrectly compared inflation year ranges against today's date (`GETDATE()`), causing false inflation calculations.
-
-**Example of the bug:**
-- Historical item: 2021 PR
-- Current item: 2022 PR
-- Today: 2026
-- Bug calculation: 5 years of inflation (2021 → 2026) ✗
-- Correct calculation: 1 year of inflation (2021 → 2022) ✓
-
-**The Fix:**
-- Changed all year comparisons from `YEAR(...) < YEAR(GETDATE())` to `YEAR(...) < YEAR(prm_current.C_DATETIME)`
-- Aligned SQL logic exactly with Python v3 code (lines 5541, 5566)
-- Validates that `current_year` is derived from the current PR's `purchase_req_mst.C_DATETIME`, not today's date
-
-**Affected Queries:**
-- Query 3: Lines 328-348 (inflation flags, normalized pricing)
-- Query 4: Lines 415-434 (all inflation calculations)
-
----
-
-## 9. Glossary
+## 8. Glossary
 
 | Term | Definition |
 |------|-----------|
