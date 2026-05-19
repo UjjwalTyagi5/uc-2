@@ -9,11 +9,12 @@
 --   Stage C: LLM ranking (6 rejection rules)
 --   Result: similar_dtl_ids populated from Stage C "selected" items
 --
--- These 4 queries support client analysis of:
--- 1. Supplier hierarchy (Primary, Secondary, Tertiary)
+-- These 5 queries support client analysis of:
+-- 1. Supplier hierarchy (Primary, Secondary L1, Secondary L2)
 -- 2. Technical & Commercial specifications per supplier
 -- 3. Historical benchmarking (BP & LP with inflation)
--- 4. Currency conversion & inflation rates
+-- 4. Currency conversion & exchange rate details (SELECTED quotes only)
+-- 5. Validation of inflation logic against v3 pipeline
 -- ============================================================================
 
 -- USAGE: Replace @purchase_req_no with the actual PR number (e.g., 'R_152105/2021')
@@ -375,28 +376,25 @@ WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID;
 
 -- ============================================================================
--- QUERY 4: CURRENCY CONVERSION & INFLATION RATES
+-- QUERY 4: CURRENCY CONVERSION & EXCHANGE RATE DETAILS (SELECTED ONLY)
 -- ============================================================================
--- Returns BOTH LLM and CPI inflation for BOTH LOW and LAST
+-- Returns currency conversion details for SELECTED quotes ONLY (is_selected_quote = 1)
 --
 -- CURRENCY: Source currency → EUR conversion (stored at extraction time)
--- INFLATION LOW: inflation_pct (LLM) + cpi_inflation_pct (World Bank CPI)
--- INFLATION LAST: inflation_pct_last (LLM) + cpi_inflation_pct_last (World Bank CPI)
+-- EXCHANGE RATE: Shows which rate was applied during currency conversion
 --
--- Reference dates:
---   - Current item: prm_current.C_DATETIME (current PR master date)
---   - LOW item: prm_bp.C_DATETIME (LOW item's PR master date, from line 5533)
---   - LAST item: prm_lp.C_DATETIME (LAST item's PR master date, from line 5564)
+-- Reference: v3 _convert_to_eur logic at lines 3973-4008 in pipeline_stage_123_v3.py
 
 DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
 SELECT
     prd.PURCHASE_DTL_ID AS item_id,
-    prm_current.PURCHASE_REQ_NO AS pr_number,
+    prm.PURCHASE_REQ_NO AS pr_number,
     prd.ITEMDESCRIPTION AS ras_item_description,
     qi.supplier_name,
+    qi.supplier_country,
 
-    -- ─── CURRENCY CONVERSION (CURRENT ITEM) ────────────────────────────
+    -- ─── CURRENCY CONVERSION (SELECTED QUOTE) ──────────────────────────
     qi.currency AS source_currency,
     qi.unit_price AS unit_price_source_currency,
     qi.unit_price_eur AS unit_price_eur_converted,
@@ -405,59 +403,22 @@ SELECT
     qi.total_price_eur AS total_price_eur_converted,
 
     -- ─── EXCHANGE RATE DETAILS ─────────────────────────────────────────
+    -- Shows which exchange rate from EXCHANGE_RATE table was applied
     cm.CUR_ID AS source_currency_id,
     er.CONVERSION_RATE AS exchange_rate_from_mst,
     er.FROM_DATE AS exchange_rate_valid_from,
     er.TO_DATE AS exchange_rate_valid_to,
     er.STATUS_ID AS exchange_rate_status,
 
-    -- ─── LOW INFLATION CALCULATION (TWO SOURCES) ─────────────────────
-    -- Lines 5534-5556 in pipeline_stage_123_v3.py: if YEAR(ref_dt) < YEAR(created)
-    br.bp_unit_price AS low_unit_price_eur,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.inflation_pct, 4) ELSE 0.0 END AS low_llm_inflation_pct,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.cpi_inflation_pct, 4) ELSE 0.0 END AS low_cpi_inflation_pct,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_llm_inflation_amount_eur,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_cpi_inflation_amount_eur,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_llm_adjusted_unit_price,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_cpi_adjusted_unit_price,
-    prm_bp.C_DATETIME AS low_pr_created_date,
-    YEAR(prm_bp.C_DATETIME) AS low_pr_year,
-
-    -- ─── LAST INFLATION CALCULATION (TWO SOURCES) ──────────────────
-    -- Lines 5565-5581 in pipeline_stage_123_v3.py: if YEAR(ref_dt_last) < YEAR(created)
-    qi_lp.unit_price_eur AS last_unit_price_eur,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.inflation_pct_last, 4) ELSE 0.0 END AS last_llm_inflation_pct,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE 0.0 END AS last_cpi_inflation_pct,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_llm_inflation_amount_eur,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_cpi_inflation_amount_eur,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_llm_adjusted_unit_price,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_cpi_adjusted_unit_price,
-    prm_lp.C_DATETIME AS last_pr_created_date,
-    YEAR(prm_lp.C_DATETIME) AS last_pr_year,
-
     -- ─── REFERENCE DATES ────────────────────────────────────────────────
-    prm_current.C_DATETIME AS current_pr_created_date,
-    YEAR(prm_current.C_DATETIME) AS current_pr_year
+    qi.quotation_date,
+    prm.C_DATETIME AS pr_created_date
 
 FROM ras_procurement.quotation_extracted_items qi
 INNER JOIN ras_procurement.purchase_req_detail prd
     ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
-INNER JOIN ras_procurement.purchase_req_mst prm_current
-    ON prd.PURCHASE_REQ_ID = prm_current.PURCHASE_REQ_ID
-LEFT JOIN ras_procurement.benchmark_result br
-    ON qi.extracted_item_uuid_pk = br.extracted_item_uuid_fk
-LEFT JOIN ras_procurement.quotation_extracted_items qi_bp
-    ON br.low_hist_item_fk = qi_bp.extracted_item_uuid_pk
-LEFT JOIN ras_procurement.purchase_req_detail prd_bp
-    ON qi_bp.purchase_dtl_id = prd_bp.PURCHASE_DTL_ID
-LEFT JOIN ras_procurement.purchase_req_mst prm_bp
-    ON prd_bp.PURCHASE_REQ_ID = prm_bp.PURCHASE_REQ_ID
-LEFT JOIN ras_procurement.quotation_extracted_items qi_lp
-    ON br.last_hist_item_fk = qi_lp.extracted_item_uuid_pk
-LEFT JOIN ras_procurement.purchase_req_detail prd_lp
-    ON qi_lp.purchase_dtl_id = prd_lp.PURCHASE_DTL_ID
-LEFT JOIN ras_procurement.purchase_req_mst prm_lp
-    ON prd_lp.PURCHASE_REQ_ID = prm_lp.PURCHASE_REQ_ID
+INNER JOIN ras_procurement.purchase_req_mst prm
+    ON prd.PURCHASE_REQ_ID = prm.PURCHASE_REQ_ID
 -- Exchange rate details (v3 _convert_to_eur logic at lines 3973-4008)
 LEFT JOIN ras_procurement.currency_mst cm
     ON UPPER(cm.CURRENCY) = UPPER(qi.currency)
@@ -467,10 +428,11 @@ LEFT JOIN ras_procurement.EXCHANGE_RATE er
     ON cm.CUR_ID = er.CUR_ID
     AND er.BASE_CUR_ID = cm_eur.CUR_ID
     AND er.STATUS_ID = 10   -- Active rate only
-    AND er.FROM_DATE <= CAST(COALESCE(qi.quotation_date, prm_current.C_DATETIME) AS DATE)
-    AND er.TO_DATE >= CAST(COALESCE(qi.quotation_date, prm_current.C_DATETIME) AS DATE)
-WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
-ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC;
+    AND er.FROM_DATE <= CAST(COALESCE(qi.quotation_date, prm.C_DATETIME) AS DATE)
+    AND er.TO_DATE >= CAST(COALESCE(qi.quotation_date, prm.C_DATETIME) AS DATE)
+WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
+  AND qi.is_selected_quote = 1
+ORDER BY prd.PURCHASE_DTL_ID;
 
 -- ============================================================================
 -- QUERY 5: VALIDATION — CHECK INFLATION LOGIC MATCHES v3 PIPELINE
