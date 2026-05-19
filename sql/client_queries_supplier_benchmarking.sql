@@ -57,19 +57,27 @@ ORDER BY prd.PURCHASE_DTL_ID;
 -- Uses ROW_NUMBER to rank by unit_price_eur ascending
 SELECT
     'SECONDARY_L1' AS supplier_rank,
-    prd.PURCHASE_DTL_ID AS item_id,
-    prm.PURCHASE_REQ_NO AS pr_number,
-    qi.supplier_name,
-    qi.supplier_country,
-    qi.supplier_match_conf,
-    qi.total_price_eur,
-    qi.unit_price_eur,
-    qi.quotation_date,
-    qi.payment_terms
+    subq.PURCHASE_DTL_ID AS item_id,
+    subq.PURCHASE_REQ_NO AS pr_number,
+    subq.supplier_name,
+    subq.supplier_country,
+    subq.supplier_match_conf,
+    subq.total_price_eur,
+    subq.unit_price_eur,
+    subq.quotation_date,
+    subq.payment_terms
 FROM (
     SELECT
-        qi.*,
-        prd.PURCHASE_DTL_ID,
+        qi.extracted_item_uuid_pk,
+        qi.supplier_name,
+        qi.supplier_country,
+        qi.supplier_match_conf,
+        qi.total_price_eur,
+        qi.unit_price_eur,
+        qi.quotation_date,
+        qi.payment_terms,
+        qi.currency,
+        qi.purchase_dtl_id AS PURCHASE_DTL_ID,
         prm.PURCHASE_REQ_NO,
         ROW_NUMBER() OVER (
             PARTITION BY prd.PURCHASE_DTL_ID
@@ -83,27 +91,35 @@ FROM (
     WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
       AND qi.is_selected_quote = 0
       AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
-) qi
-WHERE price_rank = 1
-ORDER BY PURCHASE_DTL_ID;
+) subq
+WHERE subq.price_rank = 1
+ORDER BY subq.PURCHASE_DTL_ID;
 
 -- ─── SECONDARY L2: 2nd lowest price among ALL suppliers (non-selected) ──
 -- For each item, get the 2nd cheapest alternative
 SELECT
     'SECONDARY_L2' AS supplier_rank,
-    prd.PURCHASE_DTL_ID AS item_id,
-    prm.PURCHASE_REQ_NO AS pr_number,
-    qi.supplier_name,
-    qi.supplier_country,
-    qi.supplier_match_conf,
-    qi.total_price_eur,
-    qi.unit_price_eur,
-    qi.quotation_date,
-    qi.payment_terms
+    subq.PURCHASE_DTL_ID AS item_id,
+    subq.PURCHASE_REQ_NO AS pr_number,
+    subq.supplier_name,
+    subq.supplier_country,
+    subq.supplier_match_conf,
+    subq.total_price_eur,
+    subq.unit_price_eur,
+    subq.quotation_date,
+    subq.payment_terms
 FROM (
     SELECT
-        qi.*,
-        prd.PURCHASE_DTL_ID,
+        qi.extracted_item_uuid_pk,
+        qi.supplier_name,
+        qi.supplier_country,
+        qi.supplier_match_conf,
+        qi.total_price_eur,
+        qi.unit_price_eur,
+        qi.quotation_date,
+        qi.payment_terms,
+        qi.currency,
+        qi.purchase_dtl_id AS PURCHASE_DTL_ID,
         prm.PURCHASE_REQ_NO,
         ROW_NUMBER() OVER (
             PARTITION BY prd.PURCHASE_DTL_ID
@@ -117,9 +133,9 @@ FROM (
     WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
       AND qi.is_selected_quote = 0
       AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
-) qi
-WHERE price_rank = 2
-ORDER BY PURCHASE_DTL_ID;
+) subq
+WHERE subq.price_rank = 2
+ORDER BY subq.PURCHASE_DTL_ID;
 
 -- ============================================================================
 -- QUERY 2: TECHNICAL & COMMERCIAL SPECS FOR RAS > ITEM > PER SUPPLIER
