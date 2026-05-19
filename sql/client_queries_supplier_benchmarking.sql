@@ -400,9 +400,16 @@ SELECT
     qi.currency AS source_currency,
     qi.unit_price AS unit_price_source_currency,
     qi.unit_price_eur AS unit_price_eur_converted,
-    ROUND(qi.unit_price_eur / NULLIF(qi.unit_price, 0), 4) AS implied_exchange_rate,
+    ROUND(qi.unit_price_eur / NULLIF(qi.unit_price, 0), 6) AS applied_exchange_rate,
     qi.total_price AS total_price_source_currency,
     qi.total_price_eur AS total_price_eur_converted,
+
+    -- ─── EXCHANGE RATE DETAILS ─────────────────────────────────────────
+    cm.CUR_ID AS source_currency_id,
+    er.CONVERSION_RATE AS exchange_rate_from_mst,
+    er.FROM_DATE AS exchange_rate_valid_from,
+    er.TO_DATE AS exchange_rate_valid_to,
+    er.STATUS_ID AS exchange_rate_status,
 
     -- ─── LOW INFLATION CALCULATION (TWO SOURCES) ─────────────────────
     -- Lines 5534-5556 in pipeline_stage_123_v3.py: if YEAR(ref_dt) < YEAR(created)
@@ -451,6 +458,15 @@ LEFT JOIN ras_procurement.purchase_req_detail prd_lp
     ON qi_lp.purchase_dtl_id = prd_lp.PURCHASE_DTL_ID
 LEFT JOIN ras_procurement.purchase_req_mst prm_lp
     ON prd_lp.PURCHASE_REQ_ID = prm_lp.PURCHASE_REQ_ID
+-- Exchange rate details (v3 _convert_to_eur logic at lines 3973-4008)
+LEFT JOIN ras_procurement.currency_mst cm
+    ON UPPER(cm.CURRENCY) = UPPER(qi.currency)
+LEFT JOIN ras_procurement.EXCHANGE_RATE er
+    ON cm.CUR_ID = er.CUR_ID
+    AND er.BASE_CUR_ID = 1  -- EUR_CUR_ID = 1 (target currency)
+    AND er.STATUS_ID = 10   -- Active rate only
+    AND er.FROM_DATE <= CAST(qi.quotation_date AS DATE)
+    AND er.TO_DATE >= CAST(qi.quotation_date AS DATE)
 WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC;
 
