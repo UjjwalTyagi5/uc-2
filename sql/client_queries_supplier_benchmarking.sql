@@ -263,22 +263,22 @@ WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC, qi.total_price_eur;
 
 -- ============================================================================
--- QUERY 3: SUPPLIER MAPPING FOR HISTORICAL BENCHMARKING (BP / LP)
+-- QUERY 3: SUPPLIER MAPPING FOR HISTORICAL BENCHMARKING (LOW / LAST)
 -- ============================================================================
--- Returns benchmark comparison with BOTH LLM and CPI inflation for BP and LP
+-- Returns benchmark comparison with BOTH LLM and CPI inflation for LOW and LAST
 --
--- BP (Best Price) = lowest unit_price_eur from similar_dtl_ids (LLM-ranked shortlist)
--- LP (Last Purchase) = most recent by PR date from similar_dtl_ids
+-- LOW = lowest unit_price_eur from similar_dtl_ids (LLM-ranked shortlist)
+-- LAST = most recent by PR date from similar_dtl_ids
 --
--- Inflation: FOUR values calculated for each (BP and LP):
+-- Inflation: FOUR values calculated for each (LOW and LAST):
 --   - inflation_pct: LLM-estimated inflation
 --   - cpi_inflation_pct: World Bank CPI-based inflation
---   - inflation_pct_last: LLM-estimated inflation for LP
---   - cpi_inflation_pct_last: World Bank CPI for LP
+--   - inflation_pct_last: LLM-estimated inflation for LAST
+--   - cpi_inflation_pct_last: World Bank CPI for LAST
 --
 -- Normalization formula (both):
---   bp_normalized = bp_unit_price × (1 + cpi_inflation_pct / 100)
---   lp_normalized = lp_unit_price × (1 + cpi_inflation_pct_last / 100)
+--   low_normalized = low_unit_price × (1 + cpi_inflation_pct / 100)
+--   last_normalized = last_unit_price × (1 + cpi_inflation_pct_last / 100)
 
 DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
@@ -295,57 +295,57 @@ SELECT
     qi_current.currency AS current_currency,
     qi_current.quotation_date AS current_quotation_date,
 
-    -- ─── BEST PRICE (BP) — CHEAPEST FROM similar_dtl_ids ──────────────────
+    -- ─── LOW (LOWEST PRICE) — CHEAPEST FROM similar_dtl_ids ─────────────────
     -- Selected by _compute_low_last(): min(shortlist_dtl_ids, unit_price_eur)
     -- Does NOT filter for is_selected_quote (can be any quote from shortlist)
-    qi_bp.supplier_name AS bp_supplier_name,
-    qi_bp.supplier_country AS bp_supplier_country,
-    qi_bp.currency AS bp_currency,
-    qi_bp.unit_price_eur AS bp_unit_price_eur,
-    qi_bp.total_price_eur AS bp_total_price_eur,
-    qi_bp.quotation_date AS bp_quotation_date,
-    prm_bp.PURCHASE_REQ_NO AS bp_pr_number,
-    prm_bp.C_DATETIME AS bp_pr_created_date,
-    DATEDIFF(YEAR, YEAR(prm_bp.C_DATETIME), YEAR(GETDATE())) AS bp_years_ago,
+    qi_bp.supplier_name AS low_supplier_name,
+    qi_bp.supplier_country AS low_supplier_country,
+    qi_bp.currency AS low_currency,
+    qi_bp.unit_price_eur AS low_unit_price_eur,
+    qi_bp.total_price_eur AS low_total_price_eur,
+    qi_bp.quotation_date AS low_quotation_date,
+    prm_bp.PURCHASE_REQ_NO AS low_pr_number,
+    prm_bp.C_DATETIME AS low_pr_created_date,
+    DATEDIFF(YEAR, YEAR(prm_bp.C_DATETIME), YEAR(GETDATE())) AS low_years_ago,
 
-    -- ─── LAST PURCHASE (LP) — MOST RECENT FROM similar_dtl_ids ────────────
+    -- ─── LAST (MOST RECENT) — MOST RECENT FROM similar_dtl_ids ────────────
     -- Selected by _compute_low_last(): max(shortlist_dtl_ids, pr_created_date)
     -- Most recent by purchase_req_mst.C_DATETIME
-    qi_lp.supplier_name AS lp_supplier_name,
-    qi_lp.supplier_country AS lp_supplier_country,
-    qi_lp.currency AS lp_currency,
-    qi_lp.unit_price_eur AS lp_unit_price_eur,
-    qi_lp.total_price_eur AS lp_total_price_eur,
-    qi_lp.quotation_date AS lp_quotation_date,
-    prm_lp.PURCHASE_REQ_NO AS lp_pr_number,
-    prm_lp.C_DATETIME AS lp_pr_created_date,
-    DATEDIFF(YEAR, YEAR(prm_lp.C_DATETIME), YEAR(GETDATE())) AS lp_years_ago,
+    qi_lp.supplier_name AS last_supplier_name,
+    qi_lp.supplier_country AS last_supplier_country,
+    qi_lp.currency AS last_currency,
+    qi_lp.unit_price_eur AS last_unit_price_eur,
+    qi_lp.total_price_eur AS last_total_price_eur,
+    qi_lp.quotation_date AS last_quotation_date,
+    prm_lp.PURCHASE_REQ_NO AS last_pr_number,
+    prm_lp.C_DATETIME AS last_pr_created_date,
+    DATEDIFF(YEAR, YEAR(prm_lp.C_DATETIME), YEAR(GETDATE())) AS last_years_ago,
 
-    -- ─── BP INFLATION (TWO TYPES) ───────────────────────────────────────
+    -- ─── LOW INFLATION (TWO TYPES) ──────────────────────────────────────
     -- Lines 5542-5555 in pipeline_stage_123_v3.py
-    ROUND(br.inflation_pct, 4) AS bp_llm_inflation_pct,
-    ROUND(br.cpi_inflation_pct, 4) AS bp_cpi_inflation_pct,
+    ROUND(br.inflation_pct, 4) AS low_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct, 4) AS low_cpi_inflation_pct,
 
-    -- ─── LP INFLATION (TWO TYPES) ───────────────────────────────────────
+    -- ─── LAST INFLATION (TWO TYPES) ──────────────────────────────────────
     -- Lines 5567-5581 in pipeline_stage_123_v3.py
-    ROUND(br.inflation_pct_last, 4) AS lp_llm_inflation_pct,
-    ROUND(br.cpi_inflation_pct_last, 4) AS lp_cpi_inflation_pct,
+    ROUND(br.inflation_pct_last, 4) AS last_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct_last, 4) AS last_cpi_inflation_pct,
 
     -- ─── NORMALIZED PRICING (USING CPI INFLATION) ───────────────────────
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 2) AS bp_cpi_normalized_unit_price_eur,
-    ROUND(br.bp_total_price * (1 + br.cpi_inflation_pct / 100), 2) AS bp_cpi_normalized_total_price_eur,
-    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS lp_cpi_normalized_unit_price_eur,
-    ROUND(qi_lp.total_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS lp_cpi_normalized_total_price_eur,
+    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 2) AS low_cpi_normalized_unit_price_eur,
+    ROUND(br.bp_total_price * (1 + br.cpi_inflation_pct / 100), 2) AS low_cpi_normalized_total_price_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS last_cpi_normalized_unit_price_eur,
+    ROUND(qi_lp.total_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS last_cpi_normalized_total_price_eur,
 
     -- ─── NORMALIZED PRICING (USING LLM INFLATION) ──────────────────────
-    ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 2) AS bp_llm_normalized_unit_price_eur,
-    ROUND(br.bp_total_price * (1 + br.inflation_pct / 100), 2) AS bp_llm_normalized_total_price_eur,
-    ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 2) AS lp_llm_normalized_unit_price_eur,
-    ROUND(qi_lp.total_price_eur * (1 + br.inflation_pct_last / 100), 2) AS lp_llm_normalized_total_price_eur,
+    ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 2) AS low_llm_normalized_unit_price_eur,
+    ROUND(br.bp_total_price * (1 + br.inflation_pct / 100), 2) AS low_llm_normalized_total_price_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 2) AS last_llm_normalized_unit_price_eur,
+    ROUND(qi_lp.total_price_eur * (1 + br.inflation_pct_last / 100), 2) AS last_llm_normalized_total_price_eur,
 
     -- ─── SAVINGS / OVERPAYMENT (CPI-ADJUSTED) ──────────────────────────
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100) - qi_current.unit_price_eur, 2) AS bp_cpi_adjusted_vs_current_unit_diff_eur,
-    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100) - qi_current.unit_price_eur, 2) AS lp_cpi_adjusted_vs_current_unit_diff_eur,
+    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100) - qi_current.unit_price_eur, 2) AS low_cpi_adjusted_vs_current_unit_diff_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100) - qi_current.unit_price_eur, 2) AS last_cpi_adjusted_vs_current_unit_diff_eur,
 
     -- ─── CONTEXT ────────────────────────────────────────────────────────
     -- similar_dtl_ids = from Stage C LLM ranking shortlist (lines 7817 in v3)
@@ -377,16 +377,16 @@ ORDER BY prd.PURCHASE_DTL_ID;
 -- ============================================================================
 -- QUERY 4: CURRENCY CONVERSION & INFLATION RATES
 -- ============================================================================
--- Returns BOTH LLM and CPI inflation for BOTH BP and LP
+-- Returns BOTH LLM and CPI inflation for BOTH LOW and LAST
 --
 -- CURRENCY: Source currency → EUR conversion (stored at extraction time)
--- INFLATION BP: inflation_pct (LLM) + cpi_inflation_pct (World Bank CPI)
--- INFLATION LP: inflation_pct_last (LLM) + cpi_inflation_pct_last (World Bank CPI)
+-- INFLATION LOW: inflation_pct (LLM) + cpi_inflation_pct (World Bank CPI)
+-- INFLATION LAST: inflation_pct_last (LLM) + cpi_inflation_pct_last (World Bank CPI)
 --
 -- Reference dates:
 --   - Current item: prm_current.C_DATETIME (current PR master date)
---   - BP item: prm_bp.C_DATETIME (BP item's PR master date, from line 5533)
---   - LP item: prm_lp.C_DATETIME (LP item's PR master date, from line 5564)
+--   - LOW item: prm_bp.C_DATETIME (LOW item's PR master date, from line 5533)
+--   - LAST item: prm_lp.C_DATETIME (LAST item's PR master date, from line 5564)
 
 DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
@@ -404,31 +404,31 @@ SELECT
     qi.total_price AS total_price_source_currency,
     qi.total_price_eur AS total_price_eur_converted,
 
-    -- ─── BP INFLATION CALCULATION (TWO SOURCES) ───────────────────────
+    -- ─── LOW INFLATION CALCULATION (TWO SOURCES) ─────────────────────
     -- Calculated at line 5542-5555 in pipeline_stage_123_v3.py
-    -- Uses BP item's supplier_country and PR date range
-    br.bp_unit_price AS bp_unit_price_eur,
-    ROUND(br.inflation_pct, 4) AS bp_llm_inflation_pct,
-    ROUND(br.cpi_inflation_pct, 4) AS bp_cpi_inflation_pct,
-    ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) AS bp_llm_inflation_amount_eur,
-    ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) AS bp_cpi_inflation_amount_eur,
-    ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) AS bp_llm_adjusted_unit_price,
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) AS bp_cpi_adjusted_unit_price,
-    prm_bp.C_DATETIME AS bp_pr_created_date,
-    YEAR(prm_bp.C_DATETIME) AS bp_pr_year,
+    -- Uses LOW item's supplier_country and PR date range
+    br.bp_unit_price AS low_unit_price_eur,
+    ROUND(br.inflation_pct, 4) AS low_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct, 4) AS low_cpi_inflation_pct,
+    ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) AS low_llm_inflation_amount_eur,
+    ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) AS low_cpi_inflation_amount_eur,
+    ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) AS low_llm_adjusted_unit_price,
+    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) AS low_cpi_adjusted_unit_price,
+    prm_bp.C_DATETIME AS low_pr_created_date,
+    YEAR(prm_bp.C_DATETIME) AS low_pr_year,
 
-    -- ─── LP INFLATION CALCULATION (TWO SOURCES) ───────────────────────
+    -- ─── LAST INFLATION CALCULATION (TWO SOURCES) ──────────────────
     -- Calculated at line 5567-5581 in pipeline_stage_123_v3.py
-    -- Uses LP item's supplier_country and PR date range
-    qi_lp.unit_price_eur AS lp_unit_price_eur,
-    ROUND(br.inflation_pct_last, 4) AS lp_llm_inflation_pct,
-    ROUND(br.cpi_inflation_pct_last, 4) AS lp_cpi_inflation_pct,
-    ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS lp_llm_inflation_amount_eur,
-    ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS lp_cpi_inflation_amount_eur,
-    ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) AS lp_llm_adjusted_unit_price,
-    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) AS lp_cpi_adjusted_unit_price,
-    prm_lp.C_DATETIME AS lp_pr_created_date,
-    YEAR(prm_lp.C_DATETIME) AS lp_pr_year,
+    -- Uses LAST item's supplier_country and PR date range
+    qi_lp.unit_price_eur AS last_unit_price_eur,
+    ROUND(br.inflation_pct_last, 4) AS last_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct_last, 4) AS last_cpi_inflation_pct,
+    ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS last_llm_inflation_amount_eur,
+    ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS last_cpi_inflation_amount_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) AS last_llm_adjusted_unit_price,
+    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) AS last_cpi_adjusted_unit_price,
+    prm_lp.C_DATETIME AS last_pr_created_date,
+    YEAR(prm_lp.C_DATETIME) AS last_pr_year,
 
     -- ─── REFERENCE DATES ────────────────────────────────────────────────
     prm_current.C_DATETIME AS current_pr_created_date,
