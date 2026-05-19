@@ -173,39 +173,74 @@ SELECT
     qi.supplier_country,
     ROUND(qi.supplier_match_conf, 3) AS supplier_match_confidence,
 
-    -- ─── TECHNICAL SPECIFICATIONS ───────────────────────────────────────
+    -- ─── TECHNICAL SPECIFICATIONS (RAW DATA) ────────────────────────────
     qi.item_name,
     qi.item_description,
-    CONCAT(
-        ISNULL(qi.item_level_1, ''), ' > ',
-        ISNULL(qi.item_level_2, ''), ' > ',
-        ISNULL(qi.item_level_3, '')
-    ) AS category_chain,
-    qi.critical_attributes,  -- JSON: [{"name": "...", "value": ..., "importance": "critical"}]
+    qi.item_summary,
+
+    -- 8-level taxonomy (raw, not concatenated)
+    qi.item_level_1,
+    qi.item_level_2,
+    qi.item_level_3,
+    qi.item_level_4,
+    qi.item_level_5,
+    qi.item_level_6,
+    qi.item_level_7,
+    qi.item_level_8,
+
+    -- Critical and important attributes
+    qi.critical_attributes,  -- JSON: [{"name": "...", "value": ..., "importance": "critical/important"}]
+
+    -- Categorization
     qi.commodity_tag,
     qi.purchase_category_llm,
+
+    -- Quantity and unit
     qi.unit,
     qi.quantity,
 
-    -- ─── COMMERCIAL SPECIFICATIONS ───────────────────────────────────────
+    -- ─── COMMERCIAL SPECIFICATIONS (RAW DATA) ──────────────────────────
+    -- Quotation metadata
     qi.quotation_ref_no,
     qi.quotation_date,
     qi.validity_date,
     qi.validity_days,
+
+    -- Payment and delivery terms
     qi.payment_terms,
     qi.delivery_date,
     qi.delivery_time_days,
 
-    -- Quote-level terms
+    -- Incoterms
     qi.quote_incoterms,
     qi.quote_incoterms_named_place,
+
+    -- Quote totals and charges (quote-level)
     qi.quote_subtotal,
     qi.quote_freight,
     qi.quote_insurance,
     qi.quote_customs_duties,
+    qi.quote_packing_forwarding,
+    qi.quote_installation,
+    qi.quote_other_charges,
+
+    -- Tax information
     qi.quote_tax_type,
     qi.quote_tax_rate_pct,
+    qi.quote_tax_amount_total,
     qi.quote_grand_total,
+
+    -- Line-item level commercial details (if provided by supplier)
+    qi.line_incoterms,
+    qi.line_freight,
+    qi.line_insurance,
+    qi.line_tax_rate_pct,
+    qi.line_tax_amount,
+    qi.line_other_charges,
+    qi.line_total_inclusive,
+    qi.line_allocation_method,
+    qi.line_hsn_sac_code,
+    qi.line_country_of_origin,
 
     -- Pricing (source currency + EUR)
     qi.currency,
