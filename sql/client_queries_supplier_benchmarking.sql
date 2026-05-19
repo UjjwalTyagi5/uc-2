@@ -23,10 +23,12 @@
 -- ============================================================================
 -- Returns three result sets:
 --   1. PRIMARY: is_selected_quote = 1 (the ONE selected supplier per item)
---   2. SECONDARY L1: Lowest price among non-selected (is_selected_quote = 0)
---   3. SECONDARY L2: 2nd lowest price among non-selected
+--   2. SECONDARY L1: Lowest price among ALL suppliers per item
+--   3. SECONDARY L2: 2nd lowest price among ALL suppliers per item
 --
--- NOTE: L1 and L2 include ALL suppliers (not filtered by is_selected_quote)
+-- NOTE: L1 and L2 rank ALL suppliers by unit price (lowest and 2nd-lowest).
+-- A supplier can be PRIMARY for one item and L1/L2 for another item.
+-- A supplier can also be L1/L2 even if it's PRIMARY for that same item.
 
 DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
@@ -52,8 +54,8 @@ WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
   AND qi.is_selected_quote = 1
 ORDER BY prd.PURCHASE_DTL_ID;
 
--- ─── SECONDARY L1: Lowest price among ALL suppliers (non-selected) ──────
--- For each item, get the cheapest alternative (not the selected one)
+-- ─── SECONDARY L1: Lowest price among ALL suppliers ───────────────────────
+-- For each item, get the cheapest supplier (can include primary if lowest priced)
 -- Uses ROW_NUMBER to rank by unit_price_eur ascending
 SELECT
     'SECONDARY_L1' AS supplier_rank,
@@ -65,7 +67,8 @@ SELECT
     subq.total_price_eur,
     subq.unit_price_eur,
     subq.quotation_date,
-    subq.payment_terms
+    subq.payment_terms,
+    subq.is_selected_quote
 FROM (
     SELECT
         qi.extracted_item_uuid_pk,
@@ -77,6 +80,7 @@ FROM (
         qi.quotation_date,
         qi.payment_terms,
         qi.currency,
+        qi.is_selected_quote,
         qi.purchase_dtl_id AS PURCHASE_DTL_ID,
         prm.PURCHASE_REQ_NO,
         ROW_NUMBER() OVER (
@@ -89,14 +93,13 @@ FROM (
     INNER JOIN ras_procurement.purchase_req_mst prm
         ON prd.PURCHASE_REQ_ID = prm.PURCHASE_REQ_ID
     WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
-      AND qi.is_selected_quote = 0
       AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
 ) subq
 WHERE subq.price_rank = 1
 ORDER BY subq.PURCHASE_DTL_ID;
 
--- ─── SECONDARY L2: 2nd lowest price among ALL suppliers (non-selected) ──
--- For each item, get the 2nd cheapest alternative
+-- ─── SECONDARY L2: 2nd lowest price among ALL suppliers ─────────────────
+-- For each item, get the 2nd cheapest supplier (can include primary if 2nd lowest priced)
 SELECT
     'SECONDARY_L2' AS supplier_rank,
     subq.PURCHASE_DTL_ID AS item_id,
@@ -107,7 +110,8 @@ SELECT
     subq.total_price_eur,
     subq.unit_price_eur,
     subq.quotation_date,
-    subq.payment_terms
+    subq.payment_terms,
+    subq.is_selected_quote
 FROM (
     SELECT
         qi.extracted_item_uuid_pk,
@@ -119,6 +123,7 @@ FROM (
         qi.quotation_date,
         qi.payment_terms,
         qi.currency,
+        qi.is_selected_quote,
         qi.purchase_dtl_id AS PURCHASE_DTL_ID,
         prm.PURCHASE_REQ_NO,
         ROW_NUMBER() OVER (
@@ -131,7 +136,6 @@ FROM (
     INNER JOIN ras_procurement.purchase_req_mst prm
         ON prd.PURCHASE_REQ_ID = prm.PURCHASE_REQ_ID
     WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
-      AND qi.is_selected_quote = 0
       AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
 ) subq
 WHERE subq.price_rank = 2
