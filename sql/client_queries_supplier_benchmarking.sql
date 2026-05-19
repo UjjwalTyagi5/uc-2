@@ -347,11 +347,6 @@ SELECT
     CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 2) ELSE qi_lp.unit_price_eur END AS last_llm_normalized_unit_price_eur,
     CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(qi_lp.total_price_eur * (1 + br.inflation_pct_last / 100), 2) ELSE qi_lp.total_price_eur END AS last_llm_normalized_total_price_eur,
 
-    -- ─── SAVINGS / OVERPAYMENT (CPI-ADJUSTED) ──────────────────────────
-    -- Only calculated if year difference exists (matching YEAR comparison above)
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100) - qi_current.unit_price_eur, 2) ELSE ROUND(br.bp_unit_price - qi_current.unit_price_eur, 2) END AS low_cpi_adjusted_vs_current_unit_diff_eur,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100) - qi_current.unit_price_eur, 2) ELSE ROUND(qi_lp.unit_price_eur - qi_current.unit_price_eur, 2) END AS last_cpi_adjusted_vs_current_unit_diff_eur,
-
     -- ─── CONTEXT ────────────────────────────────────────────────────────
     -- similar_dtl_ids = from Stage C LLM ranking shortlist (lines 7817 in v3)
     br.similar_dtl_ids,
