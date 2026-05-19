@@ -577,7 +577,11 @@ def main() -> None:
         # Write to Excel after each PR (real-time tracking)
         try:
             import pandas as pd
+            # Append to existing file instead of overwriting
             df = pd.DataFrame(results)
+            if os.path.isfile(excel_file):
+                existing = pd.read_excel(excel_file)
+                df = pd.concat([existing, df], ignore_index=True)
             df.to_excel(excel_file, index=False)
         except Exception as exc:
             logger.warning("Could not update Excel: %s", exc)
