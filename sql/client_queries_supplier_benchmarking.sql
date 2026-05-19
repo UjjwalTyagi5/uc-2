@@ -430,8 +430,7 @@ SELECT
 
     -- ─── REFERENCE DATES ────────────────────────────────────────────────
     prm_current.C_DATETIME AS current_pr_created_date,
-    YEAR(prm_current.C_DATETIME) AS current_pr_year,
-    qi.item_created_date AS current_quote_created_date
+    YEAR(prm_current.C_DATETIME) AS current_pr_year
 
 FROM ras_procurement.quotation_extracted_items qi
 INNER JOIN ras_procurement.purchase_req_detail prd
