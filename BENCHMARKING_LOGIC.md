@@ -239,10 +239,10 @@ Prices are converted at **extraction time** (not dynamically updated):
 3. Query `EXCHANGE_RATE` table for active rate:
    ```sql
    WHERE CUR_ID = source_currency_id
-     AND BASE_CUR_ID = 1 (EUR)
+     AND BASE_CUR_ID = 3 (EUR)
      AND STATUS_ID = 10 (active)
-     AND FROM_DATE <= quotation_date
-     AND TO_DATE >= quotation_date
+     AND FROM_DATE <= pr_date
+     AND TO_DATE >= pr_date
    ```
 4. Apply conversion: `unit_price_eur = unit_price × CONVERSION_RATE`
 5. Storage: Both `unit_price` (source) and `unit_price_eur` (EUR) stored in DB
@@ -251,12 +251,18 @@ Prices are converted at **extraction time** (not dynamically updated):
 - `currency_mst` — Maps ISO currency codes (USD, INR, EUR, etc.) → CUR_ID
 - `EXCHANGE_RATE` — Contains:
   - CUR_ID: source currency
-  - BASE_CUR_ID: target currency (1 = EUR)
-  - CONVERSION_RATE: rate to apply
+  - BASE_CUR_ID: target currency (3 = EUR)
+  - CONVERSION_RATE: rate to apply (source → EUR)
   - FROM_DATE, TO_DATE: validity period
   - STATUS_ID: 10 = active rate
 
-**Exchange Rate Date:** Based on **quotation_date** (not today's date), ensuring historical accuracy
+**Exchange Rate Date (PR-Level):**  
+✓ Uses **PR-level date** (not quotation_date) to standardize all quotes in a PR to same exchange rate:
+```python
+fallback_date = ctx.req_start_date or ctx.c_datetime  # Line 4486
+```
+
+**Reason:** All quotations within a PR use the same exchange rate (from PR creation/start date) for consistency, regardless of when individual quotes were issued. This ensures fair price comparison within the PR.
 
 ### In Benchmarking
 
@@ -426,8 +432,10 @@ else:
 3. **Query 3: Historical Benchmarking (BP & LP)** — Best Price and Last Purchase with inflation-adjusted pricing
    - Year comparison: `YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME)`
    - Normalized pricing: `bp_unit_price × (1 + cpi_inflation_pct / 100)`
-4. **Query 4: Currency Conversion & Inflation Rates** — Source→EUR conversion and both inflation types
-   - Year comparison: `YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME)`
+4. **Query 4: Currency Conversion & Inflation Rates (SELECTED QUOTES ONLY)** — Source→EUR conversion and both inflation types
+   - Exchange rate lookup: `PR_DATE` (req_start_date or c_datetime), NOT quotation_date
+   - Shows: quotation_date, pr_created_date, pr_req_start_date for transparency
+   - Exchange rate: Lookup based on PR-level date to match v3 standardization logic
 5. **Query 5: Validation** — Checks if stored inflation values match year comparison logic
    - Flags: "Should inflate but inflation=0" or "Should NOT inflate but inflation>0"
 
@@ -456,3 +464,5 @@ else:
 | **ref_year_last** | Year extracted from LAST item's PR date (`purchase_req_mst.C_DATETIME`) |
 | **current_year** | Year of the CURRENT PR being benchmarked (from `purchase_req_mst.C_DATETIME`), NOT today's date |
 | **C_DATETIME** | Purchase requisition creation date in `purchase_req_mst` table — source for all year comparisons |
+| **REQ_START_DATE** | Purchase requisition start date in `purchase_req_mst` table — used as PR-level date for currency conversion (fallback: C_DATETIME if NULL) |
+| **PR-level date** | Either req_start_date or c_datetime (whichever is not NULL); used for all quotations within a PR for exchange rate lookup |
