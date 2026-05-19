@@ -1,39 +1,63 @@
-# RAS Procurement Benchmarking System v3 — Logic Documentation
+# RAS Procurement Benchmarking System v3 — Complete Logic Documentation
+
+**Version:** v3 (Uses `_run_benchmark_v2` only, from pipeline_stage_123_v3.py)  
+**Last Updated:** 2026-05-18
+
+---
 
 ## Executive Summary
 
 The v3 benchmarking system provides:
-1. **Supplier Hierarchy** — Primary (extracted), Secondary (parent from RAS master), Tertiary (alternatives)
-2. **Specification Capture** — Technical (taxonomy) and Commercial (terms, payment, delivery) details per supplier
-3. **Historical Benchmarking** — Comparison against cheapest (BP) and most recent (LP) historical purchases, with inflation adjustment
-4. **Currency & Inflation** — Automatic EUR conversion and CPI-based price normalization
+1. **Supplier Hierarchy** — Primary (is_selected_quote=1), Secondary L1 (lowest price), Secondary L2 (2nd lowest)
+2. **Specification Capture** — Technical (8-level taxonomy) and Commercial (quote & line-item details)
+3. **Historical Benchmarking** — BP (Best Price) and LP (Last Purchase) with dual inflation calculation
+4. **Currency & Inflation** — EUR conversion + LLM + CPI inflation for both BP and LP
 
 ---
 
 ## 1. Supplier Hierarchy
 
-### Definitions
+### Primary Supplier (L0)
 
-**Primary Supplier**
-- Source: `quotation_extracted_items.supplier_name` (extracted via LLM from quotation documents)
-- Confidence: `supplier_match_conf` (0-1 scale) indicates how strongly the extracted name matches the RAS master supplier
-- Ranking: Suppliers are ranked by `is_selected_quote` (boolean) — the selected supplier is the primary
-- RAS Context: `purchase_req_mst.supplier_name` (the original RAS requisition supplier; used to match extracted names)
+**Definition:** The ONE supplier selected for each RAS item by the v3 extraction pipeline
 
-**Secondary Supplier**
-- Source: `purchase_req_mst.parent_supplier` (from on-prem RAS master)
-- Definition: Parent organization, group company, or parent vendor entity
-- Availability: Not all RAS records have a secondary supplier; may be NULL
-- Use Case: Group purchasing, parent company invoicing, multi-location supplier networks
+**Selection Criteria:** `is_selected_quote = 1`
 
-**Tertiary Supplier**
-- Source: Alternative suppliers quoted but not selected (`is_selected_quote = 0`)
-- Definition: All other suppliers who provided quotes for the same RAS
-- Ranking: Ranked by quote frequency (how many items were quoted) and price (lowest/highest per item)
-- Use Case: Supplier performance comparison, market competition analysis, alternative sourcing
+**Logic:**  
+Function `_select_best_quotes()` (line 3905) ranks all suppliers per item by:
+1. `supplier_match_conf` — LLM confidence that extracted supplier matches RAS supplier (0-1)
+2. `price_fit` — proximity of unit/total price to RAS requisition price
+3. `has_price` — whether unit_price is not null
 
-### Query References
-- **Query 1** — `client_queries_supplier_benchmarking.sql` — Fetch Primary, Secondary, Tertiary suppliers
+The item with the highest score gets `is_selected_quote = 1`
+
+**Count:** Exactly one per `purchase_dtl_id` (or none if extraction failed)
+
+### Secondary Supplier L1 (Lowest Price Alternative)
+
+**Definition:** Cheapest supplier among all non-selected quotes for the same item
+
+**Selection Criteria:**  
+- `is_selected_quote = 0` (NOT the selected one)
+- Minimum `unit_price_eur` (or `unit_price` if EUR not available)
+- Within same `purchase_dtl_id`
+
+**Logic:** Rank all non-selected items for an item by unit price ascending, pick rank=1
+
+**Availability:** May be NULL if no alternatives exist
+
+### Secondary Supplier L2 (2nd Lowest Price)
+
+**Definition:** Second-cheapest supplier among all non-selected quotes for the same item
+
+**Selection Criteria:**  
+- `is_selected_quote = 0`
+- Second-minimum `unit_price_eur`
+- Within same `purchase_dtl_id`
+
+**Logic:** Rank all non-selected items by unit price ascending, pick rank=2
+
+**Availability:** May be NULL if fewer than 3 suppliers quoted
 
 ---
 
@@ -41,24 +65,18 @@ The v3 benchmarking system provides:
 
 ### Taxonomy Structure (item_level_1 through item_level_8)
 
-The extraction LLM assigns an 8-level hierarchical taxonomy to every item:
+8-level hierarchical classification assigned by the LLM extraction:
 
 | Level | Meaning | Example |
 |-------|---------|---------|
-| 1 | **Broad Category** | Mechanical, Electrical, Software, Services |
-| 2 | **Product Type** | Industrial Equipment, Power Supply, Cloud Service |
-| 3 | **Product Subtype** | Mould Tooling, Servo Motor, Data Analytics |
-| 4 | **Specific Feature** | Cavity Count, Frame Size, Licensing Model |
-| 5–8 | **Detailed Specs** | Manufacturer, Version, Options, etc. |
+| 1 | Broad Category | Mechanical, Electrical, Software |
+| 2 | Product Type | Industrial Equipment, Motor, Cloud Service |
+| 3 | Product Subtype | Mould Tooling, Servo Motor, SaaS |
+| 4–8 | Specific Features | Cavity count, machine model, version, options |
 
-**Example Chain:**
-```
-Mechanical > Industrial Equipment > Mould Tooling > Double Cavity > F65 Series > DN13+15 > Air Forming > Supplier Code S001
-```
+### Critical Attributes (JSON)
 
-### Critical Attributes (JSON Structure)
-
-Each item has a `critical_attributes` JSON array:
+Each item has `critical_attributes` JSON array with structure:
 
 ```json
 [
@@ -73,164 +91,132 @@ Each item has a `critical_attributes` JSON array:
     "value": 65.0,
     "unit": "series",
     "importance": "important"
-  },
-  {
-    "name": "tube_diameter_nominal",
-    "value": 13.0,
-    "unit": "DN",
-    "importance": "important"
   }
 ]
 ```
 
 **Importance Levels:**
-- `critical` — Must match exactly (or within 10% tolerance) between source and historical candidates; mismatch → REJECT
-- `important` — Should match (within 20% tolerance); mismatch → downrank
-- `informational` — Nice to match; no penalty if different
+- `critical` — Must match (±10% tolerance); mismatch = REJECT in LLM ranking
+- `important` — Should match (±20% tolerance); mismatch = downrank
+- `informational` — No penalty if different
 
 ### Fields in quotation_extracted_items
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `item_name` | NVARCHAR | Brief item description |
-| `item_description` | NVARCHAR | Detailed specification text |
-| `item_summary` | NVARCHAR | Condensed LLM summary |
-| `item_level_1` through `item_level_8` | NVARCHAR | Hierarchical taxonomy |
-| `critical_attributes` | NVARCHAR(MAX) JSON | Spec attributes with importance |
-| `commodity_tag` | NVARCHAR | Commodity/family tag (e.g., "Moulding", "Fasteners") |
-| `purchase_category_llm` | NVARCHAR(200) | LLM-derived category (v2+, used for SQL pool filtering) |
+**Technical Specs:**
+- `item_name`, `item_description`, `item_summary`
+- `item_level_1` through `item_level_8`
+- `critical_attributes` (JSON)
+- `commodity_tag`, `purchase_category_llm`
 
-### Query References
-- **Query 2** — `client_queries_supplier_benchmarking.sql` — Technical specs per supplier
+**Quantity & Unit:**
+- `unit`, `quantity`
 
 ---
 
 ## 3. Commercial Specifications
 
-### Quote-Level Commercial Details (Standard Terms)
+### Quote-Level Details (Applied to Entire Quotation)
 
-Applied to the entire quotation:
+| Field | Type | Purpose |
+|-------|------|---------|
+| `quotation_ref_no` | NVARCHAR | Supplier's quote reference |
+| `quotation_date` | DATETIME | Date quotation was issued |
+| `validity_date` | DATETIME | Quote expiry |
+| `validity_days` | INT | Validity period (days) |
+| `payment_terms` | NVARCHAR | Payment conditions (e.g., "Net 30") |
+| `delivery_date` | DATETIME | Promised delivery |
+| `delivery_time_days` | INT | Lead time (days) |
+| `quote_incoterms` | NVARCHAR | Incoterms (FOB, CIF, DDP, etc.) |
+| `quote_incoterms_named_place` | NVARCHAR | Port/location for Incoterms |
 
-| Field | Purpose |
-|-------|---------|
-| `quotation_ref_no` | Supplier's quote reference number |
-| `quotation_date` | Date quotation was issued |
-| `validity_date` | Quote expiry date |
-| `validity_days` | Quote validity period in days |
-| `payment_terms` | Payment conditions (e.g., "Net 30", "2/10 Net 30", "Bank Transfer On Sight") |
-| `delivery_date` | Promised delivery date |
-| `delivery_time_days` | Lead time in days from order to delivery |
-| `quote_incoterms` | Incoterms code (FOB, CIF, DDP, FCA, etc.) |
-| `quote_incoterms_named_place` | Specific port/location for Incoterms (e.g., "Port of Shanghai") |
-
-### Quote-Level Financial Details (Charges & Totals)
-
-| Field | Purpose |
-|-------|---------|
-| `quote_subtotal` | Subtotal before any charges |
-| `quote_freight` | Freight/shipping charges |
-| `quote_insurance` | Insurance charges |
-| `quote_customs_duties` | Customs/duty charges |
-| `quote_packing_forwarding` | Packing & forwarding charges |
-| `quote_installation` | Installation charges (if applicable) |
-| `quote_other_charges` | Any other charges |
-| `quote_tax_type` | Tax type (VAT, GST, etc.) |
-| `quote_tax_rate_pct` | Tax rate as percentage |
-| `quote_tax_amount_total` | Total tax amount |
-| `quote_grand_total` | Final total after all charges & tax |
-| `quote_grand_total_currency` | Currency of grand total |
+**Charges & Totals:**
+- `quote_subtotal`, `quote_freight`, `quote_insurance`, `quote_customs_duties`, `quote_packing_forwarding`, `quote_installation`, `quote_other_charges`
+- `quote_tax_type`, `quote_tax_rate_pct`, `quote_tax_amount_total`
+- `quote_grand_total`, `quote_grand_total_currency`
 
 ### Line-Item Commercial Details (New in v3)
 
-Applied per line item (when supplier provides line-level breakdown):
-
-| Field | Purpose |
-|-------|---------|
-| `line_incoterms` | Incoterms if specified per line |
-| `line_freight` | Freight allocated to this line |
-| `line_insurance` | Insurance allocated to this line |
-| `line_tax_rate_pct` | Tax rate for this line |
-| `line_tax_amount` | Tax amount for this line |
-| `line_other_charges` | Other charges for this line |
-| `line_total_inclusive` | Line total including all allocated charges |
-| `line_allocation_method` | How charges were split (e.g., "proportional by value", "equal", "weight-based") |
-| `line_hsn_sac_code` | Harmonized System/SAC tariff code (used for import duty classification) |
-| `line_country_of_origin` | Country where item is manufactured |
-
-### Query References
-- **Query 2** — `client_queries_supplier_benchmarking.sql` — Commercial specs per supplier
+When supplier provides line-level breakdown:
+- `line_incoterms`, `line_freight`, `line_insurance`, `line_tax_rate_pct`, `line_tax_amount`, `line_other_charges`
+- `line_total_inclusive`
+- `line_allocation_method` — how charges were split
+- `line_hsn_sac_code` — tariff code
+- `line_country_of_origin`
 
 ---
 
-## 4. Historical Benchmarking Logic
+## 4. Historical Benchmarking (v3 3-Stage Pipeline)
 
 ### Overview
 
-The system maintains a `benchmark_result` table that links each extracted quotation item to:
-1. **BP (Best Price)** — the cheapest historical item for similar specs
-2. **LP (Last Purchase)** — the most recently purchased item for similar specs
+For each selected quote item, the pipeline finds:
+- **BP (Best Price):** Lowest-priced historical item matching the specs
+- **LP (Last Purchase):** Most-recently purchased historical item matching the specs
 
-Both are inflation-adjusted for fair comparison.
+Both are extracted from `similar_dtl_ids` (populated by Stage C LLM ranking).
 
-### How BP & LP Are Computed
+### How similar_dtl_ids Are Populated
 
-#### Stage A: SQL Pool (Category-Based)
-- Query all historical items in the same `purchase_category_llm`
+**Stage A — SQL Category Pool**
+- Query `quotation_extracted_items` for historical items in same `purchase_category_llm`
 - Older than current PR (by `item_created_date`)
-- With known unit_price_eur
+- With known `unit_price_eur`
+- Default: up to 100 items
+- If < 20 items, widen to `item_level_1 + item_level_2` matching
 
-#### Stage B: Pinecone Vector Search (Similarity-Based)
-- Embed the current item using its `embed_content` (or fallback to `_build_embed_text`)
-- Search Pinecone for items with cosine similarity ≥ 0.80
+**Stage B — Pinecone Vector Search (Global)**
+- Embed current item using `embed_content`
+- Search Pinecone globally (empty pool)
+- Min similarity: 0.80 (default)
 - Fetch top-k results
 
-#### Stage C: LLM Relevance Ranking
-- Combine A + B pools
-- Filter by date (no future items)
-- Pre-filter for extreme price outliers
-- **Rank candidates using LLM** with rules:
-  1. **Critical attribute barriers** — critical attrs must match (±10%)
-  2. **Product type consistency** — item_level chain must be compatible
-  3. **Spec-to-price ratio sanity** — price/spec ratio must not diverge > 5×
-  4. **Important attribute penalties** — mismatches downrank
-  5. **Brand & recency** — recency is a tiebreaker
+**Stage C — LLM Relevance Ranking**
+- Combine Stage A + Stage B pools
+- Apply hard date guard (drop items newer than current PR)
+- Pre-filter for extreme price outliers (`bench_max_price_ratio`)
+- Call LLM with `RANK_PROMPT_SYSTEM_V2` (6 rejection rules)
+- LLM returns `selected` and `rejected` arrays
 
-Result: LLM returns top-K ranked candidates
+**Result:** `shortlist_dtl_ids` = extract `purchase_dtl_id` from LLM "selected" items
 
-#### Extraction of BP & LP
-- **BP (cheapest):** Among surviving candidates, pick the one with lowest `unit_price_eur`
-- **LP (most recent):** Among surviving candidates, pick the one with latest `item_created_date`
+**Storage:** Convert to JSON, store in `benchmark_result.similar_dtl_ids`
 
-### Storage in benchmark_result
+### LLM Rejection Rules (Stage C)
 
-| Column | Type | Purpose |
-|--------|------|---------|
-| `purchase_dtl_id` | INT | Current RAS item ID |
-| `extracted_item_uuid_fk` | UUID | FK to current quotation_extracted_items row |
-| `low_hist_item_fk` | UUID | FK to BP historical item in quotation_extracted_items |
-| `last_hist_item_fk` | UUID | FK to LP historical item in quotation_extracted_items |
-| `bp_unit_price` | DECIMAL(20,4) | Best price per unit (EUR) |
-| `bp_total_price` | DECIMAL(20,4) | Best price total line value (EUR) |
-| `similar_dtl_ids` | NVARCHAR(MAX) JSON | Array of similar historical item IDs for context |
-| `summary` | NVARCHAR(MAX) | LLM benchmark recommendation text |
-| `inflation_pct` | DECIMAL(10,4) | General inflation % (BP → current) |
-| `cpi_inflation_pct` | DECIMAL(10,4) | CPI-based inflation % (BP → current) |
-| `inflation_pct_last` | DECIMAL(10,4) | General inflation % (LP → current) [v3 new] |
-| `cpi_inflation_pct_last` | DECIMAL(10,4) | CPI-based inflation % (LP → current) [v3 new] |
+1. **Critical Attribute Barriers** — critical attrs must match (±10%)
+2. **Product Type Consistency** — item_level chain compatible
+3. **Spec-to-Price Ratio Sanity** — price/spec ratio not > 5× off pool median
+4. **Important Attribute Penalties** — mismatches downrank (±20%)
+5. **Brand Similarity is Not Relevance** — no boost for same brand
+6. **Recency Tiebreak** — prefer more recent among survivors
 
-### Normalization Formula
+### BP & LP Extraction from similar_dtl_ids
 
-Once historical items are selected, their prices are normalized (adjusted for inflation):
+**Function:** `_compute_low_last()` (line 4746)
 
-```
-normalized_bp_unit_price = bp_unit_price × (1 + cpi_inflation_pct / 100)
-normalized_lp_unit_price = lp_unit_price × (1 + cpi_inflation_pct_last / 100)
+```python
+# From shortlist_dtl_ids, fetch full historical data
+historical = _fetch_historical_for_dtl_ids(shortlist_dtl_ids)
+
+# Filter by: UOM (optional), age (max_age_months), outliers (3×IQR)
+historical = _filter_historical_*()
+
+# Extract low and last
+low_item  = min(historical, key=unit_price_eur)   # BP = cheapest
+last_item = max(historical, key=pr_created_date)  # LP = most recent
 ```
 
-This allows fair comparison: "If the historical purchase had happened today, what would it cost?"
+**BP (Best Price):**
+- Source: `similar_dtl_ids` (LLM-ranked shortlist)
+- Selection: minimum `unit_price_eur`
+- No filter for `is_selected_quote` (can be ANY quote)
+- Stored in: `benchmark_result.low_hist_item_fk`
 
-### Query References
-- **Query 3** — `client_queries_supplier_benchmarking.sql` — BP/LP with inflation
+**LP (Last Purchase):**
+- Source: same `similar_dtl_ids`
+- Selection: maximum `pr_created_date` (from `purchase_req_mst.C_DATETIME`)
+- No filter for `is_selected_quote`
+- Stored in: `benchmark_result.last_hist_item_fk`
 
 ---
 
@@ -238,236 +224,155 @@ This allows fair comparison: "If the historical purchase had happened today, wha
 
 ### Source and Target
 
-- **Source Currency:** Varies by supplier (`quotation_extracted_items.currency`)
-  - Common: INR, USD, EUR, GBP, ZAR, AED, RMB, JPY, etc.
-- **Target Currency:** EUR (for all comparisons)
-  - Stored as `unit_price_eur`, `total_price_eur`
+**Source:** Supplier's quote currency (INR, USD, EUR, GBP, ZAR, AED, RMB, JPY, etc.)  
+**Target:** EUR (for all comparisons and storage)
 
 ### Conversion Method (v3)
 
-The v3 pipeline converts currencies within the `_run_pricing_llm()` function:
+Prices are converted at **extraction time** (not dynamically updated):
 
-1. **Extraction**: LLM extracts both `unit_price` (source currency) and `unit_price_eur` (if available in document)
-2. **Fallback Conversion**: If `unit_price_eur` is missing:
-   - Call LLM pricing function with historical exchange rate lookup
-   - Apply conversion: `unit_price_eur = unit_price × exchange_rate`
-3. **Storage**: Both source and EUR prices are stored
+1. **LLM Extraction:** Extracts both `unit_price` (source) and `unit_price_eur` (if in document)
+2. **Fallback:** If `unit_price_eur` missing, apply historical exchange rate
+3. **Storage:** Both `unit_price` and `unit_price_eur` stored in DB
 
-### Exchange Rates
+**Exchange Rate Source:** Historical rates (market data, central bank)  
+**Applied:** At extraction; uses PR creation date for consistency
 
-- **Source:** Historical exchange rates (inferred from market data or LLM-retrieved rates)
-- **Application:** Applied at extraction time (not dynamically updated)
-- **Impact:** A 10-year-old quote in INR is converted using the exchange rate from that date
+### In Benchmarking
 
-### Query References
-- **Query 4** — `client_queries_supplier_benchmarking.sql` — Currency conversion details
-- **Query 4 Implied Exchange Rate** — `unit_price_eur / unit_price` (for verification)
+**For Current Item:**
+- `unit_price_eur` from `quotation_extracted_items`
+
+**For BP & LP:**
+- Each uses its own PR's exchange rate (via `unit_price_eur` stored in DB)
+- No re-conversion; historical price already in EUR
 
 ---
 
-## 6. Inflation Calculation
+## 6. Inflation Calculation (BOTH LLM + CPI for BOTH BP & LP)
 
-### CPI-Based Inflation (v3)
+### Overview
 
-The system uses **Consumer Price Index (CPI)** to adjust historical prices to current levels.
+v3 calculates **four inflation values**:
+- `inflation_pct` — LLM estimate for BP (line 5542-5552)
+- `cpi_inflation_pct` — World Bank CPI for BP (line 5549)
+- `inflation_pct_last` — LLM estimate for LP (line 5567-5577)
+- `cpi_inflation_pct_last` — World Bank CPI for LP (line 5574)
 
-### Calculation Flow
+### Reference Dates
 
-#### Step 1: Identify Reference Dates
-- **Current PR date:** `purchase_req_mst.C_DATETIME` (when the current RAS was created)
-- **Historical item date:** `quotation_extracted_items.item_created_date` (when the BP/LP was quoted)
+Each historical item uses its own PR date (from `purchase_req_mst.C_DATETIME`):
 
-#### Step 2: Retrieve CPI Data
-The function `_compute_cpi_pct()` in `pipeline_stage_123_v3.py`:
-- Takes country (supplier country), reference year, current year
-- Calls LLM (Azure OpenAI) to fetch CPI data
-- Returns CPI inflation percentage
-
-#### Step 3: Apply Formula
-
-```
-inflation_pct = (CPI_current_year / CPI_historical_year - 1) × 100
-
-normalized_price = historical_price × (1 + inflation_pct / 100)
+**For BP:**
+```python
+ref_dt = _get_pr_master_date_for_dtl_id(tgt_cs, low_item.purchase_dtl_id)  # Line 5533
+ref_year = ref_dt.year
+current_year = created.year  # Current PR year
 ```
 
-**Example:**
-- Historical item: quoted 2021, price 100 EUR
-- Current PR: 2026
-- CPI inflation from 2021 to 2026: 15%
-- Normalized price: 100 × (1 + 15/100) = 115 EUR
-
-### Two Inflation Figures (v3 New)
-
-| Column | Source | Purpose |
-|--------|--------|---------|
-| `inflation_pct` | `_compute_cpi_pct()` general | Standard inflation % |
-| `cpi_inflation_pct` | `_compute_cpi_pct()` CPI | CPI-specific inflation % (more accurate) |
-| `inflation_pct_last` | Same logic, LP date | Inflation from LP to current (v3 new) |
-| `cpi_inflation_pct_last` | Same logic, LP date | CPI inflation from LP to current (v3 new) |
-
-Usually `cpi_inflation_pct ≥ inflation_pct` (CPI is typically more conservative).
-
-### Limitations
-
-- **Data Freshness:** CPI lookup happens at extraction time; not updated if inflation rates change
-- **Country Specificity:** Only supplier country is used; item-specific inflation (e.g., semiconductor prices vs general inflation) is not captured
-- **Manual Entry:** Not all inflations can be automatically retrieved; fallback to general country inflation
-
-### Query References
-- **Query 4** — `client_queries_supplier_benchmarking.sql` — Inflation amounts & adjusted prices
-
----
-
-## 7. Key Data Flow Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ INPUT: New RAS (purchase_req_id = 152105)                           │
-└───────────────────────┬──────────────────────────────────────────────┘
-                        │
-                        ▼
-        ┌───────────────────────────────┐
-        │ QUOTATION EXTRACTION (LLM)    │
-        │ Extracts from PDF documents   │
-        └───────┬───────────────────────┘
-                │
-                ▼
-    ┌───────────────────────────────────────────┐
-    │ quotation_extracted_items                 │
-    │ ├─ supplier_name (PRIMARY SUPPLIER)      │
-    │ ├─ item_name, item_level_1..8 (TECH)    │
-    │ ├─ critical_attributes (SPECS)          │
-    │ ├─ quotation_date, payment_terms (COM)  │
-    │ ├─ currency, unit_price, unit_price_eur│
-    │ └─ is_selected_quote (RANKING)          │
-    └────────────────┬────────────────────────┘
-                     │
-         ┌───────────┴────────────┐
-         │                        │
-         ▼                        ▼
-    ┌─────────────┐       ┌──────────────┐
-    │ purchase_   │       │ SECONDARY &  │
-    │ req_mst     │       │ TERTIARY     │
-    │ supplier_   │       │ SUPPLIERS    │
-    │ name        │       └──────────────┘
-    │ parent_     │
-    │ supplier    │
-    └─────────────┘
-         │
-         ▼
-    ┌────────────────────────────────┐
-    │ BENCHMARKING STAGE (V2 3-STAGE)│
-    │ ┌─────────────┐                │
-    │ │ SQL POOL    │                │
-    │ │ by category │                │
-    │ └──────┬──────┘                │
-    │        │                       │
-    │   ┌────┴────┐                  │
-    │   │ combined │                 │
-    │   │ pool     │                 │
-    │   └────┬────┘                  │
-    │        │                       │
-    │   ┌────┴──────────┐            │
-    │   │ LLM RANKING   │            │
-    │   │ (6 rules)     │            │
-    │   └────┬──────────┘            │
-    │        │                       │
-    │   ┌────┴──────┐                │
-    │   │ BP & LP   │                │
-    │   │ selected  │                │
-    │   └────┬──────┘                │
-    └────────┼────────────────────────┘
-             │
-             ▼
-    ┌─────────────────────────────────────┐
-    │ benchmark_result                    │
-    │ ├─ purchase_dtl_id (reference)     │
-    │ ├─ low_hist_item_fk (BP)           │
-    │ ├─ last_hist_item_fk (LP)          │
-    │ ├─ bp_unit_price (cheapest)        │
-    │ ├─ inflation_pct (BP inflation)    │
-    │ ├─ inflation_pct_last (LP infla.)  │
-    │ ├─ similar_dtl_ids (context)       │
-    │ └─ summary (LLM recommendation)    │
-    └────────────┬──────────────────────┘
-                 │
-                 ▼
-    ┌─────────────────────────────────┐
-    │ NORMALIZED PRICING              │
-    │ ├─ bp_normalized = bp × (1 +   │
-    │ │   cpi_inflation_pct / 100)    │
-    │ ├─ lp_normalized = lp × (1 +   │
-    │ │   cpi_inflation_pct_last/100) │
-    │ └─ READY FOR REPORTING          │
-    └─────────────────────────────────┘
+**For LP:**
+```python
+ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_item.purchase_dtl_id)  # Line 5564
+ref_year_last = ref_dt_last.year
+current_year = created.year
 ```
 
+### LLM Inflation Estimation
+
+**Function:** `_estimate_inflation_via_llm()` (line 5266)
+
+Calls LLM with prompt asking for estimated cumulative inflation % for:
+- Item name/category
+- Supplier country
+- Year range (ref_year → current_year)
+
+**Formula:** Macroeconomic inflation for that item category in that country
+
+### World Bank CPI Inflation
+
+**Function:** `_compute_cpi_pct()` (line 5216)
+
+```python
+# Fetch CPI data from World Bank API
+url = "https://api.worldbank.org/v2/country/{alpha2}/indicator/FP.CPI.TOTL.ZG"
+
+# Resolve country name → ISO alpha-2 code
+alpha2 = resolve_country(supplier_country)
+
+# Retrieve annual CPI rates for year range
+rates = {year: cpi_annual_rate for year in range(ref_year, current_year)}
+
+# Cumulative inflation
+factor = 1.0
+for yr in range(ref_year + 1, current_year + 1):
+    if yr in rates:
+        factor *= (1 + rates[yr] / 100)
+
+inflation_pct = (factor - 1) * 100
+```
+
+**Endpoint:** https://api.worldbank.org/v2/country/{country_code}/indicator/FP.CPI.TOTL.ZG
+
+### Normalization Formula
+
+**Both BP and LP:**
+
+```
+normalized_bp = bp_unit_price × (1 + cpi_inflation_pct / 100)
+normalized_lp = lp_unit_price × (1 + cpi_inflation_pct_last / 100)
+```
+
+Used in view (vw_benchmark_summary.sql, lines 89-92 and 110).
+
+### Storage in benchmark_result
+
+| Column | Source | For Item |
+|--------|--------|----------|
+| `inflation_pct` | LLM estimate | BP |
+| `cpi_inflation_pct` | World Bank CPI | BP |
+| `inflation_pct_last` | LLM estimate | LP |
+| `cpi_inflation_pct_last` | World Bank CPI | LP |
+
 ---
 
-## 8. Configuration & Tuning (v3)
+## 7. Implementation References (v3)
 
-### Benchmark Configuration Keys
+**Core Pipeline:**
+- `agentcore_components/pipeline_stage_123_v3.py`
+  - `_run_benchmark_v2()` line 7537 — Main orchestration
+  - `_sql_pool_by_category()` line 7149 — Stage A
+  - `_pinecone_narrow_within_pool()` line 7225 — Stage B
+  - `_llm_rank_candidates()` line 7355 — Stage C
+  - `_pre_filter_candidates()` line 7367 — Price ratio pre-filter
+  - `_compute_low_last()` line 4746 — BP/LP extraction
+  - `_estimate_inflation_via_llm()` line 5266 — LLM inflation
+  - `_compute_cpi_pct()` line 5216 — World Bank CPI
+  - `_get_pr_master_date_for_dtl_id()` line 5300 — PR date lookup
 
-These can be passed as `prompts` dict to `_run_benchmark_v2()`:
+**Schema:**
+- `migrations/create_vw_benchmark_summary.sql` — Benchmark view with normalized prices
 
-| Key | Default | Purpose |
-|-----|---------|---------|
-| `bench_sql_pool_size` | 100 | Max historical items to fetch in SQL pool (Stage A) |
-| `bench_pinecone_top_k` | 10 | Max results from Pinecone (Stage B) |
-| `bench_min_similarity` | 0.80 | Minimum cosine similarity threshold for Pinecone |
-| `bench_llm_shortlist_size` | max(5, top_k_final) | How many candidates LLM ranks |
-| `bench_widen_l1l2_when_sparse` | True | If SQL pool < 20, widen to item_level_1+2 |
-| `bench_max_price_ratio` | 10.0 | Pre-filter: drop candidates with unit_price > 10× source |
-| `bench_critical_threshold_pct` | 10 | Critical attribute tolerance |
-| `bench_important_threshold_pct` | 20 | Important attribute tolerance |
-| `bench_ratio_band_pct` | 50 | Spec-to-price ratio band (±50% of median) |
-| `bench_max_age_months` | 0 | Max age of historical items (0 = no limit) |
-| `bench_uom_strict` | False | Require exact unit match for comparison |
-
----
-
-## 9. Implementation References
-
-### Core Files (v3)
-
-- **Pipeline Logic:** `agentcore_components/pipeline_stage_123_v3.py`
-  - `_run_benchmark_v2()` (line ~7470) — Main benchmarking orchestration
-  - `_sql_pool_by_category()` (line ~7149) — Stage A SQL pool
-  - `_pinecone_narrow_within_pool()` (line ~7225) — Stage B search
-  - `_llm_rank_candidates()` (line ~7355) — Stage C LLM ranking
-  - `_pre_filter_candidates()` (line ~7367) — Price ratio pre-filter
-  - `_compute_cpi_pct()` — CPI inflation lookup
-
-- **Schema Definitions:**
-  - `sql/quotation_extracted_items_add_commercials_cols.sql` — Commercial spec columns
-  - `migrations/add_inflation_last_columns.sql` — v3 LP inflation support
-  - `migrations/create_vw_benchmark_summary.sql` — Combined benchmark view
-
-- **Client Queries:**
-  - `sql/client_queries_supplier_benchmarking.sql` — All 4 queries (this document)
+**Client Queries:**
+- `sql/client_queries_supplier_benchmarking.sql` — All 4 queries (this documentation)
 
 ---
 
-## 10. Glossary
+## 8. Glossary
 
 | Term | Definition |
 |------|-----------|
-| **BP** | Best Price — cheapest historical item matching current specs |
-| **LP** | Last Purchase — most recently purchased historical item |
+| **BP** | Best Price — lowest-cost historical item from similar_dtl_ids |
+| **LP** | Last Purchase — most-recent historical item from similar_dtl_ids |
 | **RAS** | Requisition Approval System — source of purchase requirements |
 | **PURCHASE_DTL_ID** | Line item ID within a RAS |
 | **PURCHASE_REQ_ID** | RAS header ID (PR number) |
-| **extracted_item_uuid_pk** | Unique identifier for each extracted quotation row |
+| **extracted_item_uuid_pk** | Unique ID for each extracted quotation row |
+| **is_selected_quote** | Binary flag (0/1) indicating if item was selected as primary supplier |
 | **supplier_match_conf** | Confidence (0-1) that extracted supplier matches RAS supplier |
-| **item_level_1..8** | 8-level hierarchical taxonomy for categorizing items |
-| **critical_attributes** | JSON array of must-match specifications |
-| **CPI** | Consumer Price Index — measure of inflation |
+| **item_level_1..8** | 8-level hierarchical taxonomy (Mechanical > Industrial Equipment > Mould Tooling > ...) |
+| **critical_attributes** | JSON array of must-match specs (importance="critical") |
+| **similar_dtl_ids** | JSON array of historical items ranked by LLM Stage C |
+| **cpi_inflation_pct** | World Bank CPI-based inflation % (BP) |
+| **cpi_inflation_pct_last** | World Bank CPI-based inflation % (LP) |
 | **Incoterms** | International Commercial Terms (FOB, CIF, DDP, etc.) |
-
----
-
-## Document History
-
-- **v3 (2026-05-18):** Initial documentation for v3 benchmarking with LP inflation, improved pre-filtering
-- **Reference:** Based on pipeline_stage_123_v3.py and schema migrations
+| **purchase_category_llm** | LLM-assigned category (used for Stage A SQL filtering) |

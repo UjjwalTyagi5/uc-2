@@ -1,73 +1,114 @@
 -- ============================================================================
 -- CLIENT QUERIES: SUPPLIER HIERARCHY & BENCHMARKING (v3)
 -- ============================================================================
+-- Based on v3 pipeline implementation in pipeline_stage_123_v3.py
+--
+-- v3 Benchmarking uses:
+--   Stage A: SQL category pool
+--   Stage B: Pinecone vector search (global)
+--   Stage C: LLM ranking (6 rejection rules)
+--   Result: similar_dtl_ids populated from Stage C "selected" items
+--
 -- These 4 queries support client analysis of:
 -- 1. Supplier hierarchy (Primary, Secondary, Tertiary)
 -- 2. Technical & Commercial specifications per supplier
--- 3. Historical benchmarking (Best Price & Last Purchase)
+-- 3. Historical benchmarking (BP & LP with inflation)
 -- 4. Currency conversion & inflation rates
 -- ============================================================================
 
 -- USAGE: Replace @purchase_req_id with the actual PR ID (e.g., 152105)
 
 -- ============================================================================
--- QUERY 1: FETCH PRIMARY, SECONDARY, TERTIARY SUPPLIERS FOR A RAS
+-- QUERY 1: FETCH PRIMARY, SECONDARY SUPPLIERS FOR A RAS
 -- ============================================================================
 -- Returns three result sets:
---   1. PRIMARY SUPPLIERS: extracted from quotations, ranked by selection status
---   2. SECONDARY SUPPLIER: parent_supplier from RAS master (if exists)
---   3. TERTIARY SUPPLIERS: alternative/unselected suppliers by category
+--   1. PRIMARY: is_selected_quote = 1 (the ONE selected supplier per item)
+--   2. SECONDARY L1: Lowest price among non-selected (is_selected_quote = 0)
+--   3. SECONDARY L2: 2nd lowest price among non-selected
+--
+-- NOTE: L1 and L2 include ALL suppliers (not filtered by is_selected_quote)
 
 DECLARE @purchase_req_id INT = 152105;
 
--- ─── PRIMARY SUPPLIERS ───────────────────────────────────────────────────
--- Suppliers from extracted quotations, ranked by is_selected_quote count
--- supplier_match_conf = confidence (0-1) of LLM match to RAS supplier
+-- ─── PRIMARY SUPPLIER: is_selected_quote = 1 ────────────────────────────
+-- Exactly one per item (purchase_dtl_id), the one selected by v3 extraction
 SELECT
-    'PRIMARY' AS supplier_type,
+    'PRIMARY' AS supplier_rank,
+    prd.PURCHASE_DTL_ID AS item_id,
     qi.supplier_name,
     qi.supplier_country,
-    ROUND(AVG(qi.supplier_match_conf), 3) AS avg_supplier_match_conf,
-    COUNT(qi.extracted_item_uuid_pk) AS total_quotes,
-    SUM(CASE WHEN qi.is_selected_quote = 1 THEN 1 ELSE 0 END) AS selected_quotes,
-    STRING_AGG(DISTINCT qi.purchase_category_llm, ', ') AS categories_quoted
+    qi.supplier_match_conf,
+    qi.total_price_eur,
+    qi.quotation_date,
+    qi.payment_terms,
+    qi.currency
 FROM ras_procurement.quotation_extracted_items qi
-WHERE qi.purchase_req_id = @purchase_req_id
-  AND qi.supplier_name IS NOT NULL
-GROUP BY qi.supplier_name, qi.supplier_country
-ORDER BY selected_quotes DESC, total_quotes DESC;
+INNER JOIN ras_procurement.purchase_req_detail prd
+    ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
+WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+  AND qi.is_selected_quote = 1
+ORDER BY prd.PURCHASE_DTL_ID;
 
--- ─── SECONDARY SUPPLIER ───────────────────────────────────────────────────
--- Parent supplier (if any) from RAS master
--- Represents parent organization or group company
+-- ─── SECONDARY L1: Lowest price among ALL suppliers (non-selected) ──────
+-- For each item, get the cheapest alternative (not the selected one)
+-- Uses ROW_NUMBER to rank by unit_price_eur ascending
 SELECT
-    'SECONDARY' AS supplier_type,
-    prm.parent_supplier AS supplier_name,
-    prm.supplier_type,
-    COUNT(DISTINCT prm.PURCHASE_REQ_ID) AS ras_count
-FROM ras_procurement.purchase_req_mst prm
-WHERE prm.PURCHASE_REQ_ID = @purchase_req_id
-  AND prm.parent_supplier IS NOT NULL
-GROUP BY prm.parent_supplier, prm.supplier_type;
-
--- ─── TERTIARY SUPPLIERS ───────────────────────────────────────────────────
--- Alternative suppliers: those quoted but not selected
--- Ranked by frequency (alternative offers per item category)
-SELECT
-    'TERTIARY' AS supplier_type,
+    'SECONDARY_L1' AS supplier_rank,
+    prd.PURCHASE_DTL_ID AS item_id,
     qi.supplier_name,
     qi.supplier_country,
-    ROUND(AVG(qi.supplier_match_conf), 3) AS avg_supplier_match_conf,
-    COUNT(qi.extracted_item_uuid_pk) AS alternative_quotes,
-    MIN(qi.total_price_eur) AS lowest_price_eur,
-    MAX(qi.total_price_eur) AS highest_price_eur,
-    qi.purchase_category_llm AS category
-FROM ras_procurement.quotation_extracted_items qi
-WHERE qi.purchase_req_id = @purchase_req_id
-  AND qi.is_selected_quote = 0
-  AND qi.supplier_name IS NOT NULL
-GROUP BY qi.supplier_name, qi.supplier_country, qi.purchase_category_llm
-ORDER BY alternative_quotes DESC, lowest_price_eur ASC;
+    qi.supplier_match_conf,
+    qi.total_price_eur,
+    qi.unit_price_eur,
+    qi.quotation_date,
+    qi.payment_terms
+FROM (
+    SELECT
+        qi.*,
+        prd.PURCHASE_DTL_ID,
+        ROW_NUMBER() OVER (
+            PARTITION BY prd.PURCHASE_DTL_ID
+            ORDER BY COALESCE(qi.unit_price_eur, qi.unit_price) ASC
+        ) AS price_rank
+    FROM ras_procurement.quotation_extracted_items qi
+    INNER JOIN ras_procurement.purchase_req_detail prd
+        ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
+    WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+      AND qi.is_selected_quote = 0
+      AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
+) qi
+WHERE price_rank = 1
+ORDER BY PURCHASE_DTL_ID;
+
+-- ─── SECONDARY L2: 2nd lowest price among ALL suppliers (non-selected) ──
+-- For each item, get the 2nd cheapest alternative
+SELECT
+    'SECONDARY_L2' AS supplier_rank,
+    prd.PURCHASE_DTL_ID AS item_id,
+    qi.supplier_name,
+    qi.supplier_country,
+    qi.supplier_match_conf,
+    qi.total_price_eur,
+    qi.unit_price_eur,
+    qi.quotation_date,
+    qi.payment_terms
+FROM (
+    SELECT
+        qi.*,
+        prd.PURCHASE_DTL_ID,
+        ROW_NUMBER() OVER (
+            PARTITION BY prd.PURCHASE_DTL_ID
+            ORDER BY COALESCE(qi.unit_price_eur, qi.unit_price) ASC
+        ) AS price_rank
+    FROM ras_procurement.quotation_extracted_items qi
+    INNER JOIN ras_procurement.purchase_req_detail prd
+        ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
+    WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+      AND qi.is_selected_quote = 0
+      AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
+) qi
+WHERE price_rank = 2
+ORDER BY PURCHASE_DTL_ID;
 
 -- ============================================================================
 -- QUERY 2: TECHNICAL & COMMERCIAL SPECS FOR RAS > ITEM > PER SUPPLIER
@@ -140,13 +181,20 @@ ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC, qi.total_price_eur;
 -- ============================================================================
 -- QUERY 3: SUPPLIER MAPPING FOR HISTORICAL BENCHMARKING (BP / LP)
 -- ============================================================================
--- Returns benchmark comparison:
---   CURRENT: what this RAS item was quoted at
---   BP (BEST PRICE): cheapest historical match + inflation adjustment
---   LP (LAST PURCHASE): most recent historical match + inflation adjustment
--- Formulas:
---   bp_normalized_unit_price = bp_unit_price * (1 + bp_cpi_inflation_pct / 100)
---   lp_normalized_unit_price = lp_unit_price * (1 + lp_cpi_inflation_pct / 100)
+-- Returns benchmark comparison with BOTH LLM and CPI inflation for BP and LP
+--
+-- BP (Best Price) = lowest unit_price_eur from similar_dtl_ids (LLM-ranked shortlist)
+-- LP (Last Purchase) = most recent by PR date from similar_dtl_ids
+--
+-- Inflation: FOUR values calculated for each (BP and LP):
+--   - inflation_pct: LLM-estimated inflation
+--   - cpi_inflation_pct: World Bank CPI-based inflation
+--   - inflation_pct_last: LLM-estimated inflation for LP
+--   - cpi_inflation_pct_last: World Bank CPI for LP
+--
+-- Normalization formula (both):
+--   bp_normalized = bp_unit_price × (1 + cpi_inflation_pct / 100)
+--   lp_normalized = lp_unit_price × (1 + cpi_inflation_pct_last / 100)
 
 DECLARE @purchase_req_id INT = 152105;
 
@@ -159,63 +207,99 @@ SELECT
     qi_current.supplier_country AS current_supplier_country,
     qi_current.unit_price_eur AS current_unit_price_eur,
     qi_current.total_price_eur AS current_total_price_eur,
+    qi_current.currency AS current_currency,
     qi_current.quotation_date AS current_quotation_date,
 
-    -- ─── BEST PRICE (BP) — CHEAPEST HISTORICAL MATCH ──────────────────────
+    -- ─── BEST PRICE (BP) — CHEAPEST FROM similar_dtl_ids ──────────────────
+    -- Selected by _compute_low_last(): min(shortlist_dtl_ids, unit_price_eur)
+    -- Does NOT filter for is_selected_quote (can be any quote from shortlist)
     qi_bp.supplier_name AS bp_supplier_name,
     qi_bp.supplier_country AS bp_supplier_country,
-    br.bp_unit_price AS bp_unit_price_eur,
-    br.bp_total_price AS bp_total_price_eur,
+    qi_bp.currency AS bp_currency,
+    qi_bp.unit_price_eur AS bp_unit_price_eur,
+    qi_bp.total_price_eur AS bp_total_price_eur,
     qi_bp.quotation_date AS bp_quotation_date,
-    DATEDIFF(DAY, qi_bp.item_created_date, GETDATE()) AS bp_days_ago,
+    prm_bp.C_DATETIME AS bp_pr_created_date,
+    DATEDIFF(YEAR, YEAR(prm_bp.C_DATETIME), YEAR(GETDATE())) AS bp_years_ago,
 
-    -- ─── LAST PURCHASE (LP) — MOST RECENT HISTORICAL MATCH ────────────────
+    -- ─── LAST PURCHASE (LP) — MOST RECENT FROM similar_dtl_ids ────────────
+    -- Selected by _compute_low_last(): max(shortlist_dtl_ids, pr_created_date)
+    -- Most recent by purchase_req_mst.C_DATETIME
     qi_lp.supplier_name AS lp_supplier_name,
     qi_lp.supplier_country AS lp_supplier_country,
+    qi_lp.currency AS lp_currency,
     qi_lp.unit_price_eur AS lp_unit_price_eur,
     qi_lp.total_price_eur AS lp_total_price_eur,
     qi_lp.quotation_date AS lp_quotation_date,
-    DATEDIFF(DAY, qi_lp.item_created_date, GETDATE()) AS lp_days_ago,
+    prm_lp.C_DATETIME AS lp_pr_created_date,
+    DATEDIFF(YEAR, YEAR(prm_lp.C_DATETIME), YEAR(GETDATE())) AS lp_years_ago,
 
-    -- ─── INFLATION ADJUSTMENTS ──────────────────────────────────────────
-    ROUND(br.inflation_pct, 2) AS bp_general_inflation_pct,
-    ROUND(br.cpi_inflation_pct, 2) AS bp_cpi_inflation_pct,
-    ROUND(br.inflation_pct_last, 2) AS lp_general_inflation_pct,
-    ROUND(br.cpi_inflation_pct_last, 2) AS lp_cpi_inflation_pct,
+    -- ─── BP INFLATION (TWO TYPES) ───────────────────────────────────────
+    -- Lines 5542-5555 in pipeline_stage_123_v3.py
+    ROUND(br.inflation_pct, 4) AS bp_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct, 4) AS bp_cpi_inflation_pct,
 
-    -- ─── NORMALIZED PRICING (INFLATION-ADJUSTED) ────────────────────────
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 2) AS bp_inflation_adjusted_unit_price_eur,
-    ROUND(br.bp_total_price * (1 + br.cpi_inflation_pct / 100), 2) AS bp_inflation_adjusted_total_price_eur,
-    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS lp_inflation_adjusted_unit_price_eur,
-    ROUND(qi_lp.total_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS lp_inflation_adjusted_total_price_eur,
+    -- ─── LP INFLATION (TWO TYPES) ───────────────────────────────────────
+    -- Lines 5567-5581 in pipeline_stage_123_v3.py
+    ROUND(br.inflation_pct_last, 4) AS lp_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct_last, 4) AS lp_cpi_inflation_pct,
 
-    -- ─── SAVINGS / OVERPAYMENT ──────────────────────────────────────────
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100) - qi_current.unit_price_eur, 2) AS bp_adjusted_vs_current_unit_diff_eur,
-    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100) - qi_current.unit_price_eur, 2) AS lp_adjusted_vs_current_unit_diff_eur,
+    -- ─── NORMALIZED PRICING (USING CPI INFLATION) ───────────────────────
+    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 2) AS bp_cpi_normalized_unit_price_eur,
+    ROUND(br.bp_total_price * (1 + br.cpi_inflation_pct / 100), 2) AS bp_cpi_normalized_total_price_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS lp_cpi_normalized_unit_price_eur,
+    ROUND(qi_lp.total_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) AS lp_cpi_normalized_total_price_eur,
+
+    -- ─── NORMALIZED PRICING (USING LLM INFLATION) ──────────────────────
+    ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 2) AS bp_llm_normalized_unit_price_eur,
+    ROUND(br.bp_total_price * (1 + br.inflation_pct / 100), 2) AS bp_llm_normalized_total_price_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 2) AS lp_llm_normalized_unit_price_eur,
+    ROUND(qi_lp.total_price_eur * (1 + br.inflation_pct_last / 100), 2) AS lp_llm_normalized_total_price_eur,
+
+    -- ─── SAVINGS / OVERPAYMENT (CPI-ADJUSTED) ──────────────────────────
+    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100) - qi_current.unit_price_eur, 2) AS bp_cpi_adjusted_vs_current_unit_diff_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100) - qi_current.unit_price_eur, 2) AS lp_cpi_adjusted_vs_current_unit_diff_eur,
 
     -- ─── CONTEXT ────────────────────────────────────────────────────────
-    br.similar_dtl_ids,  -- JSON: [375663, 375664, ...] list of other similar historical items
-    br.summary  -- LLM-generated benchmark recommendation
+    -- similar_dtl_ids = from Stage C LLM ranking shortlist (lines 7817 in v3)
+    br.similar_dtl_ids,
+    br.summary
 
 FROM ras_procurement.benchmark_result br
 INNER JOIN ras_procurement.quotation_extracted_items qi_current
     ON br.extracted_item_uuid_fk = qi_current.extracted_item_uuid_pk
 INNER JOIN ras_procurement.purchase_req_detail prd
     ON br.purchase_dtl_id = prd.PURCHASE_DTL_ID
+INNER JOIN ras_procurement.purchase_req_mst prm_current
+    ON prd.PURCHASE_REQ_ID = prm_current.PURCHASE_REQ_ID
 LEFT JOIN ras_procurement.quotation_extracted_items qi_bp
     ON br.low_hist_item_fk = qi_bp.extracted_item_uuid_pk
+LEFT JOIN ras_procurement.purchase_req_detail prd_bp
+    ON qi_bp.purchase_dtl_id = prd_bp.PURCHASE_DTL_ID
+LEFT JOIN ras_procurement.purchase_req_mst prm_bp
+    ON prd_bp.PURCHASE_REQ_ID = prm_bp.PURCHASE_REQ_ID
 LEFT JOIN ras_procurement.quotation_extracted_items qi_lp
     ON br.last_hist_item_fk = qi_lp.extracted_item_uuid_pk
+LEFT JOIN ras_procurement.purchase_req_detail prd_lp
+    ON qi_lp.purchase_dtl_id = prd_lp.PURCHASE_DTL_ID
+LEFT JOIN ras_procurement.purchase_req_mst prm_lp
+    ON prd_lp.PURCHASE_REQ_ID = prm_lp.PURCHASE_REQ_ID
 WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
 ORDER BY prd.PURCHASE_DTL_ID;
 
 -- ============================================================================
 -- QUERY 4: CURRENCY CONVERSION & INFLATION RATES
 -- ============================================================================
--- Returns:
---   CURRENCY: Source currency, original price, converted price (EUR)
---   INFLATION: BP and LP inflation rates (CPI-based) and adjusted prices
--- Inflation formula: normalized_price = historical_price * (1 + cpi_inflation_pct / 100)
+-- Returns BOTH LLM and CPI inflation for BOTH BP and LP
+--
+-- CURRENCY: Source currency → EUR conversion (stored at extraction time)
+-- INFLATION BP: inflation_pct (LLM) + cpi_inflation_pct (World Bank CPI)
+-- INFLATION LP: inflation_pct_last (LLM) + cpi_inflation_pct_last (World Bank CPI)
+--
+-- Reference dates:
+--   - Current item: prm_current.C_DATETIME (current PR master date)
+--   - BP item: prm_bp.C_DATETIME (BP item's PR master date, from line 5533)
+--   - LP item: prm_lp.C_DATETIME (LP item's PR master date, from line 5564)
 
 DECLARE @purchase_req_id INT = 152105;
 
@@ -224,43 +308,64 @@ SELECT
     prd.ITEMDESCRIPTION AS ras_item_description,
     qi.supplier_name,
 
-    -- ─── CURRENCY CONVERSION ────────────────────────────────────────────
-    qi.currency AS source_currency_iso_code,
+    -- ─── CURRENCY CONVERSION (CURRENT ITEM) ────────────────────────────
+    qi.currency AS source_currency,
     qi.unit_price AS unit_price_source_currency,
     qi.unit_price_eur AS unit_price_eur_converted,
     ROUND(qi.unit_price_eur / NULLIF(qi.unit_price, 0), 4) AS implied_exchange_rate,
-    CASE
-        WHEN qi.currency = 'EUR' THEN 'No conversion required'
-        ELSE 'Converted via v3 LLM pricing logic'
-    END AS currency_conversion_method,
-
     qi.total_price AS total_price_source_currency,
     qi.total_price_eur AS total_price_eur_converted,
 
-    -- ─── BP (BEST PRICE) INFLATION ──────────────────────────────────────
-    br.bp_unit_price AS bp_historical_unit_price_eur,
-    ROUND(br.inflation_pct, 2) AS bp_general_inflation_pct,
-    ROUND(br.cpi_inflation_pct, 2) AS bp_cpi_inflation_pct,
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) AS bp_inflation_adjusted_unit_price,
-    ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) AS bp_inflation_amount_eur,
+    -- ─── BP INFLATION CALCULATION (TWO SOURCES) ───────────────────────
+    -- Calculated at line 5542-5555 in pipeline_stage_123_v3.py
+    -- Uses BP item's supplier_country and PR date range
+    br.bp_unit_price AS bp_unit_price_eur,
+    ROUND(br.inflation_pct, 4) AS bp_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct, 4) AS bp_cpi_inflation_pct,
+    ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) AS bp_llm_inflation_amount_eur,
+    ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) AS bp_cpi_inflation_amount_eur,
+    ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) AS bp_llm_adjusted_unit_price,
+    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) AS bp_cpi_adjusted_unit_price,
+    prm_bp.C_DATETIME AS bp_pr_created_date,
+    YEAR(prm_bp.C_DATETIME) AS bp_pr_year,
 
-    -- ─── LP (LAST PURCHASE) INFLATION ───────────────────────────────────
-    br.bp_unit_price AS lp_historical_unit_price_eur,  -- LP uses same historical item as reference
-    ROUND(br.inflation_pct_last, 2) AS lp_general_inflation_pct,
-    ROUND(br.cpi_inflation_pct_last, 2) AS lp_cpi_inflation_pct,
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct_last / 100), 4) AS lp_inflation_adjusted_unit_price,
-    ROUND((br.cpi_inflation_pct_last / 100) * br.bp_unit_price, 4) AS lp_inflation_amount_eur,
+    -- ─── LP INFLATION CALCULATION (TWO SOURCES) ───────────────────────
+    -- Calculated at line 5567-5581 in pipeline_stage_123_v3.py
+    -- Uses LP item's supplier_country and PR date range
+    qi_lp.unit_price_eur AS lp_unit_price_eur,
+    ROUND(br.inflation_pct_last, 4) AS lp_llm_inflation_pct,
+    ROUND(br.cpi_inflation_pct_last, 4) AS lp_cpi_inflation_pct,
+    ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS lp_llm_inflation_amount_eur,
+    ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS lp_cpi_inflation_amount_eur,
+    ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) AS lp_llm_adjusted_unit_price,
+    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) AS lp_cpi_adjusted_unit_price,
+    prm_lp.C_DATETIME AS lp_pr_created_date,
+    YEAR(prm_lp.C_DATETIME) AS lp_pr_year,
 
     -- ─── REFERENCE DATES ────────────────────────────────────────────────
-    prd.C_DATETIME AS pr_created_date,
-    qi.item_created_date AS current_quote_created_date,
-    DATEDIFF(MONTH, prd.C_DATETIME, GETDATE()) AS months_since_pr_creation
+    prm_current.C_DATETIME AS current_pr_created_date,
+    YEAR(prm_current.C_DATETIME) AS current_pr_year,
+    qi.item_created_date AS current_quote_created_date
 
 FROM ras_procurement.quotation_extracted_items qi
 INNER JOIN ras_procurement.purchase_req_detail prd
     ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
+INNER JOIN ras_procurement.purchase_req_mst prm_current
+    ON prd.PURCHASE_REQ_ID = prm_current.PURCHASE_REQ_ID
 LEFT JOIN ras_procurement.benchmark_result br
     ON qi.extracted_item_uuid_pk = br.extracted_item_uuid_fk
+LEFT JOIN ras_procurement.quotation_extracted_items qi_bp
+    ON br.low_hist_item_fk = qi_bp.extracted_item_uuid_pk
+LEFT JOIN ras_procurement.purchase_req_detail prd_bp
+    ON qi_bp.purchase_dtl_id = prd_bp.PURCHASE_DTL_ID
+LEFT JOIN ras_procurement.purchase_req_mst prm_bp
+    ON prd_bp.PURCHASE_REQ_ID = prm_bp.PURCHASE_REQ_ID
+LEFT JOIN ras_procurement.quotation_extracted_items qi_lp
+    ON br.last_hist_item_fk = qi_lp.extracted_item_uuid_pk
+LEFT JOIN ras_procurement.purchase_req_detail prd_lp
+    ON qi_lp.purchase_dtl_id = prd_lp.PURCHASE_DTL_ID
+LEFT JOIN ras_procurement.purchase_req_mst prm_lp
+    ON prd_lp.PURCHASE_REQ_ID = prm_lp.PURCHASE_REQ_ID
 WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
 ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC;
 
