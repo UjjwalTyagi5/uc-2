@@ -419,6 +419,10 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="Run everything (DB read + blob download + LLM call) but skip the UPDATE.",
     )
+    parser.add_argument(
+        "--reset-progress", action="store_true",
+        help="Clear progress file at start (do not skip already-processed PRs).",
+    )
     args = parser.parse_args()
 
     # ── Build the LLM client ─────────────────────────────────────────────────
@@ -475,6 +479,15 @@ def main() -> None:
     except ImportError:
         logger.error("pandas required for progress tracking — pip install pandas openpyxl")
         sys.exit(1)
+
+    # Clear progress file if requested
+    if args.reset_progress:
+        if os.path.isfile(excel_file):
+            try:
+                os.remove(excel_file)
+                logger.info("Progress file cleared: %s", excel_file)
+            except Exception as exc:
+                logger.warning("Could not clear progress file: %s", exc)
 
     if args.pr_nos:
         pr_nos = args.pr_nos
