@@ -325,32 +325,32 @@ SELECT
 
     -- ─── LOW INFLATION (TWO TYPES) ──────────────────────────────────────
     -- Lines 5534-5541 in pipeline_stage_123_v3.py: if ref_year < current_year (year integers)
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.inflation_pct, 4) ELSE 0.0 END AS low_llm_inflation_pct,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.cpi_inflation_pct, 4) ELSE 0.0 END AS low_cpi_inflation_pct,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.inflation_pct, 4) ELSE 0.0 END AS low_llm_inflation_pct,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.cpi_inflation_pct, 4) ELSE 0.0 END AS low_cpi_inflation_pct,
 
     -- ─── LAST INFLATION (TWO TYPES) ──────────────────────────────────────
     -- Lines 5565-5566 in pipeline_stage_123_v3.py: if ref_year_last < current_year (year integers)
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.inflation_pct_last, 4) ELSE 0.0 END AS last_llm_inflation_pct,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE 0.0 END AS last_cpi_inflation_pct,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.inflation_pct_last, 4) ELSE 0.0 END AS last_llm_inflation_pct,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE 0.0 END AS last_cpi_inflation_pct,
 
     -- ─── NORMALIZED PRICING (USING CPI INFLATION) ───────────────────────
     -- Only calculated if year difference exists
-    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 2) ELSE br.bp_unit_price END AS low_cpi_normalized_unit_price_eur,
-    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.bp_total_price * (1 + br.cpi_inflation_pct / 100), 2) ELSE br.bp_total_price END AS low_cpi_normalized_total_price_eur,
-    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) ELSE qi_lp.unit_price_eur END AS last_cpi_normalized_unit_price_eur,
-    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(qi_lp.total_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) ELSE qi_lp.total_price_eur END AS last_cpi_normalized_total_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 2) ELSE br.bp_unit_price END AS low_cpi_normalized_unit_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(br.bp_total_price * (1 + br.cpi_inflation_pct / 100), 2) ELSE br.bp_total_price END AS low_cpi_normalized_total_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) ELSE qi_lp.unit_price_eur END AS last_cpi_normalized_unit_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(qi_lp.total_price_eur * (1 + br.cpi_inflation_pct_last / 100), 2) ELSE qi_lp.total_price_eur END AS last_cpi_normalized_total_price_eur,
 
     -- ─── NORMALIZED PRICING (USING LLM INFLATION) ──────────────────────
     -- Only calculated if year difference exists
-    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 2) ELSE br.bp_unit_price END AS low_llm_normalized_unit_price_eur,
-    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.bp_total_price * (1 + br.inflation_pct / 100), 2) ELSE br.bp_total_price END AS low_llm_normalized_total_price_eur,
-    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 2) ELSE qi_lp.unit_price_eur END AS last_llm_normalized_unit_price_eur,
-    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(qi_lp.total_price_eur * (1 + br.inflation_pct_last / 100), 2) ELSE qi_lp.total_price_eur END AS last_llm_normalized_total_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 2) ELSE br.bp_unit_price END AS low_llm_normalized_unit_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(br.bp_total_price * (1 + br.inflation_pct / 100), 2) ELSE br.bp_total_price END AS low_llm_normalized_total_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 2) ELSE qi_lp.unit_price_eur END AS last_llm_normalized_unit_price_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(qi_lp.total_price_eur * (1 + br.inflation_pct_last / 100), 2) ELSE qi_lp.total_price_eur END AS last_llm_normalized_total_price_eur,
 
     -- ─── SAVINGS / OVERPAYMENT (CPI-ADJUSTED) ──────────────────────────
     -- Only calculated if year difference exists
-    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100) - qi_current.unit_price_eur, 2) ELSE ROUND(br.bp_unit_price - qi_current.unit_price_eur, 2) END AS low_cpi_adjusted_vs_current_unit_diff_eur,
-    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100) - qi_current.unit_price_eur, 2) ELSE ROUND(qi_lp.unit_price_eur - qi_current.unit_price_eur, 2) END AS last_cpi_adjusted_vs_current_unit_diff_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100) - qi_current.unit_price_eur, 2) ELSE ROUND(br.bp_unit_price - qi_current.unit_price_eur, 2) END AS low_cpi_adjusted_vs_current_unit_diff_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, prm_current.C_DATETIME) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100) - qi_current.unit_price_eur, 2) ELSE ROUND(qi_lp.unit_price_eur - qi_current.unit_price_eur, 2) END AS last_cpi_adjusted_vs_current_unit_diff_eur,
 
     -- ─── CONTEXT ────────────────────────────────────────────────────────
     -- similar_dtl_ids = from Stage C LLM ranking shortlist (lines 7817 in v3)
@@ -412,24 +412,24 @@ SELECT
     -- ─── LOW INFLATION CALCULATION (TWO SOURCES) ─────────────────────
     -- Lines 5534-5556 in pipeline_stage_123_v3.py: if YEAR(ref_dt) < YEAR(created)
     br.bp_unit_price AS low_unit_price_eur,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.inflation_pct, 4) ELSE 0.0 END AS low_llm_inflation_pct,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.cpi_inflation_pct, 4) ELSE 0.0 END AS low_cpi_inflation_pct,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_llm_inflation_amount_eur,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_cpi_inflation_amount_eur,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_llm_adjusted_unit_price,
-    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_cpi_adjusted_unit_price,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.inflation_pct, 4) ELSE 0.0 END AS low_llm_inflation_pct,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.cpi_inflation_pct, 4) ELSE 0.0 END AS low_cpi_inflation_pct,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_llm_inflation_amount_eur,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_cpi_inflation_amount_eur,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_llm_adjusted_unit_price,
+    CASE WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_cpi_adjusted_unit_price,
     prm_bp.C_DATETIME AS low_pr_created_date,
     YEAR(prm_bp.C_DATETIME) AS low_pr_year,
 
     -- ─── LAST INFLATION CALCULATION (TWO SOURCES) ──────────────────
     -- Lines 5565-5581 in pipeline_stage_123_v3.py: if YEAR(ref_dt_last) < YEAR(created)
     qi_lp.unit_price_eur AS last_unit_price_eur,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.inflation_pct_last, 4) ELSE 0.0 END AS last_llm_inflation_pct,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE 0.0 END AS last_cpi_inflation_pct,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_llm_inflation_amount_eur,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_cpi_inflation_amount_eur,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_llm_adjusted_unit_price,
-    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(GETDATE()) THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_cpi_adjusted_unit_price,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.inflation_pct_last, 4) ELSE 0.0 END AS last_llm_inflation_pct,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE 0.0 END AS last_cpi_inflation_pct,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_llm_inflation_amount_eur,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_cpi_inflation_amount_eur,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_llm_adjusted_unit_price,
+    CASE WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_cpi_adjusted_unit_price,
     prm_lp.C_DATETIME AS last_pr_created_date,
     YEAR(prm_lp.C_DATETIME) AS last_pr_year,
 
