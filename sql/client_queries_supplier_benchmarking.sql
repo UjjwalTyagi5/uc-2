@@ -298,6 +298,7 @@ SELECT
     -- ─── LOW (LOWEST PRICE) — CHEAPEST FROM similar_dtl_ids ─────────────────
     -- Selected by _compute_low_last(): min(shortlist_dtl_ids, unit_price_eur)
     -- Does NOT filter for is_selected_quote (can be any quote from shortlist)
+    qi_bp.purchase_dtl_id AS low_dtl_id,
     qi_bp.supplier_name AS low_supplier_name,
     qi_bp.supplier_country AS low_supplier_country,
     qi_bp.currency AS low_currency,
@@ -311,6 +312,7 @@ SELECT
     -- ─── LAST (MOST RECENT) — MOST RECENT FROM similar_dtl_ids ────────────
     -- Selected by _compute_low_last(): max(shortlist_dtl_ids, pr_created_date)
     -- Most recent by purchase_req_mst.C_DATETIME
+    qi_lp.purchase_dtl_id AS last_dtl_id,
     qi_lp.supplier_name AS last_supplier_name,
     qi_lp.supplier_country AS last_supplier_country,
     qi_lp.currency AS last_currency,
