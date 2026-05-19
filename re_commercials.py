@@ -379,6 +379,21 @@ def _format_summary(results: list[dict]) -> str:
     return f"groups: {len(results)} ({', '.join(parts)}) — rows updated: {rows_updated}"
 
 
+def _is_pr_already_processed(excel_file: str, pr_no: str) -> bool:
+    """Check if PR was already successfully processed by reading progress file."""
+    if not os.path.isfile(excel_file):
+        return False
+    try:
+        import pandas as pd
+        df = pd.read_excel(excel_file)
+        # Check if this PR exists with status "ok"
+        matching = df[(df.get("pr_no") == pr_no) & (df.get("status") == "ok")]
+        return len(matching) > 0
+    except Exception as exc:
+        logger.debug("Could not check progress file: %s", exc)
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -497,6 +512,12 @@ def main() -> None:
 
         # Fetch & resolve for this PR only
         try:
+            # Check if PR was already processed successfully
+            if _is_pr_already_processed(excel_file, pr_no):
+                logger.info("[%s] already processed — skipping", pr_no)
+                results.append({"pr_no": pr_no, "status": "skipped", "reason": "already_processed", "timestamp": datetime.now().isoformat()})
+                continue
+
             row_groups = _fetch_existing_rows(TGT_CS, pr_no)
             if not row_groups:
                 logger.info("[%s] no quotation_extracted_items rows — skipping", pr_no)
