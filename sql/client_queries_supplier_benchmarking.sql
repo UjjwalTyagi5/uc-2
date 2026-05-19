@@ -412,7 +412,8 @@ SELECT
 
     -- ─── REFERENCE DATES ────────────────────────────────────────────────
     qi.quotation_date,
-    prm.C_DATETIME AS pr_created_date
+    prm.C_DATETIME AS pr_created_date,
+    prm.REQ_START_DATE AS pr_req_start_date
 
 FROM ras_procurement.quotation_extracted_items qi
 INNER JOIN ras_procurement.purchase_req_detail prd
