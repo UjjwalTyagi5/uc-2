@@ -259,23 +259,49 @@ v3 calculates **four inflation values**:
 - `inflation_pct_last` — LLM estimate for LP (line 5567-5577)
 - `cpi_inflation_pct_last` — World Bank CPI for LP (line 5574)
 
-### Reference Dates
+### Reference Dates & Year Comparison
 
-Each historical item uses its own PR date (from `purchase_req_mst.C_DATETIME`):
+Each historical item uses its own PR date (from `purchase_req_mst.C_DATETIME`), compared against the **CURRENT PR's year** (not today's date):
 
-**For BP:**
+**Current PR Year (for both BP and LP):**
+```python
+created = src_date  # From purchase_req_detail.C_DATETIME (line 7611)
+current_year = created.year  # Extract the year (line 7614 & 7824)
+```
+
+**For BP (Best Price):**
 ```python
 ref_dt = _get_pr_master_date_for_dtl_id(tgt_cs, low_item.purchase_dtl_id)  # Line 5533
-ref_year = ref_dt.year
-current_year = created.year  # Current PR year
+ref_year = ref_dt.year  # Historical BP item's PR year
+# Inflation only applies if: ref_year < current_year (line 5541)
 ```
 
-**For LP:**
+**For LP (Last Purchase):**
 ```python
 ref_dt_last = _get_pr_master_date_for_dtl_id(tgt_cs, last_item.purchase_dtl_id)  # Line 5564
-ref_year_last = ref_dt_last.year
-current_year = created.year
+ref_year_last = ref_dt_last.year  # Historical LP item's PR year
+# Inflation only applies if: ref_year_last < current_year (line 5566)
 ```
+
+### Year Comparison Logic
+
+**Inflation is calculated ONLY when:**
+```python
+if ref_year and current_year and ref_year < current_year:
+    # Calculate inflation
+else:
+    # No inflation (set to 0 or NULL)
+```
+
+**Example:**
+- Historical BP item: 2021 PR
+- Current PR: 2022 PR
+- Result: Apply 1 year of inflation ✓
+
+**NOT:**
+- Historical BP item: 2021 PR
+- Today's date: 2026
+- Result: Apply 5 years of inflation ✗ (INCORRECT)
 
 ### LLM Inflation Estimation
 
@@ -337,27 +363,80 @@ Used in view (vw_benchmark_summary.sql, lines 89-92 and 110).
 
 ## 7. Implementation References (v3)
 
-**Core Pipeline:**
-- `agentcore_components/pipeline_stage_123_v3.py`
-  - `_run_benchmark_v2()` line 7537 — Main orchestration
-  - `_sql_pool_by_category()` line 7149 — Stage A
-  - `_pinecone_narrow_within_pool()` line 7225 — Stage B
-  - `_llm_rank_candidates()` line 7355 — Stage C
-  - `_pre_filter_candidates()` line 7367 — Price ratio pre-filter
-  - `_compute_low_last()` line 4746 — BP/LP extraction
-  - `_estimate_inflation_via_llm()` line 5266 — LLM inflation
-  - `_compute_cpi_pct()` line 5216 — World Bank CPI
-  - `_get_pr_master_date_for_dtl_id()` line 5300 — PR date lookup
+### Core Pipeline
 
-**Schema:**
-- `migrations/create_vw_benchmark_summary.sql` — Benchmark view with normalized prices
+`agentcore_components/pipeline_stage_123_v3.py`
+- `_run_benchmark_v2()` line 7537 — Main orchestration
+  - Line 7614: `created = src_date` (Current PR's C_DATETIME)
+  - Line 7824: `current_year = created.year` (Current PR's year)
+- `_sql_pool_by_category()` line 7149 — Stage A (SQL category pool)
+- `_pinecone_narrow_within_pool()` line 7225 — Stage B (vector search)
+- `_llm_rank_candidates()` line 7355 — Stage C (LLM ranking)
+- `_pre_filter_candidates()` line 7367 — Price ratio pre-filter
+- `_compute_low_last()` line 4746 — BP/LP extraction
+- `_estimate_inflation_via_llm()` line 5266 — LLM inflation estimate
+  - Condition: `if ref_year and current_year and current_year > ref_year` (line 5273)
+- `_compute_cpi_pct()` line 5216 — World Bank CPI inflation
+  - Condition: `if start_year >= end_year: return None` (line 5222)
+  - Loop: `for yr in range(start_year + 1, end_year + 1)` (line 5257)
+- `_get_pr_master_date_for_dtl_id()` line 5300 — PR master date lookup
 
-**Client Queries:**
-- `sql/client_queries_supplier_benchmarking.sql` — All 4 queries (this documentation)
+**Inflation Application (lines 5541 & 5566):**
+```python
+if ref_year and current_year and ref_year < current_year:
+    infl_dec = _estimate_inflation_via_llm(...)
+    cpi_dec = _compute_cpi_pct(...)
+else:
+    infl_dec = cpi_dec = Decimal("0")
+```
+
+### Database Schema
+
+`migrations/create_vw_benchmark_summary.sql` — Benchmark summary view with normalized prices:
+- Lines 89-92: `low_hist_normalized_unit_price_eur = low_unit_price_eur × (1 + cpi_inflation_pct / 100)`
+- Lines 110: `last_hist_normalized_unit_price_eur = last_unit_price_eur × (1 + cpi_inflation_pct_last / 100)`
+
+### Client Queries
+
+`sql/client_queries_supplier_benchmarking.sql` — **5 queries for client analysis:**
+
+1. **Query 1: Supplier Hierarchy** — PRIMARY, SECONDARY L1, SECONDARY L2 suppliers
+2. **Query 2: Technical & Commercial Specs** — Item specs and quotation details per supplier
+3. **Query 3: Historical Benchmarking (BP & LP)** — Best Price and Last Purchase with inflation-adjusted pricing
+   - Year comparison: `YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME)`
+   - Normalized pricing: `bp_unit_price × (1 + cpi_inflation_pct / 100)`
+4. **Query 4: Currency Conversion & Inflation Rates** — Source→EUR conversion and both inflation types
+   - Year comparison: `YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME)`
+5. **Query 5: Validation** — Checks if stored inflation values match year comparison logic
+   - Flags: "Should inflate but inflation=0" or "Should NOT inflate but inflation>0"
 
 ---
 
-## 8. Glossary
+## 8. Important Notes
+
+### Year Comparison Bug Fix (2026-05-20)
+
+**The Issue:** Initial SQL implementation incorrectly compared inflation year ranges against today's date (`GETDATE()`), causing false inflation calculations.
+
+**Example of the bug:**
+- Historical item: 2021 PR
+- Current item: 2022 PR
+- Today: 2026
+- Bug calculation: 5 years of inflation (2021 → 2026) ✗
+- Correct calculation: 1 year of inflation (2021 → 2022) ✓
+
+**The Fix:**
+- Changed all year comparisons from `YEAR(...) < YEAR(GETDATE())` to `YEAR(...) < YEAR(prm_current.C_DATETIME)`
+- Aligned SQL logic exactly with Python v3 code (lines 5541, 5566)
+- Validates that `current_year` is derived from the current PR's `purchase_req_mst.C_DATETIME`, not today's date
+
+**Affected Queries:**
+- Query 3: Lines 328-348 (inflation flags, normalized pricing)
+- Query 4: Lines 415-434 (all inflation calculations)
+
+---
+
+## 9. Glossary
 
 | Term | Definition |
 |------|-----------|
@@ -372,7 +451,11 @@ Used in view (vw_benchmark_summary.sql, lines 89-92 and 110).
 | **item_level_1..8** | 8-level hierarchical taxonomy (Mechanical > Industrial Equipment > Mould Tooling > ...) |
 | **critical_attributes** | JSON array of must-match specs (importance="critical") |
 | **similar_dtl_ids** | JSON array of historical items ranked by LLM Stage C |
-| **cpi_inflation_pct** | World Bank CPI-based inflation % (BP) |
-| **cpi_inflation_pct_last** | World Bank CPI-based inflation % (LP) |
+| **cpi_inflation_pct** | World Bank CPI-based inflation % (BP) — Only applied when ref_year < current_year |
+| **cpi_inflation_pct_last** | World Bank CPI-based inflation % (LP) — Only applied when ref_year_last < current_year |
 | **Incoterms** | International Commercial Terms (FOB, CIF, DDP, etc.) |
 | **purchase_category_llm** | LLM-assigned category (used for Stage A SQL filtering) |
+| **ref_year** | Year extracted from historical item's PR date (`purchase_req_mst.C_DATETIME`) |
+| **ref_year_last** | Year extracted from LAST item's PR date (`purchase_req_mst.C_DATETIME`) |
+| **current_year** | Year of the CURRENT PR being benchmarked (from `purchase_req_mst.C_DATETIME`), NOT today's date |
+| **C_DATETIME** | Purchase requisition creation date in `purchase_req_mst` table — source for all year comparisons |
