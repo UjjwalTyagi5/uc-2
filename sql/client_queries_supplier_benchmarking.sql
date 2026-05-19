@@ -324,16 +324,14 @@ SELECT
     DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) AS last_years_ago,
 
     -- ─── LOW INFLATION (TWO TYPES) ──────────────────────────────────────
-    -- Lines 5542-5555 in pipeline_stage_123_v3.py
-    -- Only calculated if year difference exists (low_years_ago > 0)
-    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.inflation_pct, 4) ELSE NULL END AS low_llm_inflation_pct,
-    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.cpi_inflation_pct, 4) ELSE NULL END AS low_cpi_inflation_pct,
+    -- Lines 5539-5556 in pipeline_stage_123_v3.py: initialize to 0, only calculate if ref_year < current_year
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.inflation_pct, 4) ELSE 0.0 END AS low_llm_inflation_pct,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.cpi_inflation_pct, 4) ELSE 0.0 END AS low_cpi_inflation_pct,
 
     -- ─── LAST INFLATION (TWO TYPES) ──────────────────────────────────────
-    -- Lines 5567-5581 in pipeline_stage_123_v3.py
-    -- Only calculated if year difference exists (last_years_ago > 0)
-    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.inflation_pct_last, 4) ELSE NULL END AS last_llm_inflation_pct,
-    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE NULL END AS last_cpi_inflation_pct,
+    -- Lines 5540 and 5566-5581 in pipeline_stage_123_v3.py: initialize to 0, only calculate if ref_year_last < current_year
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.inflation_pct_last, 4) ELSE 0.0 END AS last_llm_inflation_pct,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE 0.0 END AS last_cpi_inflation_pct,
 
     -- ─── NORMALIZED PRICING (USING CPI INFLATION) ───────────────────────
     -- Only calculated if year difference exists
@@ -412,28 +410,28 @@ SELECT
     qi.total_price_eur AS total_price_eur_converted,
 
     -- ─── LOW INFLATION CALCULATION (TWO SOURCES) ─────────────────────
-    -- Calculated at line 5542-5555 in pipeline_stage_123_v3.py
-    -- Uses LOW item's supplier_country and PR date range
+    -- Lines 5539-5556 in pipeline_stage_123_v3.py
+    -- Condition: if ref_year < current_year (ref_year and current_year and ref_year < current_year)
     br.bp_unit_price AS low_unit_price_eur,
-    ROUND(br.inflation_pct, 4) AS low_llm_inflation_pct,
-    ROUND(br.cpi_inflation_pct, 4) AS low_cpi_inflation_pct,
-    ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) AS low_llm_inflation_amount_eur,
-    ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) AS low_cpi_inflation_amount_eur,
-    ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) AS low_llm_adjusted_unit_price,
-    ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) AS low_cpi_adjusted_unit_price,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.inflation_pct, 4) ELSE 0.0 END AS low_llm_inflation_pct,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.cpi_inflation_pct, 4) ELSE 0.0 END AS low_cpi_inflation_pct,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND((br.inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_llm_inflation_amount_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND((br.cpi_inflation_pct / 100) * br.bp_unit_price, 4) ELSE 0.0 END AS low_cpi_inflation_amount_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.bp_unit_price * (1 + br.inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_llm_adjusted_unit_price,
+    CASE WHEN DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.bp_unit_price * (1 + br.cpi_inflation_pct / 100), 4) ELSE ROUND(br.bp_unit_price, 4) END AS low_cpi_adjusted_unit_price,
     prm_bp.C_DATETIME AS low_pr_created_date,
     YEAR(prm_bp.C_DATETIME) AS low_pr_year,
 
     -- ─── LAST INFLATION CALCULATION (TWO SOURCES) ──────────────────
-    -- Calculated at line 5567-5581 in pipeline_stage_123_v3.py
-    -- Uses LAST item's supplier_country and PR date range
+    -- Lines 5540 and 5566-5581 in pipeline_stage_123_v3.py
+    -- Condition: if ref_year_last < current_year (ref_year_last and current_year and ref_year_last < current_year)
     qi_lp.unit_price_eur AS last_unit_price_eur,
-    ROUND(br.inflation_pct_last, 4) AS last_llm_inflation_pct,
-    ROUND(br.cpi_inflation_pct_last, 4) AS last_cpi_inflation_pct,
-    ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS last_llm_inflation_amount_eur,
-    ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) AS last_cpi_inflation_amount_eur,
-    ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) AS last_llm_adjusted_unit_price,
-    ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) AS last_cpi_adjusted_unit_price,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.inflation_pct_last, 4) ELSE 0.0 END AS last_llm_inflation_pct,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(br.cpi_inflation_pct_last, 4) ELSE 0.0 END AS last_cpi_inflation_pct,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND((br.inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_llm_inflation_amount_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND((br.cpi_inflation_pct_last / 100) * qi_lp.unit_price_eur, 4) ELSE 0.0 END AS last_cpi_inflation_amount_eur,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_llm_adjusted_unit_price,
+    CASE WHEN DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) > 0 THEN ROUND(qi_lp.unit_price_eur * (1 + br.cpi_inflation_pct_last / 100), 4) ELSE ROUND(qi_lp.unit_price_eur, 4) END AS last_cpi_adjusted_unit_price,
     prm_lp.C_DATETIME AS last_pr_created_date,
     YEAR(prm_lp.C_DATETIME) AS last_pr_year,
 
