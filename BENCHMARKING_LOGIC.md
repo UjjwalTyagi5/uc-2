@@ -1,7 +1,20 @@
 # RAS Procurement Benchmarking System v3 — Complete Logic Documentation
 
 **Version:** v3 (Uses `_run_benchmark_v2` only, from pipeline_stage_123_v3.py)  
-**Last Updated:** 2026-05-18
+**Last Updated:** 2026-05-20
+
+---
+
+## ⚠️ Key Design Decision: PR-Level Exchange Rates
+
+**All quotations within a single PR use the same exchange rate** — determined by the PR's start/creation date, NOT individual quotation dates. This ensures fair price comparison across all suppliers within a PR, even if quotes were issued on different dates.
+
+**Implementation:**
+- v3 line 4486: `fallback_date = ctx.req_start_date or ctx.c_datetime`
+- Used for all `_convert_to_eur()` calls during extraction (line 4356-4357)
+- Query 4 performs lookup using PR date to match this logic
+
+**Why:** Standardization. A PR evaluated on 2022-09-10 should use 2022-09-10 exchange rates for all quotes, regardless of whether quotes were issued on 2022-06-02 or 2022-09-15.
 
 ---
 
