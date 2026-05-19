@@ -16,7 +16,7 @@
 -- 4. Currency conversion & inflation rates
 -- ============================================================================
 
--- USAGE: Replace @purchase_req_id with the actual PR ID (e.g., 152105)
+-- USAGE: Replace @purchase_req_no with the actual PR number (e.g., 'R_152105/2021')
 
 -- ============================================================================
 -- QUERY 1: FETCH PRIMARY, SECONDARY SUPPLIERS FOR A RAS
@@ -28,13 +28,14 @@
 --
 -- NOTE: L1 and L2 include ALL suppliers (not filtered by is_selected_quote)
 
-DECLARE @purchase_req_id INT = 152105;
+DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
 -- ─── PRIMARY SUPPLIER: is_selected_quote = 1 ────────────────────────────
 -- Exactly one per item (purchase_dtl_id), the one selected by v3 extraction
 SELECT
     'PRIMARY' AS supplier_rank,
     prd.PURCHASE_DTL_ID AS item_id,
+    prm.PURCHASE_REQ_NO AS pr_number,
     qi.supplier_name,
     qi.supplier_country,
     qi.supplier_match_conf,
@@ -45,7 +46,9 @@ SELECT
 FROM ras_procurement.quotation_extracted_items qi
 INNER JOIN ras_procurement.purchase_req_detail prd
     ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
-WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+INNER JOIN ras_procurement.purchase_req_mst prm
+    ON prd.PURCHASE_REQ_ID = prm.PURCHASE_REQ_ID
+WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
   AND qi.is_selected_quote = 1
 ORDER BY prd.PURCHASE_DTL_ID;
 
@@ -55,6 +58,7 @@ ORDER BY prd.PURCHASE_DTL_ID;
 SELECT
     'SECONDARY_L1' AS supplier_rank,
     prd.PURCHASE_DTL_ID AS item_id,
+    prm.PURCHASE_REQ_NO AS pr_number,
     qi.supplier_name,
     qi.supplier_country,
     qi.supplier_match_conf,
@@ -66,6 +70,7 @@ FROM (
     SELECT
         qi.*,
         prd.PURCHASE_DTL_ID,
+        prm.PURCHASE_REQ_NO,
         ROW_NUMBER() OVER (
             PARTITION BY prd.PURCHASE_DTL_ID
             ORDER BY COALESCE(qi.unit_price_eur, qi.unit_price) ASC
@@ -73,7 +78,9 @@ FROM (
     FROM ras_procurement.quotation_extracted_items qi
     INNER JOIN ras_procurement.purchase_req_detail prd
         ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
-    WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+    INNER JOIN ras_procurement.purchase_req_mst prm
+        ON prd.PURCHASE_REQ_ID = prm.PURCHASE_REQ_ID
+    WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
       AND qi.is_selected_quote = 0
       AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
 ) qi
@@ -85,6 +92,7 @@ ORDER BY PURCHASE_DTL_ID;
 SELECT
     'SECONDARY_L2' AS supplier_rank,
     prd.PURCHASE_DTL_ID AS item_id,
+    prm.PURCHASE_REQ_NO AS pr_number,
     qi.supplier_name,
     qi.supplier_country,
     qi.supplier_match_conf,
@@ -96,6 +104,7 @@ FROM (
     SELECT
         qi.*,
         prd.PURCHASE_DTL_ID,
+        prm.PURCHASE_REQ_NO,
         ROW_NUMBER() OVER (
             PARTITION BY prd.PURCHASE_DTL_ID
             ORDER BY COALESCE(qi.unit_price_eur, qi.unit_price) ASC
@@ -103,7 +112,9 @@ FROM (
     FROM ras_procurement.quotation_extracted_items qi
     INNER JOIN ras_procurement.purchase_req_detail prd
         ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
-    WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+    INNER JOIN ras_procurement.purchase_req_mst prm
+        ON prd.PURCHASE_REQ_ID = prm.PURCHASE_REQ_ID
+    WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
       AND qi.is_selected_quote = 0
       AND COALESCE(qi.unit_price_eur, qi.unit_price) IS NOT NULL
 ) qi
@@ -118,10 +129,11 @@ ORDER BY PURCHASE_DTL_ID;
 --   COMMERCIAL: quotation terms, payment, delivery, pricing
 -- Rows are grouped by item (PURCHASE_DTL_ID) and supplier
 
-DECLARE @purchase_req_id INT = 152105;
+DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
 SELECT
     prd.PURCHASE_DTL_ID AS item_id,
+    prm.PURCHASE_REQ_NO AS pr_number,
     prd.ITEMDESCRIPTION AS ras_item_description,
     qi.supplier_name,
     qi.supplier_country,
@@ -175,7 +187,9 @@ SELECT
 FROM ras_procurement.quotation_extracted_items qi
 INNER JOIN ras_procurement.purchase_req_detail prd
     ON qi.purchase_dtl_id = prd.PURCHASE_DTL_ID
-WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+INNER JOIN ras_procurement.purchase_req_mst prm
+    ON prd.PURCHASE_REQ_ID = prm.PURCHASE_REQ_ID
+WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC, qi.total_price_eur;
 
 -- ============================================================================
@@ -196,10 +210,11 @@ ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC, qi.total_price_eur;
 --   bp_normalized = bp_unit_price × (1 + cpi_inflation_pct / 100)
 --   lp_normalized = lp_unit_price × (1 + cpi_inflation_pct_last / 100)
 
-DECLARE @purchase_req_id INT = 152105;
+DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
 SELECT
     prd.PURCHASE_DTL_ID AS item_id,
+    prm_current.PURCHASE_REQ_NO AS pr_number,
     prd.ITEMDESCRIPTION AS ras_item_description,
 
     -- ─── CURRENT SUPPLIER (THIS RAS) ─────────────────────────────────────
@@ -219,6 +234,7 @@ SELECT
     qi_bp.unit_price_eur AS bp_unit_price_eur,
     qi_bp.total_price_eur AS bp_total_price_eur,
     qi_bp.quotation_date AS bp_quotation_date,
+    prm_bp.PURCHASE_REQ_NO AS bp_pr_number,
     prm_bp.C_DATETIME AS bp_pr_created_date,
     DATEDIFF(YEAR, YEAR(prm_bp.C_DATETIME), YEAR(GETDATE())) AS bp_years_ago,
 
@@ -231,6 +247,7 @@ SELECT
     qi_lp.unit_price_eur AS lp_unit_price_eur,
     qi_lp.total_price_eur AS lp_total_price_eur,
     qi_lp.quotation_date AS lp_quotation_date,
+    prm_lp.PURCHASE_REQ_NO AS lp_pr_number,
     prm_lp.C_DATETIME AS lp_pr_created_date,
     DATEDIFF(YEAR, YEAR(prm_lp.C_DATETIME), YEAR(GETDATE())) AS lp_years_ago,
 
@@ -284,7 +301,7 @@ LEFT JOIN ras_procurement.purchase_req_detail prd_lp
     ON qi_lp.purchase_dtl_id = prd_lp.PURCHASE_DTL_ID
 LEFT JOIN ras_procurement.purchase_req_mst prm_lp
     ON prd_lp.PURCHASE_REQ_ID = prm_lp.PURCHASE_REQ_ID
-WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID;
 
 -- ============================================================================
@@ -301,10 +318,11 @@ ORDER BY prd.PURCHASE_DTL_ID;
 --   - BP item: prm_bp.C_DATETIME (BP item's PR master date, from line 5533)
 --   - LP item: prm_lp.C_DATETIME (LP item's PR master date, from line 5564)
 
-DECLARE @purchase_req_id INT = 152105;
+DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
 
 SELECT
     prd.PURCHASE_DTL_ID AS item_id,
+    prm_current.PURCHASE_REQ_NO AS pr_number,
     prd.ITEMDESCRIPTION AS ras_item_description,
     qi.supplier_name,
 
@@ -366,7 +384,7 @@ LEFT JOIN ras_procurement.purchase_req_detail prd_lp
     ON qi_lp.purchase_dtl_id = prd_lp.PURCHASE_DTL_ID
 LEFT JOIN ras_procurement.purchase_req_mst prm_lp
     ON prd_lp.PURCHASE_REQ_ID = prm_lp.PURCHASE_REQ_ID
-WHERE prd.PURCHASE_REQ_ID = @purchase_req_id
+WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC;
 
 -- ============================================================================
