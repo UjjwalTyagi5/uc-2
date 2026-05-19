@@ -461,5 +461,86 @@ WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC;
 
 -- ============================================================================
+-- QUERY 5: VALIDATION — CHECK INFLATION LOGIC MATCHES v3 PIPELINE
+-- ============================================================================
+-- Validates inflation is applied ONLY when: ref_year < current_year (both exist)
+-- Reference: Pipeline lines 5541 (LOW) and 5566 (LAST)
+--
+-- v3 Logic:
+--   if ref_year and current_year and ref_year < current_year:
+--       calculate inflation
+--   else:
+--       inflation = 0 (or stays NULL)
+--
+-- Flags rows where actual behavior differs from expected
+
+DECLARE @purchase_req_no NVARCHAR(50) = 'R_152105/2021';
+
+SELECT
+    prd.PURCHASE_DTL_ID AS item_id,
+    prm_current.PURCHASE_REQ_NO AS pr_number,
+    YEAR(prm_current.C_DATETIME) AS current_pr_year,
+
+    -- LOW ITEM: Check if inflation conditions are met
+    CASE WHEN prm_bp.C_DATETIME IS NULL THEN NULL ELSE YEAR(prm_bp.C_DATETIME) END AS low_pr_year,
+    CASE
+        WHEN prm_bp.C_DATETIME IS NULL THEN 'NO_LOW_ITEM'
+        WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN 'SHOULD_INFLATE'
+        WHEN YEAR(prm_bp.C_DATETIME) = YEAR(prm_current.C_DATETIME) THEN 'SAME_YEAR'
+        ELSE 'FUTURE_ITEM'
+    END AS low_expected_condition,
+    br.cpi_inflation_pct AS low_cpi_stored,
+    CASE
+        WHEN prm_bp.C_DATETIME IS NULL AND (br.cpi_inflation_pct IS NOT NULL AND br.cpi_inflation_pct > 0)
+            THEN 'ERROR: No LOW item but inflation > 0'
+        WHEN YEAR(prm_bp.C_DATETIME) < YEAR(prm_current.C_DATETIME) AND (br.cpi_inflation_pct IS NULL OR br.cpi_inflation_pct = 0)
+            THEN 'ERROR: Should inflate but inflation = 0'
+        WHEN YEAR(prm_bp.C_DATETIME) >= YEAR(prm_current.C_DATETIME) AND (br.cpi_inflation_pct IS NOT NULL AND br.cpi_inflation_pct > 0)
+            THEN 'ERROR: Should NOT inflate but inflation > 0'
+        ELSE 'OK'
+    END AS low_validation_status,
+
+    -- LAST ITEM: Check if inflation conditions are met
+    CASE WHEN prm_lp.C_DATETIME IS NULL THEN NULL ELSE YEAR(prm_lp.C_DATETIME) END AS last_pr_year,
+    CASE
+        WHEN prm_lp.C_DATETIME IS NULL THEN 'NO_LAST_ITEM'
+        WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) THEN 'SHOULD_INFLATE'
+        WHEN YEAR(prm_lp.C_DATETIME) = YEAR(prm_current.C_DATETIME) THEN 'SAME_YEAR'
+        ELSE 'FUTURE_ITEM'
+    END AS last_expected_condition,
+    br.cpi_inflation_pct_last AS last_cpi_stored,
+    CASE
+        WHEN prm_lp.C_DATETIME IS NULL AND (br.cpi_inflation_pct_last IS NOT NULL AND br.cpi_inflation_pct_last > 0)
+            THEN 'ERROR: No LAST item but inflation > 0'
+        WHEN YEAR(prm_lp.C_DATETIME) < YEAR(prm_current.C_DATETIME) AND (br.cpi_inflation_pct_last IS NULL OR br.cpi_inflation_pct_last = 0)
+            THEN 'ERROR: Should inflate but inflation = 0'
+        WHEN YEAR(prm_lp.C_DATETIME) >= YEAR(prm_current.C_DATETIME) AND (br.cpi_inflation_pct_last IS NOT NULL AND br.cpi_inflation_pct_last > 0)
+            THEN 'ERROR: Should NOT inflate but inflation > 0'
+        ELSE 'OK'
+    END AS last_validation_status
+
+FROM ras_procurement.benchmark_result br
+INNER JOIN ras_procurement.quotation_extracted_items qi_current
+    ON br.extracted_item_uuid_fk = qi_current.extracted_item_uuid_pk
+INNER JOIN ras_procurement.purchase_req_detail prd
+    ON br.purchase_dtl_id = prd.PURCHASE_DTL_ID
+INNER JOIN ras_procurement.purchase_req_mst prm_current
+    ON prd.PURCHASE_REQ_ID = prm_current.PURCHASE_REQ_ID
+LEFT JOIN ras_procurement.quotation_extracted_items qi_bp
+    ON br.low_hist_item_fk = qi_bp.extracted_item_uuid_pk
+LEFT JOIN ras_procurement.purchase_req_detail prd_bp
+    ON qi_bp.purchase_dtl_id = prd_bp.PURCHASE_DTL_ID
+LEFT JOIN ras_procurement.purchase_req_mst prm_bp
+    ON prd_bp.PURCHASE_REQ_ID = prm_bp.PURCHASE_REQ_ID
+LEFT JOIN ras_procurement.quotation_extracted_items qi_lp
+    ON br.last_hist_item_fk = qi_lp.extracted_item_uuid_pk
+LEFT JOIN ras_procurement.purchase_req_detail prd_lp
+    ON qi_lp.purchase_dtl_id = prd_lp.PURCHASE_DTL_ID
+LEFT JOIN ras_procurement.purchase_req_mst prm_lp
+    ON prd_lp.PURCHASE_REQ_ID = prm_lp.PURCHASE_REQ_ID
+WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
+ORDER BY prd.PURCHASE_DTL_ID;
+
+-- ============================================================================
 -- END OF CLIENT QUERIES
 -- ============================================================================
