@@ -231,21 +231,42 @@ last_item = max(historical, key=pr_created_date)  # LP = most recent
 
 Prices are converted at **extraction time** (not dynamically updated):
 
-1. **LLM Extraction:** Extracts both `unit_price` (source) and `unit_price_eur` (if in document)
-2. **Fallback:** If `unit_price_eur` missing, apply historical exchange rate
-3. **Storage:** Both `unit_price` and `unit_price_eur` stored in DB
+**Function:** `_convert_to_eur()` (line 3945)
 
-**Exchange Rate Source:** Historical rates (market data, central bank)  
-**Applied:** At extraction; uses PR creation date for consistency
+**Process:**
+1. Extract both `unit_price` (source currency) and `currency` code from quotation
+2. Lookup source currency in `currency_mst` table → get CUR_ID
+3. Query `EXCHANGE_RATE` table for active rate:
+   ```sql
+   WHERE CUR_ID = source_currency_id
+     AND BASE_CUR_ID = 1 (EUR)
+     AND STATUS_ID = 10 (active)
+     AND FROM_DATE <= quotation_date
+     AND TO_DATE >= quotation_date
+   ```
+4. Apply conversion: `unit_price_eur = unit_price × CONVERSION_RATE`
+5. Storage: Both `unit_price` (source) and `unit_price_eur` (EUR) stored in DB
+
+**Exchange Rate Tables:**
+- `currency_mst` — Maps ISO currency codes (USD, INR, EUR, etc.) → CUR_ID
+- `EXCHANGE_RATE` — Contains:
+  - CUR_ID: source currency
+  - BASE_CUR_ID: target currency (1 = EUR)
+  - CONVERSION_RATE: rate to apply
+  - FROM_DATE, TO_DATE: validity period
+  - STATUS_ID: 10 = active rate
+
+**Exchange Rate Date:** Based on **quotation_date** (not today's date), ensuring historical accuracy
 
 ### In Benchmarking
 
 **For Current Item:**
-- `unit_price_eur` from `quotation_extracted_items`
+- `unit_price_eur` from `quotation_extracted_items` (pre-converted at extraction)
+- Exchange rate determined at quotation date
 
 **For BP & LP:**
 - Each uses its own PR's exchange rate (via `unit_price_eur` stored in DB)
-- No re-conversion; historical price already in EUR
+- No re-conversion; historical price already in EUR with rate from its own date
 
 ---
 
