@@ -461,12 +461,14 @@ LEFT JOIN ras_procurement.purchase_req_mst prm_lp
 -- Exchange rate details (v3 _convert_to_eur logic at lines 3973-4008)
 LEFT JOIN ras_procurement.currency_mst cm
     ON UPPER(cm.CURRENCY) = UPPER(qi.currency)
+LEFT JOIN ras_procurement.currency_mst cm_eur
+    ON UPPER(cm_eur.CURRENCY) = 'EUR'
 LEFT JOIN ras_procurement.EXCHANGE_RATE er
     ON cm.CUR_ID = er.CUR_ID
-    AND er.BASE_CUR_ID = 1  -- EUR_CUR_ID = 1 (target currency)
+    AND er.BASE_CUR_ID = cm_eur.CUR_ID
     AND er.STATUS_ID = 10   -- Active rate only
-    AND er.FROM_DATE <= CAST(qi.quotation_date AS DATE)
-    AND er.TO_DATE >= CAST(qi.quotation_date AS DATE)
+    AND er.FROM_DATE <= CAST(COALESCE(qi.quotation_date, qi.item_created_date, prm_current.C_DATETIME) AS DATE)
+    AND er.TO_DATE >= CAST(COALESCE(qi.quotation_date, qi.item_created_date, prm_current.C_DATETIME) AS DATE)
 WHERE prm_current.PURCHASE_REQ_NO = @purchase_req_no
 ORDER BY prd.PURCHASE_DTL_ID, qi.is_selected_quote DESC;
 
