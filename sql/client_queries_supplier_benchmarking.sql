@@ -307,7 +307,7 @@ SELECT
     qi_bp.quotation_date AS low_quotation_date,
     prm_bp.PURCHASE_REQ_NO AS low_pr_number,
     prm_bp.C_DATETIME AS low_pr_created_date,
-    DATEDIFF(YEAR, prm_bp.C_DATETIME, GETDATE()) AS low_years_ago,
+    DATEDIFF(YEAR, prm_bp.C_DATETIME, prm_current.C_DATETIME) AS low_years_ago,
 
     -- ─── LAST (MOST RECENT) — MOST RECENT FROM similar_dtl_ids ────────────
     -- Selected by _compute_low_last(): max(shortlist_dtl_ids, pr_created_date)
@@ -321,7 +321,7 @@ SELECT
     qi_lp.quotation_date AS last_quotation_date,
     prm_lp.PURCHASE_REQ_NO AS last_pr_number,
     prm_lp.C_DATETIME AS last_pr_created_date,
-    DATEDIFF(YEAR, prm_lp.C_DATETIME, GETDATE()) AS last_years_ago,
+    DATEDIFF(YEAR, prm_lp.C_DATETIME, prm_current.C_DATETIME) AS last_years_ago,
 
     -- ─── LOW INFLATION (TWO TYPES) ──────────────────────────────────────
     -- Lines 5534-5541 in pipeline_stage_123_v3.py: if ref_year < current_year (year integers)
