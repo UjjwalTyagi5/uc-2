@@ -250,6 +250,7 @@ SELECT
     qi.total_price_eur,
 
     -- Selection status
+    qi.is_selected_quote,
     CASE WHEN qi.is_selected_quote = 1 THEN 'PRIMARY SELECTED' ELSE 'ALTERNATIVE' END AS supplier_rank,
     qi.quote_rank AS rank_within_supplier
 
