@@ -428,8 +428,8 @@ LEFT JOIN ras_procurement.EXCHANGE_RATE er
     ON cm.CUR_ID = er.CUR_ID
     AND er.BASE_CUR_ID = cm_eur.CUR_ID
     AND er.STATUS_ID = 10   -- Active rate only
-    AND er.FROM_DATE <= CAST(COALESCE(qi.quotation_date, prm.C_DATETIME) AS DATE)
-    AND er.TO_DATE >= CAST(COALESCE(qi.quotation_date, prm.C_DATETIME) AS DATE)
+    AND er.FROM_DATE <= CAST(prm.C_DATETIME AS DATE)   -- PR date (matches v3 logic)
+    AND er.TO_DATE >= CAST(prm.C_DATETIME AS DATE)     -- PR date (matches v3 logic)
 WHERE prm.PURCHASE_REQ_NO = @purchase_req_no
   AND qi.is_selected_quote = 1
 ORDER BY prd.PURCHASE_DTL_ID;
