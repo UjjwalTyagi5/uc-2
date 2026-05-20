@@ -769,55 +769,6 @@ class FileExtractor:
         return False
 
 
-# ── Blob connector lookup ─────────────────────────────────────────────────
-
-def _get_blob_config_by_name(connector_name: str) -> dict:
-    name = (connector_name or "").strip()
-    if not name:
-        raise ValueError("blob_connector_name is empty. Enter the connector name from Settings → Connectors.")
-    try:
-        import asyncio
-        import concurrent.futures as _cf
-        from sqlalchemy import select
-
-        async def _fetch():
-            from agentcore.services.deps import get_db_service
-            from agentcore.services.database.models.connector_catalogue.model import ConnectorCatalogue
-            db_service = get_db_service()
-            async with db_service.with_session() as session:
-                stmt = (
-                    select(ConnectorCatalogue)
-                    .where(ConnectorCatalogue.name == name)
-                    .where(ConnectorCatalogue.provider == "azure_blob")
-                )
-                result = await session.execute(stmt)
-                row = result.scalars().first()
-                if row is None:
-                    raise ValueError(f"No azure_blob connector named {name!r} found. Check Settings → Connectors.")
-                cfg            = row.provider_config or {}
-                account_url    = (cfg.get("account_url") or row.host or "").strip()
-                container_name = (cfg.get("container_name") or row.database_name or "").strip()
-                from urllib.parse import urlparse
-                if not urlparse(account_url).netloc:
-                    raise ValueError(
-                        f"Azure Blob connector {name!r} has an invalid Storage Account URL: {account_url!r}. "
-                        f"Set the full URL in Settings → Connectors, e.g. https://youraccount.blob.core.windows.net"
-                    )
-                if not container_name:
-                    raise ValueError(f"Azure Blob connector {name!r} has no container_name.")
-                return {"account_url": account_url, "container_name": container_name}
-
-        try:
-            asyncio.get_running_loop()
-            with _cf.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, _fetch()).result(timeout=10)
-        except RuntimeError:
-            return asyncio.run(_fetch())
-    except Exception as exc:
-        raise RuntimeError(f"Blob connector lookup failed: {exc}") from exc
-
-
-
 # ── Stage 4-8 helpers (inlined) ─────────────────────────────────────────────
 
 # ── Stage IDs ─────────────────────────────────────────────────────────────────
@@ -2234,13 +2185,10 @@ def _download_blob(blob_path: str, blob_cfg: dict) -> bytes:
         blob = client.get_blob_client(container=blob_cfg["container_name"], blob=blob_path)
         return blob.download_blob().readall()
     else:
-        # Fallback: legacy connector config (from AgentCore)
+        # Connector catalogue config (from AgentCore): use all available auth methods
         from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
-        credential = DefaultAzureCredential(
-            exclude_environment_credential=True,
-            exclude_interactive_browser_credential=True,
-        )
+        credential = DefaultAzureCredential()
         client = BlobServiceClient(
             account_url=blob_cfg["account_url"], credential=credential
         )
@@ -9355,10 +9303,7 @@ class PipelineStage123NodeV2(Node):
             from azure.identity import DefaultAzureCredential
             from azure.storage.blob import BlobServiceClient
             cfg        = self._blob_cfg()
-            credential = DefaultAzureCredential(
-                exclude_cli_credential=True,
-                exclude_interactive_browser_credential=True,
-            )
+            credential = DefaultAzureCredential()
             self._container_client_cache = BlobServiceClient(
                 account_url=cfg["account_url"],
                 credential=credential,
