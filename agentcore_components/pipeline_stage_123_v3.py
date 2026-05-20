@@ -9356,7 +9356,7 @@ class PipelineStage123NodeV2(Node):
             from azure.storage.blob import BlobServiceClient
             cfg        = self._blob_cfg()
             credential = DefaultAzureCredential(
-                exclude_environment_credential=True,
+                exclude_cli_credential=True,
                 exclude_interactive_browser_credential=True,
             )
             self._container_client_cache = BlobServiceClient(
