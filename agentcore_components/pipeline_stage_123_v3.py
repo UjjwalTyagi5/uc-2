@@ -6678,16 +6678,20 @@ def _call_commercials_llm(
     items: list,
     prompts: dict | None,
 ) -> str:
-    """Commercials LLM call — mirrors _call_extraction_llm_v2's vision handling
-    so scanned quotations still work. Uses the same retry helper."""
+    """Commercials LLM call — text-only (no images) for speed.
+    Commercials extraction is text-based (incoterms, freight, taxes);
+    images cause 79+ second timeouts due to large base64 encoding."""
     from langchain_core.messages import HumanMessage, SystemMessage
     user_prompt = _build_commercials_user_prompt(ctx, doc, items, prompts)
     sys_prompt  = (prompts or {}).get("commercials_system_v2", COMMERCIALS_SYSTEM_PROMPT_V2)
-    max_images  = max(1, int((prompts or {}).get("ext_max_images", 50)))
 
     messages: list = [SystemMessage(content=sys_prompt)]
-    img_count, img_detail = 0, "n/a"
-    if doc.is_image_based and doc.images:
+    # Commercials extraction: text-only, skip images to avoid Azure slowness
+    img_count = 0
+    img_detail = "n/a"
+    if False:  # Disabled: images cause 79+ second timeouts
+        max_images  = max(1, int((prompts or {}).get("ext_max_images", 50)))
+    if doc.is_image_based and doc.images and False:  # Never true now
         if len(doc.images) > max_images:
             logger.warning(
                 "[V2-Commercials PR={}] Quotation has {} image(s) but max_images={} — truncating to first {}",
