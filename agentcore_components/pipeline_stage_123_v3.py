@@ -6697,12 +6697,18 @@ def _call_commercials_llm(
         img_count  = len(images)
         img_detail = "low" if doc.text else "high"
         content_parts: list = [{"type": "text", "text": user_prompt}]
+        total_img_bytes = 0
         for b64 in images:
+            total_img_bytes += len(b64)
             content_parts.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/png;base64,{b64}", "detail": img_detail},
             })
         messages.append(HumanMessage(content=content_parts))
+        logger.info(
+            "[V2-Commercials PR={}] Images: {} total base64 bytes ({} KB per image avg)",
+            ctx.purchase_req_no, total_img_bytes, total_img_bytes // max(1, img_count) // 1024,
+        )
     else:
         messages.append(HumanMessage(content=user_prompt))
 
