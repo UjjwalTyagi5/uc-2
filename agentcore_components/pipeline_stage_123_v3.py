@@ -8932,8 +8932,15 @@ class PipelineStage123NodeV2(Node):
                     )
                     self._safe_log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_ids)} ID(s) sent for removal")
                 except Exception as exc:
-                    error_msg = f"CRITICAL: Pinecone cleanup FAILED — PR marked as exception: {exc}"
-                    self._safe_log(f"[{pr_no}] ❌ {error_msg}")
+                    error_msg = (
+                        f"❌ Pinecone vector cleanup FAILED. Cannot delete old embeddings. "
+                        f"Reason: {str(exc)}. "
+                        f"Check: (1) Pinecone API key is valid, "
+                        f"(2) Index name '{pinecone_index}' and namespace '{pinecone_ns}' exist, "
+                        f"(3) Network connectivity to Pinecone. "
+                        f"PR cannot proceed until cleanup succeeds."
+                    )
+                    self._safe_log(f"[{pr_no}] {error_msg}")
                     logger.opt(exception=True).error(f"[{pr_no}] {error_msg}")
 
                     # Record exception in DB
@@ -8957,8 +8964,15 @@ class PipelineStage123NodeV2(Node):
         try:
             self._delete_blob_folder(pr_no)
         except Exception as exc:
-            error_msg = f"CRITICAL: Blob folder cleanup FAILED — PR marked as exception: {exc}"
-            self._safe_log(f"[{pr_no}] ❌ {error_msg}")
+            error_msg = (
+                f"❌ Azure Blob Storage cleanup FAILED. Cannot delete old files. "
+                f"Reason: {str(exc)}. "
+                f"Check: (1) Azure CLI is installed and logged in (run: az login), "
+                f"(2) Storage account access permissions, "
+                f"(3) Network connectivity to Azure. "
+                f"PR cannot proceed until cleanup succeeds."
+            )
+            self._safe_log(f"[{pr_no}] {error_msg}")
             logger.opt(exception=True).error(f"[{pr_no}] {error_msg}")
 
             # Record exception in DB
@@ -9695,8 +9709,18 @@ class PipelineStage123NodeV2(Node):
                 self._safe_log(f"[{pr_no}] Warning — BI dashboard sync failed (non-fatal): {_bi_exc}")
 
             if not attachments:
-                self._safe_log(f"[{pr_no}] No attachments — skipping (PR has no on-prem files)")
-                result["status"] = "skipped"
+                error_msg = "❌ No attachments found in on-prem RAS. Cannot proceed without quotation documents. Check if PR has associated files in the source system."
+                self._safe_log(f"[{pr_no}] {error_msg}")
+                logger.opt(exception=True).error(f"[{pr_no}] {error_msg}")
+
+                # Record exception in DB so user can investigate
+                try:
+                    self._record_exception(tgt_cs, pr_no, 99, error_msg)
+                except Exception as db_exc:
+                    logger.warning(f"[{pr_no}] Could not record no-attachments exception in DB: {db_exc}")
+
+                result["status"] = "exception"
+                result["error"] = error_msg
                 return result
 
             self._safe_log(f"[{pr_no}] Stage 1 — INGESTION complete")
