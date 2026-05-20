@@ -40,7 +40,7 @@ msg = HumanMessage(content=[
 
 start = time.time()
 try:
-    result = llm.invoke(msg)
+    result = llm.invoke([msg])  # Must pass list of messages
     elapsed = time.time() - start
     print(f"✓ Elapsed: {elapsed:.1f}s")
 except Exception as e:
@@ -54,7 +54,8 @@ print("\n" + "="*70)
 print("TEST 2: SystemMessage + HumanMessage with force_json (PRODUCTION)")
 print("="*70)
 
-sys_prompt = """You are a procurement analyst. Extract commercials data from quotations."""
+# Azure requires the word "json" in the prompt when using response_format=json_object
+sys_prompt = """You are a procurement analyst. Extract commercials data from quotations. Return JSON only."""
 user_prompt = long_text
 
 messages = [
