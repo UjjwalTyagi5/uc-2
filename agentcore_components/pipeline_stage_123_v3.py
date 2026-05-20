@@ -6706,9 +6706,16 @@ def _call_commercials_llm(
     else:
         messages.append(HumanMessage(content=user_prompt))
 
+    # Debug: log actual message sizes
+    user_prompt_bytes = len(user_prompt.encode('utf-8'))
+    sys_prompt = (prompts or {}).get("commercials_system_v2", COMMERCIALS_SYSTEM_PROMPT_V2)
+    sys_prompt_bytes = len(sys_prompt.encode('utf-8'))
+    total_bytes = user_prompt_bytes + sys_prompt_bytes
+
     logger.info(
-        "[V2-Commercials PR={}] Calling commercials LLM — {} image(s) detail={}, ~{:.0f} kB prompt",
-        ctx.purchase_req_no, img_count, img_detail, len(user_prompt) / 1024,
+        "[V2-Commercials PR={}] Calling commercials LLM — {} image(s) detail={}, user={:.1f}KB, sys={:.1f}KB, total={:.1f}KB",
+        ctx.purchase_req_no, img_count, img_detail,
+        user_prompt_bytes/1024, sys_prompt_bytes/1024, total_bytes/1024,
     )
     response = _call_llm_with_retry(llm, messages, prompts, force_json=True)
     return (getattr(response, "content", None) or str(response)).strip()

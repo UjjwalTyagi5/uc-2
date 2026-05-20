@@ -66,7 +66,7 @@ BLOB_CONTAINER = os.getenv("BLOB_CONTAINER", "quotations")
 # ── Tuning knobs passed straight through to the commercials helpers ──────────
 COMMERCIALS_PROMPTS: dict = {
     # mirrors the V2 pipeline defaults
-    "ext_max_chars":  int(os.getenv("EXT_MAX_CHARS",  "50000")),
+    "ext_max_chars":  int(os.getenv("EXT_MAX_CHARS",  "10000")),  # Reduced from 50000 to avoid LLM timeouts
     "ext_max_pages":  int(os.getenv("EXT_MAX_PAGES",  "20")),
     "ext_max_images": int(os.getenv("EXT_MAX_IMAGES", "50")),
     # LLM retry knobs reuse the pipeline defaults
