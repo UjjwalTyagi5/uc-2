@@ -2185,10 +2185,13 @@ def _download_blob(blob_path: str, blob_cfg: dict) -> bytes:
         blob = client.get_blob_client(container=blob_cfg["container_name"], blob=blob_path)
         return blob.download_blob().readall()
     else:
-        # Connector catalogue config (from AgentCore): use all available auth methods
+        # Connector catalogue config (from AgentCore): skip env/browser creds
         from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
-        credential = DefaultAzureCredential()
+        credential = DefaultAzureCredential(
+            exclude_environment_credential=True,
+            exclude_interactive_browser_credential=True,
+        )
         client = BlobServiceClient(
             account_url=blob_cfg["account_url"], credential=credential
         )
@@ -9303,7 +9306,10 @@ class PipelineStage123NodeV2(Node):
             from azure.identity import DefaultAzureCredential
             from azure.storage.blob import BlobServiceClient
             cfg        = self._blob_cfg()
-            credential = DefaultAzureCredential()
+            credential = DefaultAzureCredential(
+                exclude_environment_credential=True,
+                exclude_interactive_browser_credential=True,
+            )
             self._container_client_cache = BlobServiceClient(
                 account_url=cfg["account_url"],
                 credential=credential,
