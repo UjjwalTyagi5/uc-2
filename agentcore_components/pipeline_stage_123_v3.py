@@ -8912,7 +8912,7 @@ class PipelineStage123NodeV2(Node):
         finally:
             conn.close()
 
-        # Delete stale Pinecone vectors (non-fatal)
+        # Delete stale Pinecone vectors — CRITICAL (must succeed)
         if pinecone_ids:
             pinecone_index = (getattr(self, "pinecone_index", None) or "").strip()
             pinecone_ns    = (getattr(self, "pinecone_namespace", None) or "").strip()
@@ -8932,7 +8932,18 @@ class PipelineStage123NodeV2(Node):
                     )
                     self._safe_log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_ids)} ID(s) sent for removal")
                 except Exception as exc:
-                    self._safe_log(f"[{pr_no}] Warning — Pinecone cleanup failed (non-fatal): {exc}")
+                    error_msg = f"CRITICAL: Pinecone cleanup FAILED — PR marked as exception: {exc}"
+                    self._safe_log(f"[{pr_no}] ❌ {error_msg}")
+                    logger.opt(exception=True).error(f"[{pr_no}] {error_msg}")
+
+                    # Record exception in DB
+                    try:
+                        self._record_exception(tgt_cs, pr_no, 99, error_msg)
+                    except Exception as db_exc:
+                        logger.warning(f"[{pr_no}] Could not record Pinecone exception in DB: {db_exc}")
+
+                    # Raise to break pipeline for this PR
+                    raise RuntimeError(f"[{pr_no}] Pinecone cleanup failed — PR cannot proceed") from exc
             else:
                 self._safe_log(
                     f"[{pr_no}] Warning — pinecone_index or pinecone_namespace not set; "
@@ -8942,11 +8953,22 @@ class PipelineStage123NodeV2(Node):
         else:
             self._safe_log(f"[{pr_no}] No Pinecone vectors found in DB for this PR — skipping Pinecone delete")
 
-        # Delete Azure Blob folder (non-fatal)
+        # Delete Azure Blob folder — CRITICAL (must succeed)
         try:
             self._delete_blob_folder(pr_no)
         except Exception as exc:
-            self._safe_log(f"[{pr_no}] Warning — Blob folder cleanup failed (non-fatal): {exc}")
+            error_msg = f"CRITICAL: Blob folder cleanup FAILED — PR marked as exception: {exc}"
+            self._safe_log(f"[{pr_no}] ❌ {error_msg}")
+            logger.opt(exception=True).error(f"[{pr_no}] {error_msg}")
+
+            # Record exception in DB
+            try:
+                self._record_exception(tgt_cs, pr_no, 99, error_msg)
+            except Exception as db_exc:
+                logger.warning(f"[{pr_no}] Could not record blob exception in DB: {db_exc}")
+
+            # Raise to break pipeline for this PR
+            raise RuntimeError(f"[{pr_no}] Blob cleanup failed — PR cannot proceed") from exc
 
         self._safe_log(f"[{pr_no}] Cleanup complete — all pipeline tables cleared")
 
