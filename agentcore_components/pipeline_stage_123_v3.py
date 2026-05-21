@@ -1987,6 +1987,11 @@ Apply these rules in order:
 6. RECENCY TIE-BREAK.
    Among candidates that survive rules 1-3, prefer more recently created PRs.
 
+7. THE "NO-VACUUM" FALLBACK PRINCIPLE (NO EMPTY SELECTION ALLOWED FOR SIMILAR PRODUCTS).
+   An empty selected list is a failure for the pipeline. While rules 1-3 are strict, you must NEVER return an empty `selected` list if the candidate pool contains items that are semantically of the same product type or category. 
+   If you find yourself rejecting all candidates, relax your strict metric filters (such as critical attribute numeric limits or minor category name divergences). Pick the top K most similar items anyway, rank them accordingly, and explain the minor discrepancies in their `reason` field. 
+   Only return an empty `selected` list if all candidates are completely unrelated products (e.g. benchmarking a heavy machine against a software license).
+
 Return exactly K survivors as `selected`, with a short `reason` per row.
 Every rejected candidate goes under `rejected` with the rejecting rule and
 which attribute / level / ratio triggered the rejection.
@@ -7434,6 +7439,11 @@ def _pre_filter_candidates(source: dict, candidates: list[dict], prompts: dict |
         ratio = max(src_price, cand_price) / min(src_price, cand_price)
         if ratio <= max_ratio:
             filtered.append(c)
+        else:
+            logger.info(
+                f"Pre-filter: candidate dtl_id={c.get('purchase_dtl_id')} dropped. "
+                f"Price ratio ({cand_price} / {src_price} = {ratio:.2f}) exceeds max_ratio of {max_ratio}."
+            )
     return filtered
 
 
@@ -7477,12 +7487,24 @@ def _llm_rank_candidates(
         parsed = json.loads(raw)
         selected = parsed.get("selected", []) if isinstance(parsed, dict) else []
         rejected = parsed.get("rejected", []) if isinstance(parsed, dict) else []
+        
+        # Log ranking statistics and decisions for easy debugging
+        logger.info(
+            f"V2 rank LLM processed {len(candidates)} candidates. "
+            f"Selected: {len(selected)}, Rejected: {len(rejected)}"
+        )
+        for s in selected:
+            logger.info(f" -> SELECTED dtl_id={s.get('purchase_dtl_id')} (Rank {s.get('rank')}): {s.get('reason')}")
+        for r in rejected:
+            logger.info(f" -> REJECTED dtl_id={r.get('purchase_dtl_id')}: {r.get('reason')}")
+
         for i, s in enumerate(selected):
             if isinstance(s, dict):
                 s["rank"] = int(s.get("rank", i + 1))
         return selected, rejected
     except Exception as exc:
         logger.warning(f"V2 rank LLM failed: {exc}")
+        logger.warning(f"Raw response that failed to parse: {raw if 'raw' in locals() else 'None'}")
         return [], []
 
 
