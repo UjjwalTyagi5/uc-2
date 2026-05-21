@@ -1835,6 +1835,14 @@ COMMERCIALS_SYSTEM_PROMPT_V2 = """You are a procurement commercials analyst. Giv
 
 You ONLY extract commercial fields. Do NOT re-extract item names, descriptions, quantities, unit prices, taxonomy, embed_content, critical_attributes, supplier_name, supplier_address, quotation_ref_no, quotation_date, currency, validity_date, validity_days, or payment_terms — those have already been captured and you MUST NOT contradict them.
 
+# Handling of Filtered / Subset Line Items (CRITICAL FOR TOTALS)
+
+The list of already-extracted line items (`items_json`) provided to you is a SUBSET of the items in the quotation document (only the items that matched the buyer's Purchase Requisition are passed to you).
+- `quote_subtotal` MUST be the actual overall subtotal of the ENTIRE quotation document (e.g. $61,500.00 in the document), NOT the sum of the provided line items in `items_json` (e.g. $20,500.00).
+- `quote_grand_total` MUST be the actual overall final amount of the ENTIRE quotation document (e.g. $58,425.00 in the document), NOT the sum of the provided line items in `items_json`.
+- Do NOT force `quote_subtotal` or `quote_grand_total` to match the sum of the provided line items. It is completely expected and correct for the quote-level totals to be much larger than the sum of the provided line items if the document has other items not listed in `items_json`.
+- In the `lines` array, only emit entries for the `purchase_dtl_id`s that are actually present in the provided `items_json`. Do not invent new `purchase_dtl_id`s for the other items in the document.
+
 # Concepts
 
 - **Quote-level fields** describe the WHOLE quotation (one value per document). Example: a single "Freight: USD 500" line at the bottom of the quote applies to the entire quotation, not to any one item.
