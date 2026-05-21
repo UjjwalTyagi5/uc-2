@@ -47,6 +47,29 @@ try:
 except ImportError:
     pass
 
+import threading as _threading
+_blob_credential_lock = _threading.Lock()
+_blob_credential: "DefaultAzureCredential | None" = None
+_blob_client_cache: "dict[str, BlobServiceClient]" = {}
+
+def _get_blob_service_client(account_url: str):
+    """Get or create a cached BlobServiceClient (thread-safe singleton pattern)."""
+    global _blob_credential
+    if account_url not in _blob_client_cache:
+        with _blob_credential_lock:
+            if account_url not in _blob_client_cache:  # double-checked locking
+                if _blob_credential is None:
+                    from azure.identity import DefaultAzureCredential
+                    _blob_credential = DefaultAzureCredential(
+                        exclude_environment_credential=True,
+                        exclude_interactive_browser_credential=True,
+                    )
+                from azure.storage.blob import BlobServiceClient
+                _blob_client_cache[account_url] = BlobServiceClient(
+                    account_url=account_url, credential=_blob_credential
+                )
+    return _blob_client_cache[account_url]
+
 from agentcore.custom import Node
 from agentcore.io import BoolInput, HandleInput, IntInput, MessageTextInput, MultilineInput, Output
 from agentcore.schema.data import Data
@@ -2185,16 +2208,8 @@ def _download_blob(blob_path: str, blob_cfg: dict) -> bytes:
         blob = client.get_blob_client(container=blob_cfg["container_name"], blob=blob_path)
         return blob.download_blob().readall()
     else:
-        # Connector catalogue config (from AgentCore): skip env/browser creds
-        from azure.identity import DefaultAzureCredential
-        from azure.storage.blob import BlobServiceClient
-        credential = DefaultAzureCredential(
-            exclude_environment_credential=True,
-            exclude_interactive_browser_credential=True,
-        )
-        client = BlobServiceClient(
-            account_url=blob_cfg["account_url"], credential=credential
-        )
+        # Connector catalogue config: use cached BlobServiceClient (thread-safe singleton)
+        client = _get_blob_service_client(blob_cfg["account_url"])
         blob = client.get_blob_client(container=blob_cfg["container_name"], blob=blob_path)
         return blob.download_blob().readall()
 
