@@ -36,7 +36,7 @@ except ImportError:
     pass
 
 from agentcore.custom import Node
-from agentcore.io import HandleInput, MessageTextInput, Output
+from agentcore.io import FileInput, HandleInput, MessageTextInput, Output
 from agentcore.schema.data import Data
 from agentcore.schema.message import Message
 
@@ -209,38 +209,6 @@ def _bytes_from_data(data: Optional[Data]) -> Optional[bytes]:
     return None
 
 
-def _bytes_from_message(message) -> tuple[Optional[bytes], Optional[str]]:
-    """Pull (bytes, filename) from the first file attached to a chat
-    Message. ChatInput stores attachments under .files as a list of
-    host-side paths (or dict-like objects with a 'path' / 'name' field).
-    Returns (None, None) if no usable attachment is found."""
-    if message is None:
-        return None, None
-    files = getattr(message, "files", None)
-    if not files:
-        return None, None
-    first = files[0]
-    # Common shapes: str path, pathlib.Path, dict with 'path'/'name', or
-    # an object exposing .path / .name attributes.
-    path = None
-    name = None
-    if isinstance(first, str):
-        path = first
-        name = first.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    elif isinstance(first, dict):
-        path = first.get("path") or first.get("file_path") or first.get("url")
-        name = first.get("name") or first.get("filename")
-    else:
-        path = getattr(first, "path", None) or getattr(first, "file_path", None)
-        name = getattr(first, "name", None) or getattr(first, "filename", None)
-        if path is not None and not isinstance(path, str):
-            path = str(path)
-    if not path:
-        return None, None
-    with open(path, "rb") as fh:
-        return fh.read(), (name or path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])
-
-
 # ── Main component ────────────────────────────────────────────────────────────
 
 class AzureBlobFileOps(Node):
@@ -275,15 +243,17 @@ class AzureBlobFileOps(Node):
                 "procurement/2026-04/quote.pdf"
             ),
         ),
-        HandleInput(
-            name="chat_message",
-            display_name="Chat Message (file attachment, upload only)",
-            input_types=["Message"],
+        FileInput(
+            name="local_file",
+            display_name="File to Upload",
+            file_types=["*"],
             required=False,
             info=(
-                "Wire a Chat Input node here. Attach your Excel/PDF/etc. "
-                "via the chat panel's paperclip — the first attachment's "
-                "bytes are uploaded to the blob path."
+                "Upload your file directly on the node. AgentCore stores "
+                "it in its file store (the 'Knowledge Base' picker — used "
+                "purely as a staging area; no embeddings are created). "
+                "The component reads the bytes from there and writes them "
+                "to your Blob Path."
             ),
         ),
         HandleInput(
@@ -392,15 +362,14 @@ class AzureBlobFileOps(Node):
         """Return (bytes, source-label) for the upload payload.
 
         Resolution order:
-          1. chat_message     — first file attached to a wired ChatInput Message
+          1. local_file       — file uploaded via the canvas FileInput (KB-staged)
           2. file_data        — wired Data from an upstream node
           3. file_bytes_path  — typed absolute path on the host (self-hosted)
         """
-        msg = getattr(self, "chat_message", None)
-        raw, name = _bytes_from_message(msg)
-        if raw is not None:
-            label = f"chat attachment ({name})" if name else "chat attachment"
-            return raw, label
+        local_path = (getattr(self, "local_file", "") or "").strip()
+        if local_path:
+            with open(local_path, "rb") as fh:
+                return fh.read(), f"canvas upload ({local_path})"
 
         wired = getattr(self, "file_data", None)
         raw = _bytes_from_data(wired)
@@ -413,8 +382,8 @@ class AzureBlobFileOps(Node):
                 return fh.read(), f"host path ({path})"
 
         raise ValueError(
-            "Upload requires one of: Chat Message (with an attachment), "
-            "File Data (wired), or File Bytes Path. None were provided."
+            "Upload requires one of: File to Upload (canvas), File Data "
+            "(wired), or File Bytes Path. None were provided."
         )
 
     # ── Output methods ─────────────────────────────────────────────────────
