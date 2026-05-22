@@ -36,7 +36,7 @@ except ImportError:
     pass
 
 from agentcore.custom import Node
-from agentcore.io import HandleInput, MessageTextInput, Output
+from agentcore.io import FileInput, HandleInput, MessageTextInput, Output
 from agentcore.schema.data import Data
 from agentcore.schema.message import Message
 
@@ -243,26 +243,37 @@ class AzureBlobFileOps(Node):
                 "procurement/2026-04/quote.pdf"
             ),
         ),
+        FileInput(
+            name="local_file",
+            display_name="File to Upload",
+            file_types=["*"],
+            required=False,
+            info=(
+                "Drag-and-drop or browse a file from your machine. "
+                "AgentCore uploads it to the host and the component reads "
+                "the bytes from there. Used for the upload operation."
+            ),
+        ),
         HandleInput(
             name="file_data",
-            display_name="File Data (upload only)",
+            display_name="File Data (optional, upload only)",
             input_types=["Data"],
             required=False,
             info=(
-                "Wire a file-loader / Blob Reader / Knowledge Base node here. "
-                "Accepted Data shapes: data['bytes'] / data['file_bytes'] = "
-                "raw bytes (preferred); data['content'] / data['data'] = "
-                "bytes or utf-8 text."
+                "Alternative to File to Upload: wire a file-loader / Blob "
+                "Reader / Knowledge Base node here. Accepted Data shapes: "
+                "data['bytes'] / data['file_bytes'] = raw bytes (preferred); "
+                "data['content'] / data['data'] = bytes or utf-8 text."
             ),
         ),
         MessageTextInput(
             name="file_bytes_path",
-            display_name="File Bytes Path (upload only, optional)",
+            display_name="File Bytes Path (optional, upload only)",
             value="",
             advanced=True,
             info=(
-                "Absolute path to a local file to upload. Used only when "
-                "File Data is not wired."
+                "Absolute path to a file on the AgentCore host. Used only "
+                "when File to Upload and File Data are both empty."
             ),
         ),
     ]
@@ -344,18 +355,32 @@ class AzureBlobFileOps(Node):
 
         return _with_az_retry(_do, on_rebuild=self._invalidate_container_client)
 
-    def _resolve_upload_bytes(self) -> bytes:
+    def _resolve_upload_bytes(self) -> tuple[bytes, str]:
+        """Return (bytes, source-label) for the upload payload.
+
+        Resolution order:
+          1. local_file       — uploaded via the canvas FileInput
+          2. file_data        — wired Data from an upstream node
+          3. file_bytes_path  — typed absolute path on the host
+        """
+        local_path = (getattr(self, "local_file", "") or "").strip()
+        if local_path:
+            with open(local_path, "rb") as fh:
+                return fh.read(), f"canvas upload ({local_path})"
+
         wired = getattr(self, "file_data", None)
         raw = _bytes_from_data(wired)
         if raw is not None:
-            return raw
+            return raw, "wired File Data"
+
         path = (getattr(self, "file_bytes_path", "") or "").strip()
         if path:
             with open(path, "rb") as fh:
-                return fh.read()
+                return fh.read(), f"host path ({path})"
+
         raise ValueError(
-            "Upload requires either a wired File Data input or a "
-            "File Bytes Path. Neither was provided."
+            "Upload requires one of: File to Upload (canvas), File Data "
+            "(wired), or File Bytes Path. None were provided."
         )
 
     # ── Output methods ─────────────────────────────────────────────────────
@@ -370,9 +395,9 @@ class AzureBlobFileOps(Node):
 
         cfg = self._blob_cfg()
         if op == "upload":
-            raw = self._resolve_upload_bytes()
+            raw, source = self._resolve_upload_bytes()
             self._safe_log(
-                f"Uploading {len(raw)} byte(s) to "
+                f"Uploading {len(raw)} byte(s) from {source} to "
                 f"{cfg['container_name']}/{blob_path}"
             )
             self._upload_blob(raw, blob_path)
@@ -381,6 +406,7 @@ class AzureBlobFileOps(Node):
                 "container_name": cfg["container_name"],
                 "blob_path":      blob_path,
                 "bytes_written":  len(raw),
+                "source":         source,
                 "success":        True,
             }
             self._safe_log(f"Upload complete — {len(raw)} byte(s) → {blob_path}")
