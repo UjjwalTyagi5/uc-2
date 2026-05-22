@@ -36,7 +36,7 @@ except ImportError:
     pass
 
 from agentcore.custom import Node
-from agentcore.io import HandleInput, MessageTextInput, MultilineInput, Output
+from agentcore.io import HandleInput, MessageTextInput, Output
 from agentcore.schema.data import Data
 from agentcore.schema.message import Message
 
@@ -209,6 +209,38 @@ def _bytes_from_data(data: Optional[Data]) -> Optional[bytes]:
     return None
 
 
+def _bytes_from_message(message) -> tuple[Optional[bytes], Optional[str]]:
+    """Pull (bytes, filename) from the first file attached to a chat
+    Message. ChatInput stores attachments under .files as a list of
+    host-side paths (or dict-like objects with a 'path' / 'name' field).
+    Returns (None, None) if no usable attachment is found."""
+    if message is None:
+        return None, None
+    files = getattr(message, "files", None)
+    if not files:
+        return None, None
+    first = files[0]
+    # Common shapes: str path, pathlib.Path, dict with 'path'/'name', or
+    # an object exposing .path / .name attributes.
+    path = None
+    name = None
+    if isinstance(first, str):
+        path = first
+        name = first.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    elif isinstance(first, dict):
+        path = first.get("path") or first.get("file_path") or first.get("url")
+        name = first.get("name") or first.get("filename")
+    else:
+        path = getattr(first, "path", None) or getattr(first, "file_path", None)
+        name = getattr(first, "name", None) or getattr(first, "filename", None)
+        if path is not None and not isinstance(path, str):
+            path = str(path)
+    if not path:
+        return None, None
+    with open(path, "rb") as fh:
+        return fh.read(), (name or path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])
+
+
 # ── Main component ────────────────────────────────────────────────────────────
 
 class AzureBlobFileOps(Node):
@@ -243,18 +275,15 @@ class AzureBlobFileOps(Node):
                 "procurement/2026-04/quote.pdf"
             ),
         ),
-        MultilineInput(
-            name="file_base64",
-            display_name="File Content (base64, upload only)",
-            value="",
+        HandleInput(
+            name="chat_message",
+            display_name="Chat Message (file attachment, upload only)",
+            input_types=["Message"],
+            required=False,
             info=(
-                "Paste your local file as a base64 string. Encode it on "
-                "your machine first, e.g. in PowerShell:\n"
-                "  [Convert]::ToBase64String("
-                "[IO.File]::ReadAllBytes('C:\\path\\to\\file.pdf')) | "
-                "Set-Clipboard\n"
-                "Then paste here. A leading 'data:<mime>;base64,' prefix "
-                "is accepted and stripped automatically."
+                "Wire a Chat Input node here. Attach your Excel/PDF/etc. "
+                "via the chat panel's paperclip — the first attachment's "
+                "bytes are uploaded to the blob path."
             ),
         ),
         HandleInput(
@@ -263,9 +292,9 @@ class AzureBlobFileOps(Node):
             input_types=["Data"],
             required=False,
             info=(
-                "Alternative to File Content: wire any node here whose "
-                "Data payload carries bytes. Accepted shapes: "
-                "data['bytes'] / data['file_bytes'] = raw bytes (preferred); "
+                "Alternative source: wire any node whose Data payload "
+                "carries bytes. Accepted shapes: data['bytes'] / "
+                "data['file_bytes'] = raw bytes (preferred); "
                 "data['content'] / data['data'] = bytes or utf-8 text."
             ),
         ),
@@ -276,8 +305,8 @@ class AzureBlobFileOps(Node):
             advanced=True,
             info=(
                 "Absolute path to a file on the AgentCore host (only "
-                "useful for self-hosted setups). Used only when File "
-                "Content and File Data are both empty."
+                "useful for self-hosted setups). Used only when Chat "
+                "Message and File Data are both empty."
             ),
         ),
     ]
@@ -363,27 +392,15 @@ class AzureBlobFileOps(Node):
         """Return (bytes, source-label) for the upload payload.
 
         Resolution order:
-          1. file_base64      — pasted base64 string from the canvas
+          1. chat_message     — first file attached to a wired ChatInput Message
           2. file_data        — wired Data from an upstream node
           3. file_bytes_path  — typed absolute path on the host (self-hosted)
         """
-        import base64
-
-        b64 = (getattr(self, "file_base64", "") or "").strip()
-        if b64:
-            # Allow data-URL prefixes like "data:application/pdf;base64,...".
-            if b64.startswith("data:") and ";base64," in b64:
-                b64 = b64.split(";base64,", 1)[1]
-            # Strip whitespace / newlines copy-paste tends to introduce.
-            b64 = "".join(b64.split())
-            try:
-                raw = base64.b64decode(b64, validate=True)
-            except Exception as exc:
-                raise ValueError(
-                    f"File Content is not valid base64: {exc}. Re-encode "
-                    "your file with [Convert]::ToBase64String(...) and paste again."
-                ) from exc
-            return raw, "pasted base64"
+        msg = getattr(self, "chat_message", None)
+        raw, name = _bytes_from_message(msg)
+        if raw is not None:
+            label = f"chat attachment ({name})" if name else "chat attachment"
+            return raw, label
 
         wired = getattr(self, "file_data", None)
         raw = _bytes_from_data(wired)
@@ -396,8 +413,8 @@ class AzureBlobFileOps(Node):
                 return fh.read(), f"host path ({path})"
 
         raise ValueError(
-            "Upload requires one of: File Content (base64), File Data "
-            "(wired), or File Bytes Path. None were provided."
+            "Upload requires one of: Chat Message (with an attachment), "
+            "File Data (wired), or File Bytes Path. None were provided."
         )
 
     # ── Output methods ─────────────────────────────────────────────────────
