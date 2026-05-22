@@ -11173,7 +11173,10 @@ class PipelineStage123NodeV2(Node):
         self._safe_log(f"[{pr_no}] Worker started — work_dir={work_dir}")
 
         # Excel mode: each worker first checks the tracker and short-circuits
-        # if the PR is already at stage 8 (COMPLETE) so we do not redo work.
+        # if the PR is already at stage 8 (COMPLETE) or stage 99 (EXCEPTION)
+        # so we do not redo work. Stage-99 PRs need an explicit single-PR
+        # force-reprocess to be retried — bulk Excel runs should not keep
+        # burning compute on PRs that already failed.
         # This DB read happens on the worker's own connection, so N PRs run
         # the check in *parallel* — no serial pre-pass needed before the pool.
         if skip_if_complete:
@@ -11186,12 +11189,14 @@ class PipelineStage123NodeV2(Node):
                     f"[{pr_no}] Stage check failed (will process anyway): {exc}"
                 )
                 stage_now = -1
-            if stage_now == _STAGE_COMPLETE:
+            if stage_now in (_STAGE_COMPLETE, _STAGE_EXCEPTION):
+                stage_name = "COMPLETE" if stage_now == _STAGE_COMPLETE else "EXCEPTION"
+                status_key = "already_complete" if stage_now == _STAGE_COMPLETE else "already_exception"
                 self._safe_log(
-                    f"[{pr_no}] Already at stage {_STAGE_COMPLETE} (COMPLETE) "
+                    f"[{pr_no}] Already at stage {stage_now} ({stage_name}) "
                     f"— skipping (no cleanup, no reprocess)"
                 )
-                result["status"] = "already_complete"
+                result["status"] = status_key
                 shutil.rmtree(work_dir, ignore_errors=True)
                 return result
 
@@ -11739,7 +11744,8 @@ class PipelineStage123NodeV2(Node):
 
             self._safe_log(
                 f"Excel-driven run: {len(pr_list)} PR(s) queued — "
-                f"each worker will skip if already at stage {_STAGE_COMPLETE}"
+                f"each worker will skip if already at stage {_STAGE_COMPLETE} "
+                f"(COMPLETE) or {_STAGE_EXCEPTION} (EXCEPTION)"
             )
 
         workers = max(1, int(self.parallel_workers))
