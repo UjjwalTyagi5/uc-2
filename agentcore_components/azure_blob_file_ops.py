@@ -359,85 +359,78 @@ class AzureBlobFileOps(Node):
         return _with_az_retry(_do, on_rebuild=self._invalidate_container_client)
 
     def _read_kb_file(self, rel_path: str) -> bytes:
-        """Resolve a FileInput path returned by AgentCore. The path is
-        relative to the platform's file storage backend, typically
-        '<user_uuid>/<flow_uuid>/<kb_name>/<filename>'. Strategy:
-          1. If the path is already absolute and exists, open it directly.
-          2. Ask AgentCore's storage service for the bytes (preferred).
-          3. Walk known storage roots (env vars + user-home defaults).
-        Raises FileNotFoundError with the candidate paths it tried.
+        """Resolve a FileInput path returned by AgentCore.
+
+        AgentCore returns a storage-relative path like
+        '<user_uuid>/<flow_uuid>/<kb_name>/<filename>'. Resolution mirrors
+        BaseFileNode._resolve_via_storage in agentcore.base.data.base_file:
+          - STORAGE_TYPE=azure: download the file from the configured KB
+            container (AZURE_STORAGE_ACCOUNT_URL +
+            AZURE_STORAGE_CONTAINER_NAME).
+          - Otherwise: use Node.get_full_path(), which calls the storage
+            service's build_full_path(agent_id, file_name) and returns an
+            absolute filesystem path.
         """
         import os
+        from pathlib import Path
 
-        if os.path.isabs(rel_path) and os.path.exists(rel_path):
-            with open(rel_path, "rb") as fh:
-                return fh.read()
+        if os.path.isabs(rel_path) and Path(rel_path).exists():
+            return Path(rel_path).read_bytes()
 
-        # ── Strategy 1: AgentCore storage service ──────────────────────
-        try:
-            import asyncio
-            import concurrent.futures as _cf
-
-            async def _via_service() -> bytes | None:
-                try:
-                    from agentcore.services.deps import get_storage_service
-                except Exception:
-                    return None
-                storage = get_storage_service()
-                # Storage APIs vary across versions — try the common method
-                # names until one returns bytes.
-                for method_name in (
-                    "get_file_content", "get_file", "read_file", "get",
-                ):
-                    method = getattr(storage, method_name, None)
-                    if method is None:
-                        continue
-                    try:
-                        out = method(rel_path)
-                        if asyncio.iscoroutine(out):
-                            out = await out
-                        if isinstance(out, (bytes, bytearray)):
-                            return bytes(out)
-                    except Exception:
-                        continue
-                return None
-
-            try:
-                asyncio.get_running_loop()
-                with _cf.ThreadPoolExecutor() as pool:
-                    via_svc = pool.submit(asyncio.run, _via_service()).result(timeout=10)
-            except RuntimeError:
-                via_svc = asyncio.run(_via_service())
-            if via_svc is not None:
-                return via_svc
-        except Exception:
-            pass
-
-        # ── Strategy 2: walk known storage roots ───────────────────────
-        candidates: list[str] = []
-        env_roots = [os.environ.get(v) for v in (
-            "AGENTCORE_CONFIG_DIR", "AGENTCORE_HOME",
-            "LANGFLOW_CONFIG_DIR",  "LANGFLOW_HOME",
-        )]
-        home = os.path.expanduser("~")
-        home_roots = [
-            os.path.join(home, ".agentcore"),
-            os.path.join(home, ".langflow"),
-            os.path.join(home, ".cache", "agentcore"),
-            os.path.join(home, ".cache", "langflow"),
-        ]
-        for root in [r for r in env_roots if r] + home_roots:
-            for sub in ("files", "storage", "knowledge_bases", ""):
-                c = os.path.join(root, sub, rel_path) if sub else os.path.join(root, rel_path)
-                candidates.append(c)
-                if os.path.exists(c):
-                    with open(c, "rb") as fh:
-                        return fh.read()
-
-        raise FileNotFoundError(
-            f"Could not resolve FileInput path {rel_path!r}. Tried direct "
-            f"open, AgentCore storage service, and: {candidates}"
+        storage_type = (
+            os.environ.get("STORAGE_TYPE", "local").strip().strip("'\"").lower()
         )
+
+        if storage_type == "azure" and "/" in rel_path:
+            return self._download_kb_blob(rel_path)
+
+        # Local storage — let the storage service build the absolute path.
+        try:
+            full = self.get_full_path(rel_path)
+        except Exception as exc:
+            try:
+                full = self.resolve_path(rel_path)
+            except Exception:
+                raise FileNotFoundError(
+                    f"Could not resolve FileInput path {rel_path!r}: {exc}"
+                ) from exc
+        return Path(full).read_bytes()
+
+    def _download_kb_blob(self, blob_path: str) -> bytes:
+        """Pull a KB-staged file out of the Azure storage backend used by
+        AgentCore when STORAGE_TYPE=azure. Container defaults to the same
+        env name BaseFileNode uses (agentcore-knowledge-container).
+        Reuses the cached DefaultAzureCredential + _with_az_retry."""
+        import os
+        from azure.storage.blob import BlobServiceClient
+
+        account_url = (
+            os.environ.get("AZURE_STORAGE_ACCOUNT_URL", "") or ""
+        ).strip().strip("'\"")
+        container = (
+            os.environ.get(
+                "AZURE_STORAGE_CONTAINER_NAME", "agentcore-knowledge-container"
+            ) or "agentcore-knowledge-container"
+        ).strip().strip("'\"")
+        if not account_url:
+            raise FileNotFoundError(
+                f"AZURE_STORAGE_ACCOUNT_URL is not set; cannot fetch KB "
+                f"blob {blob_path!r}."
+            )
+
+        def _do() -> bytes:
+            credential = _get_az_credential()
+            client = BlobServiceClient(account_url=account_url, credential=credential)
+            try:
+                blob = client.get_container_client(container).get_blob_client(blob_path)
+                return blob.download_blob().readall()
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        return _with_az_retry(_do)
 
     def _resolve_upload_bytes(self) -> tuple[bytes, str]:
         """Return (bytes, source-label) for the upload payload.
