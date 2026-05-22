@@ -36,7 +36,7 @@ except ImportError:
     pass
 
 from agentcore.custom import Node
-from agentcore.io import FileInput, HandleInput, MessageTextInput, Output
+from agentcore.io import HandleInput, MessageTextInput, MultilineInput, Output
 from agentcore.schema.data import Data
 from agentcore.schema.message import Message
 
@@ -243,15 +243,18 @@ class AzureBlobFileOps(Node):
                 "procurement/2026-04/quote.pdf"
             ),
         ),
-        FileInput(
-            name="local_file",
-            display_name="File to Upload",
-            file_types=["*"],
-            required=False,
+        MultilineInput(
+            name="file_base64",
+            display_name="File Content (base64, upload only)",
+            value="",
             info=(
-                "Drag-and-drop or browse a file from your machine. "
-                "AgentCore uploads it to the host and the component reads "
-                "the bytes from there. Used for the upload operation."
+                "Paste your local file as a base64 string. Encode it on "
+                "your machine first, e.g. in PowerShell:\n"
+                "  [Convert]::ToBase64String("
+                "[IO.File]::ReadAllBytes('C:\\path\\to\\file.pdf')) | "
+                "Set-Clipboard\n"
+                "Then paste here. A leading 'data:<mime>;base64,' prefix "
+                "is accepted and stripped automatically."
             ),
         ),
         HandleInput(
@@ -260,8 +263,8 @@ class AzureBlobFileOps(Node):
             input_types=["Data"],
             required=False,
             info=(
-                "Alternative to File to Upload: wire a file-loader / Blob "
-                "Reader / Knowledge Base node here. Accepted Data shapes: "
+                "Alternative to File Content: wire any node here whose "
+                "Data payload carries bytes. Accepted shapes: "
                 "data['bytes'] / data['file_bytes'] = raw bytes (preferred); "
                 "data['content'] / data['data'] = bytes or utf-8 text."
             ),
@@ -272,8 +275,9 @@ class AzureBlobFileOps(Node):
             value="",
             advanced=True,
             info=(
-                "Absolute path to a file on the AgentCore host. Used only "
-                "when File to Upload and File Data are both empty."
+                "Absolute path to a file on the AgentCore host (only "
+                "useful for self-hosted setups). Used only when File "
+                "Content and File Data are both empty."
             ),
         ),
     ]
@@ -359,14 +363,27 @@ class AzureBlobFileOps(Node):
         """Return (bytes, source-label) for the upload payload.
 
         Resolution order:
-          1. local_file       — uploaded via the canvas FileInput
+          1. file_base64      — pasted base64 string from the canvas
           2. file_data        — wired Data from an upstream node
-          3. file_bytes_path  — typed absolute path on the host
+          3. file_bytes_path  — typed absolute path on the host (self-hosted)
         """
-        local_path = (getattr(self, "local_file", "") or "").strip()
-        if local_path:
-            with open(local_path, "rb") as fh:
-                return fh.read(), f"canvas upload ({local_path})"
+        import base64
+
+        b64 = (getattr(self, "file_base64", "") or "").strip()
+        if b64:
+            # Allow data-URL prefixes like "data:application/pdf;base64,...".
+            if b64.startswith("data:") and ";base64," in b64:
+                b64 = b64.split(";base64,", 1)[1]
+            # Strip whitespace / newlines copy-paste tends to introduce.
+            b64 = "".join(b64.split())
+            try:
+                raw = base64.b64decode(b64, validate=True)
+            except Exception as exc:
+                raise ValueError(
+                    f"File Content is not valid base64: {exc}. Re-encode "
+                    "your file with [Convert]::ToBase64String(...) and paste again."
+                ) from exc
+            return raw, "pasted base64"
 
         wired = getattr(self, "file_data", None)
         raw = _bytes_from_data(wired)
@@ -379,7 +396,7 @@ class AzureBlobFileOps(Node):
                 return fh.read(), f"host path ({path})"
 
         raise ValueError(
-            "Upload requires one of: File to Upload (canvas), File Data "
+            "Upload requires one of: File Content (base64), File Data "
             "(wired), or File Bytes Path. None were provided."
         )
 
