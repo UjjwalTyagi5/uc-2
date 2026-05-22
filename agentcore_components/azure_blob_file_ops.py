@@ -358,6 +358,87 @@ class AzureBlobFileOps(Node):
 
         return _with_az_retry(_do, on_rebuild=self._invalidate_container_client)
 
+    def _read_kb_file(self, rel_path: str) -> bytes:
+        """Resolve a FileInput path returned by AgentCore. The path is
+        relative to the platform's file storage backend, typically
+        '<user_uuid>/<flow_uuid>/<kb_name>/<filename>'. Strategy:
+          1. If the path is already absolute and exists, open it directly.
+          2. Ask AgentCore's storage service for the bytes (preferred).
+          3. Walk known storage roots (env vars + user-home defaults).
+        Raises FileNotFoundError with the candidate paths it tried.
+        """
+        import os
+
+        if os.path.isabs(rel_path) and os.path.exists(rel_path):
+            with open(rel_path, "rb") as fh:
+                return fh.read()
+
+        # ── Strategy 1: AgentCore storage service ──────────────────────
+        try:
+            import asyncio
+            import concurrent.futures as _cf
+
+            async def _via_service() -> bytes | None:
+                try:
+                    from agentcore.services.deps import get_storage_service
+                except Exception:
+                    return None
+                storage = get_storage_service()
+                # Storage APIs vary across versions — try the common method
+                # names until one returns bytes.
+                for method_name in (
+                    "get_file_content", "get_file", "read_file", "get",
+                ):
+                    method = getattr(storage, method_name, None)
+                    if method is None:
+                        continue
+                    try:
+                        out = method(rel_path)
+                        if asyncio.iscoroutine(out):
+                            out = await out
+                        if isinstance(out, (bytes, bytearray)):
+                            return bytes(out)
+                    except Exception:
+                        continue
+                return None
+
+            try:
+                asyncio.get_running_loop()
+                with _cf.ThreadPoolExecutor() as pool:
+                    via_svc = pool.submit(asyncio.run, _via_service()).result(timeout=10)
+            except RuntimeError:
+                via_svc = asyncio.run(_via_service())
+            if via_svc is not None:
+                return via_svc
+        except Exception:
+            pass
+
+        # ── Strategy 2: walk known storage roots ───────────────────────
+        candidates: list[str] = []
+        env_roots = [os.environ.get(v) for v in (
+            "AGENTCORE_CONFIG_DIR", "AGENTCORE_HOME",
+            "LANGFLOW_CONFIG_DIR",  "LANGFLOW_HOME",
+        )]
+        home = os.path.expanduser("~")
+        home_roots = [
+            os.path.join(home, ".agentcore"),
+            os.path.join(home, ".langflow"),
+            os.path.join(home, ".cache", "agentcore"),
+            os.path.join(home, ".cache", "langflow"),
+        ]
+        for root in [r for r in env_roots if r] + home_roots:
+            for sub in ("files", "storage", "knowledge_bases", ""):
+                c = os.path.join(root, sub, rel_path) if sub else os.path.join(root, rel_path)
+                candidates.append(c)
+                if os.path.exists(c):
+                    with open(c, "rb") as fh:
+                        return fh.read()
+
+        raise FileNotFoundError(
+            f"Could not resolve FileInput path {rel_path!r}. Tried direct "
+            f"open, AgentCore storage service, and: {candidates}"
+        )
+
     def _resolve_upload_bytes(self) -> tuple[bytes, str]:
         """Return (bytes, source-label) for the upload payload.
 
@@ -368,8 +449,8 @@ class AzureBlobFileOps(Node):
         """
         local_path = (getattr(self, "local_file", "") or "").strip()
         if local_path:
-            with open(local_path, "rb") as fh:
-                return fh.read(), f"canvas upload ({local_path})"
+            raw = self._read_kb_file(local_path)
+            return raw, f"canvas upload ({local_path})"
 
         wired = getattr(self, "file_data", None)
         raw = _bytes_from_data(wired)
