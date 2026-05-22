@@ -10453,7 +10453,7 @@ class PipelineStage123NodeV2(Node):
                     self._safe_log(f"[{pr_no}] Pinecone delete completed — {len(pinecone_ids)} ID(s) sent for removal")
                 except Exception as exc:
                     error_msg = (
-                        f"❌ Pinecone vector cleanup FAILED. Cannot delete old embeddings. "
+                        f"Pinecone vector cleanup FAILED. Cannot delete old embeddings. "
                         f"Reason: {str(exc)}. "
                         f"Check: (1) Pinecone API key is valid, "
                         f"(2) Index name '{pinecone_index}' and namespace '{pinecone_ns}' exist, "
@@ -10485,7 +10485,7 @@ class PipelineStage123NodeV2(Node):
             self._delete_blob_folder(pr_no)
         except Exception as exc:
             error_msg = (
-                f"❌ Azure Blob Storage cleanup FAILED. Cannot delete old files. "
+                f"Azure Blob Storage cleanup FAILED. Cannot delete old files. "
                 f"Reason: {str(exc)}. "
                 f"Check: (1) Azure CLI is installed and logged in (run: az login), "
                 f"(2) Storage account access permissions, "
@@ -11253,7 +11253,7 @@ class PipelineStage123NodeV2(Node):
                 self._safe_log(f"[{pr_no}] Warning — BI dashboard sync failed (non-fatal): {_bi_exc}")
 
             if not attachments:
-                error_msg = "❌ No attachments found in on-prem RAS. Cannot proceed without quotation documents. Check if PR has associated files in the source system."
+                error_msg = "No attachments found in on-prem RAS. Cannot proceed without quotation documents. Check if PR has associated files in the source system."
                 self._safe_log(f"[{pr_no}] {error_msg}")
                 logger.opt(exception=True).error(f"[{pr_no}] {error_msg}")
 
@@ -11509,7 +11509,7 @@ class PipelineStage123NodeV2(Node):
             src_cs = self._conn_str(self.source_connection)
             tgt_cs = self._conn_str(self.target_connection)
         except Exception as exc:
-            msg = Message(text=f"❌ Connection config error: {exc}")
+            msg = Message(text=f"Connection config error: {exc}")
             self._cached_result    = msg
             self._cached_pr_numbers = []
             return msg
@@ -11527,7 +11527,7 @@ class PipelineStage123NodeV2(Node):
             # An ImportError here is structural (pyodbc missing) — surface it
             # clearly instead of letting the daemon thread fail silently.
             logger.opt(exception=True).error(f"V2 smoke-test bootstrap failed: {exc}")
-            msg = Message(text=f"❌ V2 smoke-test bootstrap failed: {exc}")
+            msg = Message(text=f"V2 smoke-test bootstrap failed: {exc}")
             self._cached_result    = msg
             self._cached_pr_numbers = []
             return msg
@@ -11579,7 +11579,7 @@ class PipelineStage123NodeV2(Node):
             logger.opt(exception=True).error(
                 f"V2 smoke-test pool failed before probes ran: {exc}"
             )
-            msg = Message(text=f"❌ V2 smoke-test pool failed: {exc}")
+            msg = Message(text=f"V2 smoke-test pool failed: {exc}")
             self._cached_result    = msg
             self._cached_pr_numbers = []
             return msg
@@ -11588,7 +11588,7 @@ class PipelineStage123NodeV2(Node):
         smoke_elapsed = time.time() - smoke_t0
         if errors:
             err_text = "\n".join(
-                f"❌ Cannot connect to {label} DB: {type(exc).__name__}: {exc}"
+                f"Cannot connect to {label} DB: {type(exc).__name__}: {exc}"
                 for label, exc in errors
             )
             err_text += f"\n(smoke-test took {smoke_elapsed:.2f}s)"
