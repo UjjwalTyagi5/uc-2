@@ -768,28 +768,30 @@ class FileExtractor:
         try:
             import fitz
             doc = fitz.open(file_path)
-            if doc.embfile_count() > 0:
-                for i in range(doc.embfile_count()):
-                    info = doc.embfile_info(i)
-                    name = self.sanitize(info.get("filename", f"pdf_attachment_{i}"))
-                    data = doc.embfile_get(i)
-                    if data:
-                        self._save_file(data, name, out)
-            for pn, page in enumerate(doc, 1):
-                annots = page.annots()
-                if not annots:
-                    continue
-                for annot in annots:
-                    if annot.type[0] == 17:
-                        try:
-                            fd      = annot.get_file()
-                            name    = self.sanitize(fd.get("filename", f"page{pn}_attachment"))
-                            content = fd.get("content", b"")
-                            if content:
-                                self._save_file(content, name, out)
-                        except Exception:
-                            pass
-            doc.close()
+            try:
+                if doc.embfile_count() > 0:
+                    for i in range(doc.embfile_count()):
+                        info = doc.embfile_info(i)
+                        name = self.sanitize(info.get("filename", f"pdf_attachment_{i}"))
+                        data = doc.embfile_get(i)
+                        if data:
+                            self._save_file(data, name, out)
+                for pn, page in enumerate(doc, 1):
+                    annots = page.annots()
+                    if not annots:
+                        continue
+                    for annot in annots:
+                        if annot.type[0] == 17:
+                            try:
+                                fd      = annot.get_file()
+                                name    = self.sanitize(fd.get("filename", f"page{pn}_attachment"))
+                                content = fd.get("content", b"")
+                                if content:
+                                    self._save_file(content, name, out)
+                            except Exception:
+                                pass
+            finally:
+                doc.close()
             return True
         except Exception as exc:
             logger.error(f"PDF error ({os.path.basename(file_path)}): {exc}")
@@ -3160,18 +3162,20 @@ def _extract_pdf_fitz_classify(file_bytes, filename, meta_str):
     try:
         import fitz
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        total = len(doc)
-        meta_str = f"- total_pages: {total}\n"
-        pages = list(range(min(total, 8)))
-        texts = [doc[i].get_text("text").strip() for i in pages]
-        combined = "\n\n".join(f"--- Page {i+1} ---\n{t}" for i, t in zip(pages, texts) if t)
-        if len(combined.strip()) < 50:
-            pix = doc[0].get_pixmap(dpi=150)
-            b64 = base64.b64encode(pix.tobytes("png")).decode()
+        try:
+            total = len(doc)
+            meta_str = f"- total_pages: {total}\n"
+            pages = list(range(min(total, 8)))
+            texts = [doc[i].get_text("text").strip() for i in pages]
+            combined = "\n\n".join(f"--- Page {i+1} ---\n{t}" for i, t in zip(pages, texts) if t)
+            if len(combined.strip()) < 50:
+                pix = doc[0].get_pixmap(dpi=150)
+                b64 = base64.b64encode(pix.tobytes("png")).decode()
+                pix = None
+                return "[Scanned PDF - content sent as image]", b64, meta_str
+            return combined[:_MAX_CLASSIFY_CHARS], None, meta_str
+        finally:
             doc.close()
-            return "[Scanned PDF - content sent as image]", b64, meta_str
-        doc.close()
-        return combined[:_MAX_CLASSIFY_CHARS], None, meta_str
     except Exception as exc:
         return f"[PDF extraction error: {exc}]", None, meta_str
 
@@ -3183,8 +3187,12 @@ def _extract_pdf_as_image_classify(file_bytes, filename, meta_str, total):
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             img = pdf.pages[0].to_image(resolution=200)
             buf = io.BytesIO()
-            img.original.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode()
+            try:
+                img.original.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode()
+            finally:
+                try: img.original.close()
+                except Exception: pass
         return "[Scanned PDF - content sent as image]", b64, meta_str
     except Exception:
         return _extract_pdf_fitz_classify(file_bytes, filename, meta_str)
@@ -3258,13 +3266,17 @@ def _extract_word_classify(file_bytes, filename, meta_str):
                         largest = max(imgs, key=lambda n: z.getinfo(n).file_size)
                         img_bytes = z.read(largest)
                         img = Image.open(io.BytesIO(img_bytes))
-                        if img.mode not in ("RGB", "L"):
-                            img = img.convert("RGB")
-                        if max(img.size) > 2048:
-                            img.thumbnail((2048, 2048), Image.LANCZOS)
-                        buf2 = io.BytesIO()
-                        img.save(buf2, format="PNG")
-                        b64 = base64.b64encode(buf2.getvalue()).decode()
+                        try:
+                            if img.mode not in ("RGB", "L"):
+                                img = img.convert("RGB")
+                            if max(img.size) > 2048:
+                                img.thumbnail((2048, 2048), Image.LANCZOS)
+                            buf2 = io.BytesIO()
+                            img.save(buf2, format="PNG")
+                            b64 = base64.b64encode(buf2.getvalue()).decode()
+                        finally:
+                            try: img.close()
+                            except Exception: pass
                         return "[Word document is image-based - content sent as image for visual analysis]", b64, meta_str
             except Exception:
                 pass
@@ -3317,13 +3329,16 @@ def _extract_fitz_classify(file_bytes, filename, meta_str):
     try:
         import fitz
         doc = fitz.open(stream=file_bytes)
-        total = len(doc)
-        pages = list(range(min(total, 4)))
-        images: list[str] = []
-        for i in pages:
-            pix = doc[i].get_pixmap(dpi=150)
-            images.append(base64.b64encode(pix.tobytes("png")).decode())
-        doc.close()
+        try:
+            total = len(doc)
+            pages = list(range(min(total, 4)))
+            images: list[str] = []
+            for i in pages:
+                pix = doc[i].get_pixmap(dpi=150)
+                images.append(base64.b64encode(pix.tobytes("png")).decode())
+                pix = None
+        finally:
+            doc.close()
         if not images:
             return "[Document could not be rendered]", None, meta_str
         return "[Legacy document - content sent as images]", images[0], meta_str
@@ -3336,14 +3351,18 @@ def _extract_image_classify(file_bytes, filename, meta_str):
     try:
         from PIL import Image
         img = Image.open(io.BytesIO(file_bytes))
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        if max(img.size) > 2048:
-            img.thumbnail((2048, 2048))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        meta_str = f"- size: {img.size[0]}x{img.size[1]}\n"
+        try:
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            if max(img.size) > 2048:
+                img.thumbnail((2048, 2048))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            meta_str = f"- size: {img.size[0]}x{img.size[1]}\n"
+        finally:
+            try: img.close()
+            except Exception: pass
         return "[Image file - content sent as image]", b64, meta_str
     except Exception as exc:
         return f"[Image extraction error: {exc}]", None, meta_str
@@ -3536,15 +3555,78 @@ def _embed_with_timeout(embed_model, text: str, timeout_s: int = 60):
     return _call_with_timeout(embed_model.embed_query, text, timeout_s=timeout_s, label="embed-query")
 
 
+def _call_pinecone_with_retry(
+    fn,
+    *args,
+    timeout_s: int,
+    label: str,
+    max_attempts: int = 3,
+    **kwargs,
+):
+    """Run a Pinecone call with hard timeout AND retry on transient errors.
+
+    Mirrors the agentcore pinecone-service tenacity policy: 3 attempts,
+    exponential backoff (1s → 2s → 4s, capped at 10s), retries only on
+    transient server/connectivity errors as classified by
+    `_is_pinecone_server_error` (connection, timeout, 5xx, network, etc.).
+    Non-transient errors (auth, schema, invalid args) raise immediately
+    without burning retry attempts.
+
+    The caller's existing exception handling (fall-back-to-benchmark-stub
+    in Stage 7, log-and-continue in Stage 6) is preserved — retries
+    happen inside this helper, and the final exception still surfaces if
+    all attempts fail.
+    """
+    import time as _time
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _call_with_timeout(
+                fn, *args, timeout_s=timeout_s, label=label, **kwargs
+            )
+        except Exception as exc:
+            last_exc = exc
+            transient = _is_pinecone_server_error(exc)
+            if attempt >= max_attempts or not transient:
+                if transient:
+                    logger.warning(
+                        f"[{label}] all {max_attempts} attempt(s) failed — "
+                        f"surfacing {type(exc).__name__}: {exc}"
+                    )
+                raise
+            sleep_s = min(10, 2 ** (attempt - 1))  # 1, 2, 4 …
+            logger.warning(
+                f"[{label}] attempt {attempt}/{max_attempts} failed "
+                f"({type(exc).__name__}: {exc}); retrying in {sleep_s}s…"
+            )
+            _time.sleep(sleep_s)
+    # Defensive — loop above always either returns or raises.
+    raise last_exc if last_exc else RuntimeError(f"[{label}] retry loop exited unexpectedly")
+
+
 def _pinecone_search_with_timeout(search_fn, *args, timeout_s: int = 60, **kwargs):
-    """Pinecone query with hard timeout."""
-    return _call_with_timeout(search_fn, *args, timeout_s=timeout_s, label="pinecone-search", **kwargs)
+    """Pinecone query with hard timeout + 3-attempt retry on transient errors."""
+    return _call_pinecone_with_retry(
+        search_fn, *args, timeout_s=timeout_s, label="pinecone-search", **kwargs,
+    )
 
 
 def _pinecone_ingest_with_timeout(ingest_fn, *args, timeout_s: int = 120, **kwargs):
-    """Pinecone upsert with hard timeout. Larger budget than search
-    because upserts can include big batches of vectors + metadata."""
-    return _call_with_timeout(ingest_fn, *args, timeout_s=timeout_s, label="pinecone-ingest", **kwargs)
+    """Pinecone upsert with hard timeout + 3-attempt retry on transient errors.
+    Larger timeout budget than search because upserts can include big batches
+    of vectors + metadata."""
+    return _call_pinecone_with_retry(
+        ingest_fn, *args, timeout_s=timeout_s, label="pinecone-ingest", **kwargs,
+    )
+
+
+def _pinecone_ensure_with_retry(ensure_fn, *args, timeout_s: int = 60, **kwargs):
+    """Pinecone ensure-index with hard timeout + 3-attempt retry on transient
+    errors. Used at the start of Stage 6 so a flaky Pinecone start doesn't
+    immediately fail the PR — the index check is harmless to repeat."""
+    return _call_pinecone_with_retry(
+        ensure_fn, *args, timeout_s=timeout_s, label="pinecone-ensure-index", **kwargs,
+    )
 
 
 def _is_json_format_error(exc: Exception) -> bool:
@@ -3675,6 +3757,7 @@ def _render_pdf_pages_to_b64(
             for i in range(n):
                 pix = doc[i].get_pixmap(dpi=150)
                 out.append(_b64.b64encode(pix.tobytes("png")).decode())
+                pix = None
         finally:
             doc.close()
         return out
@@ -4059,33 +4142,35 @@ def _load_pdf_for_extract(file_bytes: bytes, max_pages: int) -> DocumentContent:
     try:
         import fitz
         doc        = fitz.open(stream=file_bytes, filetype="pdf")
-        page_count = len(doc)
-        if page_count > max_pages:
-            # Match doc-intel: warn explicitly so the user can see truncation in the canvas log.
-            logger.warning(
-                "PDF has {} page(s) but max_pages={} — only first {} page(s) will be processed",
-                page_count, max_pages, max_pages,
-            )
-        total      = min(page_count, max_pages)
-        text_pages: list[str] = []
-        images:     list[str] = []
-        text_count = scanned_count = 0
+        try:
+            page_count = len(doc)
+            if page_count > max_pages:
+                # Match doc-intel: warn explicitly so the user can see truncation in the canvas log.
+                logger.warning(
+                    "PDF has {} page(s) but max_pages={} — only first {} page(s) will be processed",
+                    page_count, max_pages, max_pages,
+                )
+            total      = min(page_count, max_pages)
+            text_pages: list[str] = []
+            images:     list[str] = []
+            text_count = scanned_count = 0
 
-        for i in range(total):
-            page      = doc[i]
-            page_text = page.get_text("text").strip()
-            if len(page_text) >= _SCANNED_THRESHOLD:
-                # Digital page — extract text; low-res image preserves layout context
-                text_pages.append(f"[Page {i + 1}]\n{page_text}")
-                text_count   += 1
-                pix = page.get_pixmap(dpi=72)
-            else:
-                # Scanned/image page — high-res render is the only usable content
-                scanned_count += 1
-                pix = page.get_pixmap(dpi=150)
-            images.append(base64.b64encode(pix.tobytes("png")).decode())
-
-        doc.close()
+            for i in range(total):
+                page      = doc[i]
+                page_text = page.get_text("text").strip()
+                if len(page_text) >= _SCANNED_THRESHOLD:
+                    # Digital page — extract text; low-res image preserves layout context
+                    text_pages.append(f"[Page {i + 1}]\n{page_text}")
+                    text_count   += 1
+                    pix = page.get_pixmap(dpi=72)
+                else:
+                    # Scanned/image page — high-res render is the only usable content
+                    scanned_count += 1
+                    pix = page.get_pixmap(dpi=150)
+                images.append(base64.b64encode(pix.tobytes("png")).decode())
+                pix = None
+        finally:
+            doc.close()
         logger.info(
             "PDF loaded: {}/{} page(s) — {} digital (72 DPI text+image), {} scanned (150 DPI image)",
             total, page_count, text_count, scanned_count,
@@ -4226,7 +4311,8 @@ def _load_image_for_extract(file_bytes: bytes, ext: str) -> DocumentContent:
         try:
             from PIL import Image
             buf = io.BytesIO()
-            Image.open(io.BytesIO(raw)).save(buf, format="PNG")
+            with Image.open(io.BytesIO(raw)) as _img:
+                _img.save(buf, format="PNG")
             raw = buf.getvalue()
         except Exception:
             pass
@@ -4275,18 +4361,21 @@ def _fitz_render_for_extract(file_bytes: bytes, max_pages: int) -> DocumentConte
     try:
         import fitz
         doc        = fitz.open(stream=file_bytes)
-        page_count = len(doc)
-        if page_count > max_pages:
-            logger.warning(
-                "Document has {} page(s) but max_pages={} — only first {} page(s) will be rendered",
-                page_count, max_pages, max_pages,
-            )
-        n = min(page_count, max_pages)
-        images = []
-        for i in range(n):
-            pix = doc[i].get_pixmap(dpi=200)
-            images.append(base64.b64encode(pix.tobytes("png")).decode())
-        doc.close()
+        try:
+            page_count = len(doc)
+            if page_count > max_pages:
+                logger.warning(
+                    "Document has {} page(s) but max_pages={} — only first {} page(s) will be rendered",
+                    page_count, max_pages, max_pages,
+                )
+            n = min(page_count, max_pages)
+            images = []
+            for i in range(n):
+                pix = doc[i].get_pixmap(dpi=200)
+                images.append(base64.b64encode(pix.tobytes("png")).decode())
+                pix = None
+        finally:
+            doc.close()
         logger.info("Document rendered: {}/{} page(s) at 200 DPI", n, page_count)
         return DocumentContent(images=images, page_count=n)
     except Exception as exc:
@@ -5330,7 +5419,11 @@ def _build_embed_text(row_dict: dict) -> str:
 def _run_embeddings(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str, pinecone_ns: str) -> None:
     # Structural errors (import, DB connect, index creation) propagate — caller records exception.
     from agentcore.services.pinecone_service_client import ensure_index_via_service, ingest_via_service
-    ensure_index_via_service(index_name=pinecone_index, embedding_dimension=3072)
+    _pinecone_ensure_with_retry(
+        ensure_index_via_service,
+        index_name=pinecone_index,
+        embedding_dimension=3072,
+    )
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
     try:
@@ -7888,7 +7981,11 @@ def _run_embeddings_v2(tgt_cs: str, pr_no: str, embed_model, pinecone_index: str
     12-field concat. Pinecone metadata gains purchase_category_llm +
     item_level_1/2 so Stage A's $eq filter is possible."""
     from agentcore.services.pinecone_service_client import ensure_index_via_service, ingest_via_service
-    ensure_index_via_service(index_name=pinecone_index, embedding_dimension=3072)
+    _pinecone_ensure_with_retry(
+        ensure_index_via_service,
+        index_name=pinecone_index,
+        embedding_dimension=3072,
+    )
 
     conn = _connect(tgt_cs)
     cur  = conn.cursor()
@@ -11444,6 +11541,9 @@ class PipelineStage123NodeV2(Node):
                     "text":        text,
                     "blob":        f_info["blob_path"],
                 })
+                # Free raw bytes — uploaded to blob + saved to work_dir already.
+                # Stages 4-8 re-download from blob when they need the bytes again.
+                f_info["content"] = None
 
             self._advance_tracker(tgt_cs, pr_no, _STAGE_BLOB_UPLOAD)
             self._safe_log(
@@ -11453,6 +11553,16 @@ class PipelineStage123NodeV2(Node):
 
             result["files"]  = file_data
             result["status"] = "success"
+
+            # ── Free Stage 1-3 working set before Stage 4-8 ───────────────────
+            # Stages 4-8 re-query DB and re-download blobs — they do not use
+            # attachments / all_files / file_data. Dropping these locals here
+            # reclaims hundreds of MB per PR before the heaviest stage runs.
+            # result["files"] still references file_data; it is cleared in the
+            # finally block below once the PR is fully done.
+            attachments = None
+            all_files   = None
+            file_data   = None
 
             # ── Continue to stages 4-8 in this same worker ──────────────────
             # Each parallel worker processes one PR end-to-end (stages 1→8)
@@ -11471,7 +11581,23 @@ class PipelineStage123NodeV2(Node):
             result["error"] = f"{stage_name}: {exc}"
             self._record_exception(tgt_cs, pr_no, current_stage, f"{stage_name}: {exc}")
         finally:
+            # Drop the per-file extracted text — the outer batch only reads
+            # result["pr_no"] and result["status"]. Keeping ~1 MB of text per
+            # PR across 600 PRs accumulates to >500 MB in the run-level
+            # `results` list otherwise.
+            try:
+                result["files"] = []
+            except Exception:
+                pass
             shutil.rmtree(work_dir, ignore_errors=True)
+            # Return freed allocator pages to the OS. Cheap (~100ms) compared
+            # to a PR's LLM latency, and the cumulative effect across 600 PRs
+            # is what keeps RSS stable on long Excel runs.
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
         return result
 
     # ── Entry point ───────────────────────────────────────────────────────
@@ -11855,14 +11981,18 @@ def _extract_pdf(raw: bytes) -> str:
 def _extract_excel(raw: bytes) -> str:
     import io, openpyxl
     wb    = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-    parts: list[str] = []
-    for ws in wb.worksheets:
-        parts.append(f"[Sheet: {ws.title}]")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) if c is not None else "" for c in row]
-            if any(cells):
-                parts.append("\t".join(cells))
-    return "\n".join(parts)
+    try:
+        parts: list[str] = []
+        for ws in wb.worksheets:
+            parts.append(f"[Sheet: {ws.title}]")
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(cells):
+                    parts.append("\t".join(cells))
+        return "\n".join(parts)
+    finally:
+        try: wb.close()
+        except Exception: pass
 
 
 def _extract_word(raw: bytes) -> str:
