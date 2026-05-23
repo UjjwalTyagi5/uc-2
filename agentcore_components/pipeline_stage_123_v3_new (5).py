@@ -8620,19 +8620,33 @@ def _llm_rank_candidates(
             )
             dump_in_path = dump_out_path = None
 
-    # Determinism: bind temperature=0 + a fixed seed for this ranking call,
-    # without mutating the caller's llm object. Most Azure / OpenAI chat
-    # models honor both; older models or non-OpenAI backends ignore unknown
-    # bind kwargs. If .bind() itself fails (very old wrappers), fall back
-    # to the unbound llm so the rank call still runs.
+    # Determinism: bind temperature + a fixed seed for this ranking call,
+    # without mutating the caller's llm object. Only applied when the caller
+    # explicitly sets `bench_rank_temperature` / `bench_rank_seed` in the
+    # prompts dict — newer reasoning models (gpt-5.x, o-series) reject any
+    # temperature other than the default 1 and a bound `temperature=0`
+    # surfaces as a 400 invalid_request_error on every Stage 7 rank call.
+    # Leaving both unset is the safe default for those deployments; classic
+    # gpt-4o / gpt-4o-mini users can opt back in by setting the keys.
     rank_llm = llm
-    try:
-        rank_llm = llm.bind(
-            temperature=int(p.get("bench_rank_temperature", 0)),
-            seed=int(p.get("bench_rank_seed", 42)),
-        )
-    except Exception:
-        rank_llm = llm
+    bind_kw: dict = {}
+    raw_temp = p.get("bench_rank_temperature")
+    if raw_temp not in (None, ""):
+        try:
+            bind_kw["temperature"] = float(raw_temp)
+        except (ValueError, TypeError):
+            pass
+    raw_seed = p.get("bench_rank_seed")
+    if raw_seed not in (None, ""):
+        try:
+            bind_kw["seed"] = int(raw_seed)
+        except (ValueError, TypeError):
+            pass
+    if bind_kw:
+        try:
+            rank_llm = llm.bind(**bind_kw)
+        except Exception:
+            rank_llm = llm
 
     try:
         response = _call_llm_with_retry(
