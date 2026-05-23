@@ -306,12 +306,21 @@ def install_pinecone_shim() -> None:
             })
         return out
 
-    def delete_vectors_via_service(index_name: str, namespace: str, ids: list, **kw):
-        if not ids:
+    def delete_vectors_via_service(
+        index_name: str,
+        namespace: str,
+        vector_ids: list | None = None,
+        ids: list | None = None,
+        **kw,
+    ):
+        # Pipeline calls this with `vector_ids=...`; the AgentCore service
+        # historically accepted `ids=...` too. Accept either.
+        target = vector_ids if vector_ids is not None else ids
+        if not target:
             return {"deleted_count": 0}
         idx = pc.Index(index_name)
-        idx.delete(ids=[str(i) for i in ids], namespace=namespace)
-        return {"deleted_count": len(ids)}
+        idx.delete(ids=[str(i) for i in target], namespace=namespace)
+        return {"deleted_count": len(target)}
 
     # Patch the agentcore.services.pinecone_service_client module — this works
     # whether it's the real one (installed agentcore) or the stub created by
