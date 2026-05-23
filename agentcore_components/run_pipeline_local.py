@@ -36,7 +36,92 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+
+
+# ─── Fake `agentcore` package so the pipeline file imports without MiCore ────
+#
+# The pipeline does `from agentcore.custom import Node` and friends at module
+# load time. On a machine without MiCore installed we manufacture the minimum
+# surface those imports need — empty subpackages + tiny shim classes — and
+# inject them into sys.modules BEFORE loading the pipeline file. The class
+# bodies just need to exist; we instantiate the pipeline class via
+# object.__new__ so __init__ is never called, and we never use the Input
+# classes for anything except their presence in the `inputs = [...]` list.
+
+def _install_agentcore_stubs() -> bool:
+    """Return True if we installed stubs, False if the real `agentcore`
+    package was already importable (we leave it alone in that case)."""
+    if "agentcore" in sys.modules:
+        return False
+    try:
+        import agentcore   # noqa: F401
+        return False
+    except ImportError:
+        pass
+
+    def _mod(name: str) -> ModuleType:
+        m = ModuleType(name)
+        sys.modules[name] = m
+        return m
+
+    _mod("agentcore")
+
+    # agentcore.custom — Node base class. We never construct it; we use
+    # object.__new__(PipelineStage123NodeV2). `log` is provided as a no-op
+    # fallback in case anything reaches for it; _safe_log on the pipeline
+    # routes to loguru when there's no canvas context anyway.
+    ac_custom = _mod("agentcore.custom")
+    class Node:
+        def log(self, msg, *a, **k):
+            print(msg)
+    ac_custom.Node = Node
+
+    # agentcore.io — Input classes are referenced in the `inputs = [...]`
+    # list on the class body, so they must exist and be call-able. We never
+    # read their attributes; their only job is "don't crash at class definition".
+    ac_io = _mod("agentcore.io")
+    def _input_stub(cls_name: str):
+        class _Stub:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+            def __repr__(self):
+                return f"<{cls_name} {getattr(self, 'name', '?')}>"
+        _Stub.__name__ = cls_name
+        return _Stub
+    for _n in ("BoolInput", "HandleInput", "IntInput", "MessageTextInput",
+               "MultilineInput", "FileInput", "Output"):
+        setattr(ac_io, _n, _input_stub(_n))
+
+    # agentcore.schema + Data + Message — the pipeline uses Data.data and
+    # Message(text=...). Both are tiny.
+    _mod("agentcore.schema")
+    ac_data = _mod("agentcore.schema.data")
+    class Data:
+        def __init__(self, data=None, **kw):
+            self.data = data if data is not None else dict(kw)
+    ac_data.Data = Data
+
+    ac_msg = _mod("agentcore.schema.message")
+    class Message:
+        def __init__(self, text="", **kw):
+            self.text = text
+        def __repr__(self):
+            return f"<Message text={self.text!r}>"
+    ac_msg.Message = Message
+
+    # agentcore.services + the submodules the pipeline imports lazily inside
+    # functions we either bypass (connector-catalogue lookup is replaced via
+    # the _blob_cfg monkey-patch on the instance) or shim (pinecone client).
+    _mod("agentcore.services")
+    _mod("agentcore.services.deps")
+    _mod("agentcore.services.database")
+    _mod("agentcore.services.database.models")
+    _mod("agentcore.services.database.models.connector_catalogue")
+    _mod("agentcore.services.database.models.connector_catalogue.model")
+    _mod("agentcore.services.pinecone_service_client")
+
+    return True
 
 
 # ─── locate this folder, load .env from it ────────────────────────────────────
@@ -228,12 +313,15 @@ def install_pinecone_shim() -> None:
         idx.delete(ids=[str(i) for i in ids], namespace=namespace)
         return {"deleted_count": len(ids)}
 
-    # Patch the real agentcore module so `from ... import name` finds our shim.
+    # Patch the agentcore.services.pinecone_service_client module — this works
+    # whether it's the real one (installed agentcore) or the stub created by
+    # _install_agentcore_stubs(). Either way `from ... import name` resolves
+    # to our shim functions.
     try:
         import agentcore.services.pinecone_service_client as ps
     except Exception as exc:
-        sys.exit(f"ERROR: cannot import agentcore.services.pinecone_service_client — "
-                 f"is the agentcore package installed in this venv? ({exc})")
+        sys.exit(f"ERROR: agentcore.services.pinecone_service_client unavailable "
+                 f"(stubs should have created it — internal bug): {exc}")
     ps.ensure_index_via_service   = ensure_index_via_service
     ps.ingest_via_service         = ingest_via_service
     ps.search_via_service         = search_via_service
@@ -298,6 +386,15 @@ class _ConnData:
 # ─── attach the pipeline instance, wire every attribute, run ──────────────────
 
 def build_and_run() -> int:
+    # Order matters: agentcore stubs must be in sys.modules BEFORE the
+    # pipeline file is loaded (its top-level `from agentcore.* import …`
+    # statements resolve at module-load time). The Pinecone shim then patches
+    # symbols onto whichever module — real or stubbed — is already in place.
+    used_stubs = _install_agentcore_stubs()
+    if used_stubs:
+        print("[init] agentcore stubs installed (real package not found — using minimal shims)")
+    else:
+        print("[init] real agentcore package detected — using it as-is")
     install_pinecone_shim()
     pmod = load_pipeline_module()
     Cls  = pmod.PipelineStage123NodeV2
