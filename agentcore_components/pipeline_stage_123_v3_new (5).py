@@ -2904,9 +2904,11 @@ def _conn_str(conn_data: Data) -> str:
     db     = d.get("database_name", d.get("database", ""))
     user   = d.get("username", "")
     pwd    = d.get("password", "")
+    # MARS_Connection=yes — see _conn_str method on the Node class for why.
     return (
         f"DRIVER={{{driver}}};SERVER={server},{port};"
-        f"DATABASE={db};UID={user};PWD={pwd};TrustServerCertificate=yes;"
+        f"DATABASE={db};UID={user};PWD={pwd};"
+        f"TrustServerCertificate=yes;MARS_Connection=yes;"
     )
 
 
@@ -10190,9 +10192,16 @@ class PipelineStage123NodeV2(Node):
         db     = d.get("database_name", d.get("database", ""))
         user   = d.get("username", "")
         pwd    = d.get("password", "")
+        # MARS_Connection=yes enables Multiple Active Result Sets — required
+        # for our pool-shared connections under multi-threaded use, otherwise
+        # cursors on a connection that still has unread results from a prior
+        # cursor raise HY000 "Connection is busy with results for another
+        # command". MARS lets pyodbc multiplex multiple cursors on one
+        # connection without that error.
         return (
             f"DRIVER={{{driver}}};SERVER={server},{port};"
-            f"DATABASE={db};UID={user};PWD={pwd};TrustServerCertificate=yes;"
+            f"DATABASE={db};UID={user};PWD={pwd};"
+            f"TrustServerCertificate=yes;MARS_Connection=yes;"
         )
 
     @staticmethod
