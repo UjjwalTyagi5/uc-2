@@ -765,6 +765,7 @@ class FileExtractor:
             return False
 
     def extract_from_pdf(self, file_path: str, out: str) -> bool:
+        import os  # used by the error handler below
         try:
             import fitz
             doc = fitz.open(file_path)

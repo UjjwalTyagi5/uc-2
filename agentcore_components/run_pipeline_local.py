@@ -162,28 +162,68 @@ def env_int(key: str, default: int) -> int:
 # ─── build Azure OpenAI LLM + embeddings ──────────────────────────────────────
 
 def build_llm():
+    """Build the chat LLM client.
+
+    `azure_deployment` is the DEPLOYMENT NAME you created in Azure
+    (Portal → your Azure OpenAI or Azure AI Foundry resource → Deployments).
+    The actual model (gpt-4o, gpt-5.2, o3-mini, etc.) is configured at
+    deployment-creation time — the runner just references the deployment
+    by its name. Same pattern for Azure AI Foundry: the deployment name you
+    pick in the Foundry portal goes into AZURE_OPENAI_LLM_DEPLOYMENT.
+
+    `temperature` is only forwarded if AZURE_OPENAI_TEMPERATURE is set in
+    .env. Newer reasoning models (gpt-5.x, o-series) reject the param;
+    leaving it unset is the safe default. Set it to "0", "0.3", etc. only
+    when the deployment accepts it.
+    """
     from langchain_openai import AzureChatOpenAI
-    return AzureChatOpenAI(
-        azure_endpoint   = env("AZURE_OPENAI_ENDPOINT",      required=True),
-        api_key          = env("AZURE_OPENAI_API_KEY",       required=True),
-        api_version      = env("AZURE_OPENAI_API_VERSION",   default="2024-08-01-preview"),
+    kw: dict = dict(
+        azure_endpoint   = env("AZURE_OPENAI_ENDPOINT",       required=True),
+        api_key          = env("AZURE_OPENAI_API_KEY",        required=True),
+        api_version      = env("AZURE_OPENAI_API_VERSION",    default="2024-08-01-preview"),
         azure_deployment = env("AZURE_OPENAI_LLM_DEPLOYMENT", required=True),
-        temperature      = 0.0,
         timeout          = 120,
         max_retries      = 0,   # pipeline does its own retry
     )
+    temp_raw = (os.environ.get("AZURE_OPENAI_TEMPERATURE") or "").strip()
+    if temp_raw:
+        try:
+            kw["temperature"] = float(temp_raw)
+        except ValueError:
+            sys.exit(f"ERROR: AZURE_OPENAI_TEMPERATURE={temp_raw!r} is not a number")
+    # Optional: override the model identifier sent to the API (rarely needed —
+    # azure_deployment usually covers it). Useful when LangChain's logging
+    # should show the underlying model, or when a custom deployment maps to
+    # a non-default model id.
+    model_name = env("AZURE_OPENAI_LLM_MODEL", default="")
+    if model_name:
+        kw["model"] = model_name
+    return AzureChatOpenAI(**kw)
 
 
 def build_embed_model():
+    """Build the embeddings client.
+
+    `azure_deployment` = the EMBEDDING DEPLOYMENT NAME from your Azure
+    OpenAI / Azure AI Foundry resource. The pipeline assumes a 3072-dim
+    output (text-embedding-3-large). If your deployment uses a different
+    model (e.g. text-embedding-3-small = 1536 dim) the Pinecone index
+    creation will mismatch — keep it on a 3072-dim model unless you also
+    change the pipeline's ensure_index_via_service call.
+    """
     from langchain_openai import AzureOpenAIEmbeddings
-    return AzureOpenAIEmbeddings(
-        azure_endpoint   = env("AZURE_OPENAI_ENDPOINT",        required=True),
-        api_key          = env("AZURE_OPENAI_API_KEY",         required=True),
-        api_version      = env("AZURE_OPENAI_API_VERSION",     default="2024-08-01-preview"),
+    kw: dict = dict(
+        azure_endpoint   = env("AZURE_OPENAI_ENDPOINT",         required=True),
+        api_key          = env("AZURE_OPENAI_API_KEY",          required=True),
+        api_version      = env("AZURE_OPENAI_API_VERSION",      default="2024-08-01-preview"),
         azure_deployment = env("AZURE_OPENAI_EMBED_DEPLOYMENT", required=True),
         timeout          = 60,
         max_retries      = 0,
     )
+    model_name = env("AZURE_OPENAI_EMBED_MODEL", default="")
+    if model_name:
+        kw["model"] = model_name
+    return AzureOpenAIEmbeddings(**kw)
 
 
 # ─── build Azure Blob client (3 auth modes, first non-empty wins) ─────────────
