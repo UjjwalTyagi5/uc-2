@@ -1,0 +1,69 @@
+# Requirements for run_pipeline_local.py + pipeline_stage_123_v3_new (5).py
+# when running OUTSIDE MiCore (the agentcore package is NOT needed — the
+# runner stubs it).
+#
+# Install:    pip install -r requirements.txt
+# Verify:     python -c "import fitz, openpyxl, docx, pptx, pdfplumber, extract_msg, langchain_openai, pinecone; print('all OK')"
+#
+# CRITICAL: install PyMuPDF, never the unrelated package called `fitz`.
+# If `pip install fitz` was ever run, do this first:
+#     pip uninstall -y fitz PyMuPDF && pip install PyMuPDF
+
+# ─── Core runner ─────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+# ─── Azure SDK (blob storage + auth) ─────────────────────────────────────────
+azure-storage-blob>=12.19.0
+azure-identity>=1.15.0
+
+# ─── LangChain (Azure OpenAI chat + embeddings) ──────────────────────────────
+# langchain-core comes in as a transitive of langchain-openai but pinning
+# it explicitly keeps the version compatible with both the chat and the
+# embedding wrappers.
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+
+# ─── Pinecone (vector store) ─────────────────────────────────────────────────
+# v5+ uses the new client API the shim in run_pipeline_local.py expects.
+pinecone>=5.0.0
+
+# ─── SQL Server (source + target DB) ─────────────────────────────────────────
+pyodbc>=5.0.0
+
+# ─── Stage 2 — embed-doc extraction (parses every parent attachment) ─────────
+PyMuPDF>=1.24.0        # imports as `fitz` — for PDF parsing/render
+python-docx>=1.1.0     # imports as `docx` — for .docx parsing
+python-pptx>=1.0.0     # imports as `pptx` — for .pptx parsing
+openpyxl>=3.1.0        # for .xlsx / .xlsm / .xlsb (and PR-list Excel parsing)
+xlrd>=2.0.0            # for legacy .xls files
+extract-msg>=0.49.0    # for Outlook .msg parsing
+py7zr>=0.21.0          # for .7z archive expansion
+rarfile>=4.0.0         # for .rar archive expansion
+olefile>=0.46          # for legacy .doc fallback + OLE parsing
+
+# ─── Stage 4 — classification (text + vision LLM) ────────────────────────────
+# All Stage 2 packages above are reused. These are the extras Stage 4 needs:
+pdfplumber>=0.11.0     # alternative PDF render path (silences runtime warning)
+Pillow>=10.0.0         # imports as `PIL` — image conversion for vision LLM
+chardet>=5.0.0         # encoding detection for HTML / email parsing
+beautifulsoup4>=4.12.0 # HTML tag stripping
+pandas>=2.0.0          # used by _extract_excel_classify when openpyxl/xlrd
+                       # need a unified ExcelFile interface
+
+# ─── Stage 5 — extraction (LLM emits structured items) ───────────────────────
+# Uses the same content extractors as Stage 2 + 4. No new packages.
+
+# ─── Stages 6/7 — embeddings + benchmark scoring ─────────────────────────────
+# langchain-openai + pinecone above cover Stage 6.
+# Stage 7 currency / country canonicalisation:
+pycountry>=24.0        # ISO-4217 / 3166 lookup (graceful degrade if absent)
+rapidfuzz>=3.5.0       # fuzzy currency / country / supplier-name matching
+httpx>=0.27.0          # HTTP client used by benchmark helpers (also a
+                       # langchain transitive)
+
+# ─── NOT required when running via run_pipeline_local.py ─────────────────────
+# The pipeline file references these via the `agentcore` package, but the
+# runner stubs them out (_install_agentcore_stubs / install_pinecone_shim):
+#   agentcore           — stubbed
+#   sqlalchemy          — only used inside _get_blob_config_by_name (patched)
