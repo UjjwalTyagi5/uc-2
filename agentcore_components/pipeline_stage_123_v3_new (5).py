@@ -3774,20 +3774,31 @@ def _render_pdf_pages_to_b64(
             doc.close()
         return out
 
-    # Try pdfplumber first (matches prior behaviour); fall back to fitz.
-    for label, fn in (("pdfplumber", _render_with_pdfplumber), ("fitz", _render_with_fitz)):
+    # Try fitz first — PyMuPDF's parser is more permissive than pdfplumber's
+    # PDFium and handles most malformed / unusual PDFs (compressed, scanned,
+    # non-standard cross-reference tables). pdfplumber only runs as a
+    # fallback for the rare PDF fitz can't open.
+    renderers = (("fitz", _render_with_fitz), ("pdfplumber", _render_with_pdfplumber))
+    last_exc: Exception | None = None
+    last_label: str = ""
+    for i, (label, fn) in enumerate(renderers):
         try:
             return _call_with_timeout(fn, timeout_s=timeout_s, label=f"pdf-render-{label}")
-        except TimeoutError as exc:
-            logger.warning(
-                "PDF render for vision sample timed out ({}) on {}: {} — trying next renderer",
-                label, filename, exc,
-            )
         except Exception as exc:
-            logger.warning(
-                "PDF render for vision sample failed ({}) on {}: {} — trying next renderer",
-                label, filename, exc,
-            )
+            last_exc, last_label = exc, label
+            # Intermediate failures are demoted to DEBUG — they're noise unless
+            # the final renderer also fails, in which case the WARNING below
+            # reports the truly-unrenderable file once.
+            if i < len(renderers) - 1:
+                logger.debug(
+                    "PDF render for vision sample failed ({}) on {}: {} — trying next renderer",
+                    label, filename, exc,
+                )
+    logger.warning(
+        "PDF render for vision sample failed on {} — all renderers exhausted "
+        "(last: {} → {}). Classification will rely on text-only signal.",
+        filename, last_label, last_exc,
+    )
     return []
 
 
