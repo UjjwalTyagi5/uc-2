@@ -432,8 +432,19 @@ def _start_stack_dump_thread(interval_s: int = 300) -> None:
 # Start the diagnostic thread immediately on module load. Daemon thread so
 # it won't keep the process alive on shutdown. 90s interval — short enough
 # that a stuck worker shows up quickly while debugging large batches.
+#
+# Local CLI runners (where you see every log line in real-time and Ctrl+C
+# works) can silence the periodic dumps by setting PIPELINE_DISABLE_STACK_DUMPER=1
+# in the environment before the module loads. Default behaviour (var absent
+# or "0"/"false"/"no") leaves the dumper enabled so the canvas / AKS deploy
+# keeps its silent-hang diagnostic.
 try:
-    _start_stack_dump_thread(interval_s=90)
+    import os as _os_for_dumper_gate
+    _dumper_disabled = (_os_for_dumper_gate.environ.get(
+        "PIPELINE_DISABLE_STACK_DUMPER", "").strip().lower()
+        in ("1", "true", "yes", "on"))
+    if not _dumper_disabled:
+        _start_stack_dump_thread(interval_s=90)
 except Exception:
     pass
 
