@@ -208,6 +208,7 @@ OUTER APPLY (
             WHERE p.[purchase_dtl_id] = br.[purchase_dtl_id]
               AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
               AND ISNULL(p.[is_selected_quote], 0) = 0
+              AND (qi.[supplier_name] IS NULL OR p.[supplier_name] <> qi.[supplier_name])
         ) p
         WHERE p.supplier_rn = 1
     ) p
