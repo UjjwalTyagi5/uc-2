@@ -2980,12 +2980,20 @@ def _safe_blob_filename(name: str) -> str:
           .replace("‍", "")        # zero-width joiner
           .replace(" ", " ")       # narrow no-break space
           .replace("﻿", ""))       # byte-order mark
-    # Control characters + structural URI / path delimiters → underscore.
-    s = _re.sub(r"[\x00-\x1f\x7f\\?#]", "_", s)
-    # Collapse runs of whitespace to a single space.
+    # U+FFFD REPLACEMENT CHARACTER — mojibake leftover; Azure rejects URIs
+    # containing these. Common when non-UTF-8 bytes were decoded as cp1252.
+    s = s.replace("�", "_")
+    # Drop any Unicode "C" category char (Cc control, Cs surrogate,
+    # Co private-use, Cn unassigned, Cf format) — these often slip through
+    # mojibake decoders and break Azure's URI encoder.
+    s = "".join(c for c in s if _ud.category(c)[0] != "C")
+    # Structural URI / path delimiters + ASCII control → underscore.
+    s = _re.sub(r"[\x00-\x1f\x7f\\?#%]", "_", s)
+    # Collapse runs of whitespace and underscores.
     s = _re.sub(r"\s+", " ", s)
+    s = _re.sub(r"_+", "_", s)
     # Trim trailing dots and whitespace (Windows + Azure quirks).
-    s = s.rstrip(". ")
+    s = s.rstrip(". _")
     return s or "_"
 
 def _get_blob_config_by_name(connector_name: str) -> dict:
@@ -11521,12 +11529,25 @@ class PipelineStage123NodeV2(Node):
                     # Collect embedded file contents
                     embedded = []
                     if os.path.isdir(emb_dir):
-                        for emb_name in sorted(os.listdir(emb_dir)):
+                        for emb_idx, emb_name in enumerate(sorted(os.listdir(emb_dir)), 1):
                             emb_path = os.path.join(emb_dir, emb_name)
                             if os.path.isfile(emb_path):
                                 with open(emb_path, "rb") as fh:
                                     emb_content = fh.read()
                                 safe_emb_name = _safe_blob_filename(emb_name)
+                                try:
+                                    safe_emb_name.encode("ascii")
+                                except UnicodeEncodeError:
+                                    _ext = os.path.splitext(emb_name)[1].lower()
+                                    _ext = re.sub(r"[^a-z0-9.]", "", _ext) or ".bin"
+                                    if not _ext.startswith("."):
+                                        _ext = "." + _ext
+                                    safe_emb_name = f"embedded_{att_id}_{emb_idx}{_ext}"
+                                    self._safe_log(
+                                        f"[{pr_no}] [{att_id}] embedded filename "
+                                        f"{emb_name!r} contained non-ASCII Azure "
+                                        f"rejected; using {safe_emb_name!r} instead"
+                                    )
                                 embedded.append({
                                     "filename":    emb_name,
                                     "content":     emb_content,
@@ -11537,8 +11558,24 @@ class PipelineStage123NodeV2(Node):
 
                     # Record parent in attachment_classification — sanitise the
                     # filename so Azure does not reject the URI on NBSP /
-                    # control characters (see _safe_blob_filename).
+                    # control characters / mojibake (see _safe_blob_filename).
+                    # If the sanitised name still isn't pure ASCII, fall back
+                    # to an ASCII-only synthetic name built from att_id +
+                    # original extension so the blob upload always succeeds.
                     safe_parent_name = _safe_blob_filename(att["filename"])
+                    try:
+                        safe_parent_name.encode("ascii")
+                    except UnicodeEncodeError:
+                        _ext = os.path.splitext(att["filename"])[1].lower()
+                        _ext = re.sub(r"[^a-z0-9.]", "", _ext) or ".bin"
+                        if not _ext.startswith("."):
+                            _ext = "." + _ext
+                        safe_parent_name = f"attachment_{att_id}{_ext}"
+                        self._safe_log(
+                            f"[{pr_no}] [{att_id}] filename {att['filename']!r} "
+                            f"contained non-ASCII characters that Azure rejected; "
+                            f"using safe blob name {safe_parent_name!r} instead"
+                        )
                     parent_blob_path = f"procurement/{safe_pr}/{att_id}/{safe_parent_name}"
                     parent_pk = self._upsert_parent_classification(
                         tgt_cs, pr_no, ras_uuid, att_id,
