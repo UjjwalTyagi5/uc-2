@@ -42,6 +42,7 @@ SELECT
     qi.[total_price]        AS primary_total_price,
     qi.[total_price_eur]    AS primary_total_price_eur,
     qi.[payment_terms]      AS primary_payment_terms,
+    qi.[discount]           AS primary_discount,
     qi.[supplier_name]      AS primary_supplier_name,
     qi.[supplier_country]   AS primary_supplier_country,
     qi.[quotation_date]     AS primary_quotation_date,
@@ -61,6 +62,7 @@ SELECT
     proposals.l1_currency,
     proposals.l1_quantity,
     proposals.l1_payment_terms,
+    proposals.l1_discount,
 
     proposals.l2_supplier_name,
     proposals.l2_supplier_country,
@@ -71,6 +73,7 @@ SELECT
     proposals.l2_currency,
     proposals.l2_quantity,
     proposals.l2_payment_terms,
+    proposals.l2_discount,
 
     -- ========== HISTORICAL COMPARISON: CHEAPEST MATCH ==========
     low.[purchase_dtl_id]          AS low_hist_dtl_id,
@@ -84,6 +87,7 @@ SELECT
     low.[unit_price_eur]           AS low_hist_unit_price_eur,
     low.[total_price]              AS low_hist_total_price,
     low.[total_price_eur]          AS low_hist_total_price_eur,
+    low.[discount]                 AS low_hist_discount,
     br.[inflation_pct]             AS low_hist_inflation_pct,
     br.[cpi_inflation_pct]         AS low_hist_cpi_inflation_pct,
     low.[unit_price] * (1 + br.[cpi_inflation_pct] / 100)       AS low_hist_normalized_unit_price,
@@ -103,6 +107,7 @@ SELECT
     lst.[unit_price_eur]           AS last_hist_unit_price_eur,
     lst.[total_price]              AS last_hist_total_price,
     lst.[total_price_eur]          AS last_hist_total_price_eur,
+    lst.[discount]                 AS last_hist_discount,
     br.[inflation_pct_last]        AS last_hist_inflation_pct,
     br.[cpi_inflation_pct_last]    AS last_hist_cpi_inflation_pct,
     lst.[unit_price] * (1 + br.[cpi_inflation_pct_last] / 100)       AS last_hist_normalized_unit_price,
@@ -155,6 +160,7 @@ OUTER APPLY (
         MAX(CASE WHEN rn = 1 THEN p.total_price     END) AS l1_total_price,
         MAX(CASE WHEN rn = 1 THEN p.total_price_eur END) AS l1_total_price_eur,
         MAX(CASE WHEN rn = 1 THEN p.payment_terms   END) AS l1_payment_terms,
+        MAX(CASE WHEN rn = 1 THEN p.discount        END) AS l1_discount,
         MAX(CASE WHEN rn = 1 THEN p.supplier_name   END) AS l1_supplier_name,
         MAX(CASE WHEN rn = 1 THEN p.supplier_country END) AS l1_supplier_country,
         MAX(CASE WHEN rn = 2 THEN p.quantity        END) AS l2_quantity,
@@ -164,6 +170,7 @@ OUTER APPLY (
         MAX(CASE WHEN rn = 2 THEN p.total_price     END) AS l2_total_price,
         MAX(CASE WHEN rn = 2 THEN p.total_price_eur END) AS l2_total_price_eur,
         MAX(CASE WHEN rn = 2 THEN p.payment_terms   END) AS l2_payment_terms,
+        MAX(CASE WHEN rn = 2 THEN p.discount        END) AS l2_discount,
         MAX(CASE WHEN rn = 2 THEN p.supplier_name   END) AS l2_supplier_name,
         MAX(CASE WHEN rn = 2 THEN p.supplier_country END) AS l2_supplier_country
     FROM (
@@ -175,6 +182,7 @@ OUTER APPLY (
             p.[total_price],
             p.[total_price_eur],
             p.[payment_terms],
+            p.[discount],
             p.[supplier_name],
             p.[supplier_country],
             ROW_NUMBER() OVER (
@@ -189,17 +197,19 @@ OUTER APPLY (
                 p.[total_price],
                 p.[total_price_eur],
                 p.[payment_terms],
+                p.[discount],
                 p.[supplier_name],
                 p.[supplier_country],
                 ROW_NUMBER() OVER (
-                    PARTITION BY p.[supplier_name], COALESCE(p.[unit_price_eur], p.[unit_price])
-                    ORDER BY p.[supplier_name] ASC
-                ) AS duplicate_rn
+                    PARTITION BY p.[supplier_name]
+                    ORDER BY COALESCE(p.[unit_price_eur], p.[unit_price]) ASC
+                ) AS supplier_rn
             FROM [ras_procurement].[quotation_extracted_items] p
             WHERE p.[purchase_dtl_id] = br.[purchase_dtl_id]
               AND COALESCE(p.[unit_price_eur], p.[unit_price]) IS NOT NULL
+              AND ISNULL(p.[is_selected_quote], 0) = 0
         ) p
-        WHERE p.duplicate_rn = 1
+        WHERE p.supplier_rn = 1
     ) p
 ) proposals
 
