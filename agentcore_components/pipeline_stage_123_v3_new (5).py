@@ -3536,6 +3536,33 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     ))
 
 
+def _is_llm_server_error(exc: Exception) -> bool:
+    """Return True for transient 5xx server errors from the LLM provider.
+
+    Azure OpenAI / Azure AI Foundry occasionally returns 500 / 502 / 503 /
+    504 on otherwise valid requests (deployment cold-start, model swap,
+    network hiccup, upstream timeout). These are nearly always transient
+    and succeed on retry. Matches by HTTP code, by SDK exception class
+    name, and by the error message keywords.
+    """
+    msg = str(exc).lower()
+    if any(code in msg for code in (
+        "500 ", "500,", "502 ", "502,", "503 ", "503,", "504 ", "504,",
+        "error code: 500", "error code: 502", "error code: 503", "error code: 504",
+    )):
+        return True
+    if any(kw in msg for kw in (
+        "internal server error", "bad gateway", "service unavailable",
+        "gateway timeout", "server had an error",
+    )):
+        return True
+    # openai SDK exception class names
+    cls = type(exc).__name__.lower()
+    if cls in ("internalservererror", "apitimeouterror", "apiconnectionerror"):
+        return True
+    return False
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Return True if the LLM call timed out (our wrapper or the SDK itself).
 
@@ -3749,14 +3776,22 @@ def _call_llm_with_retry(
                 active_llm = llm
                 json_mode_enabled = False
                 continue
-            # Treat rate-limit AND timeout as retryable — both indicate a
-            # transient remote condition (quota / hung socket) rather than
-            # a programming error.
-            is_rl = _is_rate_limit_error(exc)
-            is_to = _is_timeout_error(exc)
-            if (is_rl or is_to) and attempt < max_retries:
-                wait = cooldown_s * (attempt + 1)  # 60s → 120s → 180s
-                kind = "rate-limit" if is_rl else "timeout"
+            # Treat rate-limit, timeout, AND 5xx server errors as retryable —
+            # all three indicate a transient remote condition (quota / hung
+            # socket / Azure-side glitch) rather than a programming error.
+            is_rl   = _is_rate_limit_error(exc)
+            is_to   = _is_timeout_error(exc)
+            is_5xx  = _is_llm_server_error(exc)
+            if (is_rl or is_to or is_5xx) and attempt < max_retries:
+                # Server errors typically resolve in seconds — use a much
+                # shorter backoff (5s → 10s → 20s) than the rate-limit path
+                # (60s+) so we don't add minutes of wait for a momentary 504.
+                if is_5xx and not (is_rl or is_to):
+                    wait = min(60, 5 * (2 ** attempt))   # 5, 10, 20, capped at 60
+                    kind = "server-5xx"
+                else:
+                    wait = cooldown_s * (attempt + 1)    # 60s → 120s → 180s
+                    kind = "rate-limit" if is_rl else "timeout"
                 logger.warning(
                     "LLM {} (attempt {}/{}) — cooling down {}s before retry: {}",
                     kind, attempt + 1, max_retries, wait, exc,
