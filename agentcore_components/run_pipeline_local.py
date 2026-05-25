@@ -29,6 +29,7 @@ Single-PR smoke test before the full Excel:
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -157,6 +158,88 @@ def env_int(key: str, default: int) -> int:
         return int(raw)
     except ValueError:
         sys.exit(f"ERROR: env var {key}={raw!r} is not a valid int")
+
+
+# ─── CLI args + force-reprocess list ──────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    """Parse CLI args. All optional — the default behaviour is unchanged
+    when no flags are passed (Excel path / PR_FILTER come from .env)."""
+    ap = argparse.ArgumentParser(
+        description=(
+            "Run the procurement pipeline locally using credentials from "
+            "`.env` in this folder. All knobs default to the values in .env "
+            "— the flags below are for run-time overrides."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--force-reprocess",
+        default="",
+        metavar="PR1,PR2,…",
+        help=(
+            "Comma-separated PR numbers that should be re-processed even if "
+            "they are currently at stage 8 (COMPLETE) or 99 (EXCEPTION). "
+            "Combined with --force-reprocess-file and the FORCE_REPROCESS_PRS "
+            "env var (union). Only PRs that also appear in EXCEL_PATH are "
+            "actually processed; others are warned about and ignored."
+        ),
+    )
+    ap.add_argument(
+        "--force-reprocess-file",
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to a UTF-8 text file with one PR number per line. Combined "
+            "with --force-reprocess and FORCE_REPROCESS_PRS. Lines beginning "
+            "with `#` are treated as comments."
+        ),
+    )
+    return ap.parse_args()
+
+
+def _collect_force_reprocess_list(
+    args: argparse.Namespace, excel_pr_set: set
+) -> list[str]:
+    """Build the deduplicated set of PRs to force-reprocess from all three
+    sources (CLI csv + file + env), intersect with the Excel list, warn on
+    any that aren't in the Excel."""
+    bucket: set[str] = set()
+
+    def _absorb_csv(s: str) -> None:
+        for p in (s or "").split(","):
+            p = p.strip()
+            if p:
+                bucket.add(p)
+
+    _absorb_csv(getattr(args, "force_reprocess", "") or "")
+    _absorb_csv(os.environ.get("FORCE_REPROCESS_PRS") or "")
+
+    file_path = (getattr(args, "force_reprocess_file", "") or "").strip()
+    if file_path:
+        fp = Path(file_path)
+        if not fp.exists():
+            sys.exit(f"ERROR: --force-reprocess-file not found: {fp}")
+        for line in fp.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            bucket.add(line)
+
+    if not bucket:
+        return []
+
+    in_excel = sorted(bucket & excel_pr_set)
+    not_in_excel = sorted(bucket - excel_pr_set)
+    if not_in_excel:
+        preview = not_in_excel[:5]
+        more = f" (+{len(not_in_excel) - 5} more)" if len(not_in_excel) > 5 else ""
+        print(
+            f"[init] WARN: {len(not_in_excel)} force-reprocess PR(s) are NOT in "
+            f"EXCEL_PATH — they will be IGNORED (not reset, not processed): "
+            f"{preview}{more}"
+        )
+    return in_excel
 
 
 # ─── build Azure OpenAI LLM + embeddings ──────────────────────────────────────
@@ -434,7 +517,7 @@ class _ConnData:
 
 # ─── attach the pipeline instance, wire every attribute, run ──────────────────
 
-def build_and_run() -> int:
+def build_and_run(args: argparse.Namespace | None = None) -> int:
     # Order matters: agentcore stubs must be in sys.modules BEFORE the
     # pipeline file is loaded (its top-level `from agentcore.* import …`
     # statements resolve at module-load time). The Pinecone shim then patches
@@ -589,6 +672,31 @@ def build_and_run() -> int:
         except Exception as exc:
             sys.exit(f"ERROR: {label} DB connection failed: {exc}")
 
+    # ── Force-reprocess override ─────────────────────────────────────────────
+    # CLI args + env var + file all funnel through _collect_force_reprocess_list.
+    # The intersection with the Excel list gets its tracker rows reset
+    # (current_stage_fk → NULL, retry_count += 1, pipeline_exceptions cleared)
+    # so the worker-side skip check at stage 8/99 no longer short-circuits
+    # them — they re-run end-to-end like any normal Excel PR. PRs NOT in the
+    # Excel list are warned about and ignored (resetting them would leave
+    # them stranded since nothing else would pick them up).
+    if args is not None:
+        excel_pr_set: set[str] = set()
+        if inst.pr_list_data is not None:
+            payload = getattr(inst.pr_list_data, "data", None) or {}
+            excel_pr_set = set(payload.get("pr_numbers", []) or [])
+        force_prs = _collect_force_reprocess_list(args, excel_pr_set)
+        if force_prs:
+            print(
+                f"[init] Force-reprocessing {len(force_prs)} PR(s) — "
+                f"resetting their tracker rows (will bypass the stage 8/99 skip)"
+            )
+            try:
+                n_reset = inst._batch_reset_for_reprocess(tgt_cs, force_prs)
+                print(f"[init]   tracker rows updated: {n_reset}")
+            except Exception as exc:
+                sys.exit(f"ERROR: failed to reset trackers for force-reprocess PRs: {exc}")
+
     # ── run the pipeline synchronously ───────────────────────────────────────
     job_id = str(uuid.uuid4())[:8]
     print(f"\n[run] job_id={job_id} | workers={inst.parallel_workers} "
@@ -615,4 +723,4 @@ def build_and_run() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(build_and_run())
+    sys.exit(build_and_run(_parse_args()))
