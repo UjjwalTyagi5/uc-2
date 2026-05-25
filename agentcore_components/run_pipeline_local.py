@@ -195,15 +195,46 @@ def _parse_args() -> argparse.Namespace:
             "with `#` are treated as comments."
         ),
     )
+    ap.add_argument(
+        "--force-all",
+        action="store_true",
+        help=(
+            "Force-reprocess EVERY PR in EXCEL_PATH regardless of current "
+            "stage (overrides the worker-side stage 8/99 skip for the whole "
+            "Excel). Equivalent env var: FORCE_REPROCESS_ALL=1."
+        ),
+    )
     return ap.parse_args()
 
 
 def _collect_force_reprocess_list(
     args: argparse.Namespace, excel_pr_set: set
 ) -> list[str]:
-    """Build the deduplicated set of PRs to force-reprocess from all three
-    sources (CLI csv + file + env), intersect with the Excel list, warn on
-    any that aren't in the Excel."""
+    """Build the deduplicated set of PRs to force-reprocess from all sources
+    (CLI csv + file + env + the --force-all / FORCE_REPROCESS_ALL flag),
+    intersect with the Excel list, warn on any that aren't in the Excel.
+
+    If --force-all or FORCE_REPROCESS_ALL=1 is set, every PR in the Excel
+    is force-reprocessed regardless of current stage — overrides the
+    worker-side stage 8/99 skip for the whole batch.
+    """
+    # Short-circuit: --force-all (or FORCE_REPROCESS_ALL env) means every
+    # PR in the loaded Excel gets reset and reprocessed. Other flags are
+    # redundant in this mode but harmless.
+    force_all_env = (os.environ.get("FORCE_REPROCESS_ALL") or "").strip().lower()
+    force_all = (
+        bool(getattr(args, "force_all", False))
+        or force_all_env in ("1", "true", "yes", "on")
+    )
+    if force_all:
+        if not excel_pr_set:
+            print(
+                "[init] WARN: --force-all / FORCE_REPROCESS_ALL is set but no "
+                "Excel PR list is loaded — nothing to force-reprocess."
+            )
+            return []
+        return sorted(excel_pr_set)
+
     bucket: set[str] = set()
 
     def _absorb_csv(s: str) -> None:
