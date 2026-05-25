@@ -2953,6 +2953,41 @@ def _connect(cs: str):
 
 # ── Blob helpers ───────────────────────────────────────────────────────────────
 
+def _safe_blob_filename(name: str) -> str:
+    """Sanitise a filename so it can be used in an Azure Blob Storage URI.
+
+    Azure accepts most Unicode in blob names but throws InvalidUri on a
+    handful of characters that look harmless but break URI encoding:
+      • \\xa0 (non-breaking space) and other Unicode whitespace
+      • C0 / C1 control characters
+      • Backslash, ?, # — URI / path delimiters
+      • Trailing dots and spaces — Windows-quirk holdovers
+
+    Preserves Unicode letters (Chinese, Cyrillic, Arabic, accented Latin)
+    because Azure handles them fine once the structural characters above
+    are normalised. Returns "_" for an empty result so the blob path is
+    always non-empty.
+    """
+    import re as _re
+    import unicodedata as _ud
+    if not name:
+        return "_"
+    s = _ud.normalize("NFC", str(name))
+    # Map troublesome Unicode whitespace to a plain space / nothing.
+    s = (s.replace("\xa0", " ")        # non-breaking space
+          .replace("​", "")        # zero-width space
+          .replace("‌", "")        # zero-width non-joiner
+          .replace("‍", "")        # zero-width joiner
+          .replace(" ", " ")       # narrow no-break space
+          .replace("﻿", ""))       # byte-order mark
+    # Control characters + structural URI / path delimiters → underscore.
+    s = _re.sub(r"[\x00-\x1f\x7f\\?#]", "_", s)
+    # Collapse runs of whitespace to a single space.
+    s = _re.sub(r"\s+", " ", s)
+    # Trim trailing dots and whitespace (Windows + Azure quirks).
+    s = s.rstrip(". ")
+    return s or "_"
+
 def _get_blob_config_by_name(connector_name: str) -> dict:
     name = (connector_name or "").strip()
     if not name:
@@ -11491,16 +11526,20 @@ class PipelineStage123NodeV2(Node):
                             if os.path.isfile(emb_path):
                                 with open(emb_path, "rb") as fh:
                                     emb_content = fh.read()
+                                safe_emb_name = _safe_blob_filename(emb_name)
                                 embedded.append({
                                     "filename":    emb_name,
                                     "content":     emb_content,
-                                    "blob_path":   f"procurement/{safe_pr}/{att_id}/extracted/{emb_name}",
+                                    "blob_path":   f"procurement/{safe_pr}/{att_id}/extracted/{safe_emb_name}",
                                     "att_id":      att_id,
                                     "is_embedded": True,
                                 })
 
-                    # Record parent in attachment_classification
-                    parent_blob_path = f"procurement/{safe_pr}/{att_id}/{att['filename']}"
+                    # Record parent in attachment_classification — sanitise the
+                    # filename so Azure does not reject the URI on NBSP /
+                    # control characters (see _safe_blob_filename).
+                    safe_parent_name = _safe_blob_filename(att["filename"])
+                    parent_blob_path = f"procurement/{safe_pr}/{att_id}/{safe_parent_name}"
                     parent_pk = self._upsert_parent_classification(
                         tgt_cs, pr_no, ras_uuid, att_id,
                         parent_blob_path,
@@ -11515,7 +11554,7 @@ class PipelineStage123NodeV2(Node):
                     all_files.append({
                         "filename":    att["filename"],
                         "content":     att["content"],
-                        "blob_path":   f"procurement/{safe_pr}/{att_id}/{att['filename']}",
+                        "blob_path":   f"procurement/{safe_pr}/{att_id}/{safe_parent_name}",
                         "att_id":      att_id,
                         "is_embedded": False,
                     })
