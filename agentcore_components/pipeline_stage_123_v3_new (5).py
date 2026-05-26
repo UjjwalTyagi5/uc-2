@@ -332,18 +332,9 @@ class _ConnectionPool:
             raw = pyodbc.connect(cs, timeout=login_timeout)
             # Set a default query timeout so a slow / locked SQL Server
             # statement can't silently block a worker thread forever.
-            # Default 900s (15 min) is enough for cleanup DELETEs against
-            # un-indexed join chains when the target tables have grown to
-            # tens of thousands of rows. Override via DB_QUERY_TIMEOUT_S
-            # env var when running locally.
+            # 300s is generous for bulk ETL inserts but still bounded.
             try:
-                import os as _os_for_timeout
-                _q_to_raw = (_os_for_timeout.environ.get("DB_QUERY_TIMEOUT_S") or "").strip()
-                try:
-                    _q_to = int(_q_to_raw) if _q_to_raw else 900
-                except ValueError:
-                    _q_to = 900
-                raw.timeout = max(60, _q_to)
+                raw.timeout = 300
             except Exception:
                 pass
             with self._cv:
@@ -3030,20 +3021,6 @@ def _is_deadlock_error(exc: Exception) -> bool:
     if "40001" in msg or "1205" in msg:
         return True
     return "deadlock" in msg.lower()
-
-
-def _is_query_timeout_error(exc: Exception) -> bool:
-    """True for pyodbc / SQL Server query-timeout errors (HYT00).
-
-    Pyodbc raises OperationalError ('HYT00', 'Query timeout expired')
-    when raw.timeout elapses mid-execute. Common during cleanup DELETEs
-    when target tables have unindexed FK columns and the join chain
-    falls back to scans. Retryable: the next attempt may complete
-    faster (cache warmed, less contention) or finally succeed if the
-    user has just added the missing indexes.
-    """
-    msg = str(exc)
-    return "HYT00" in msg or "query timeout expired" in msg.lower()
 
 
 def _connect(cs: str):
@@ -10992,34 +10969,22 @@ class PipelineStage123NodeV2(Node):
                     )
                 return result
             except Exception as exc:
-                # Two retryable classes:
-                #   • Deadlock victim (1205 / 40001) — historical reason this
-                #     wrapper exists, fires when parallel cleanups race on
-                #     shared join chains
-                #   • Query timeout (HYT00) — fires when cleanup DELETEs hit
-                #     the per-statement timeout because target tables lack
-                #     indexes on FK columns. Same fix (retry the whole
-                #     transaction) and the next attempt often succeeds if
-                #     missing indexes have just been added.
-                is_dl   = _is_deadlock_error(exc)
-                is_qto  = _is_query_timeout_error(exc)
-                if not (is_dl or is_qto):
+                if not _is_deadlock_error(exc):
                     raise
-                kind = "DEADLOCK" if is_dl else "QUERY-TIMEOUT"
                 if attempt >= max_retries:
                     self._safe_log(
-                        f"[{pr_no}] {op_name} — {kind} retries exhausted "
+                        f"[{pr_no}] {op_name} — DEADLOCK retries exhausted "
                         f"(gave up after {max_retries + 1} attempt(s)): {exc}"
                     )
                     logger.opt(exception=True).error(
-                        "[{}] {} — {} retries exhausted: {}",
-                        pr_no, op_name, kind, exc,
+                        "[{}] {} — DEADLOCK retries exhausted: {}",
+                        pr_no, op_name, exc,
                     )
                     raise
                 attempt += 1
                 delay = base_delay * (2 ** attempt) * (1 + random.random() * 0.3)
                 self._safe_log(
-                    f"[{pr_no}] {op_name} — {kind} victim "
+                    f"[{pr_no}] {op_name} — DEADLOCK victim "
                     f"(attempt {attempt}/{max_retries}) — "
                     f"sleeping {delay:.1f}s then retrying"
                 )
