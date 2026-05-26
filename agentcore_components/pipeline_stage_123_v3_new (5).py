@@ -694,6 +694,67 @@ class FileExtractor:
             logger.error(f"OOXML error ({os.path.basename(file_path)}): {exc}")
             return False
 
+    def _parse_ole10native(self, data: bytes) -> tuple[Optional[bytes], Optional[str]]:
+        """Parse the binary structure of an OLE10Native stream.
+        Returns:
+            (payload_bytes, suggested_filename)
+        """
+        import struct
+        try:
+            if len(data) < 6:
+                return None, None
+            
+            # 1. Total length (4 bytes)
+            total_len = struct.unpack('<I', data[0:4])[0]
+            # 2. Type/flags (2 bytes, e.g. 0x0002)
+            type_flags = struct.unpack('<H', data[4:6])[0]
+            
+            # 3. Label/filename (null-terminated string)
+            idx = 6
+            label_end = data.find(b'\x00', idx)
+            if label_end == -1:
+                return None, None
+            label = data[idx:label_end].decode('utf-8', errors='ignore')
+            
+            # 4. Full path (null-terminated string)
+            idx = label_end + 1
+            path_end = data.find(b'\x00', idx)
+            if path_end == -1:
+                return None, None
+            path = data[idx:path_end].decode('utf-8', errors='ignore')
+            
+            # 5. Reserved/unknown (4 bytes)
+            idx = path_end + 1
+            if idx + 4 > len(data):
+                return None, None
+            idx += 4
+            
+            # 6. Temp path length (4 bytes)
+            if idx + 4 > len(data):
+                return None, None
+            temp_path_len = struct.unpack('<I', data[idx:idx+4])[0]
+            idx += 4
+            
+            # 7. Temp path (temp_path_len bytes)
+            if idx + temp_path_len > len(data):
+                return None, None
+            idx += temp_path_len
+            
+            # 8. Payload size (4 bytes)
+            if idx + 4 > len(data):
+                return None, None
+            payload_size = struct.unpack('<I', data[idx:idx+4])[0]
+            idx += 4
+            
+            # 9. Payload (payload_size bytes)
+            if idx + payload_size > len(data):
+                return None, None
+            payload = data[idx:idx+payload_size]
+            
+            return payload, label
+        except Exception:
+            return None, None
+
     def _extract_from_bin(self, bin_path: str, out: str) -> None:
         try:
             import olefile
@@ -706,19 +767,32 @@ class FileExtractor:
                     data  = ole.openstream(entry).read()
                     if not data or len(data) < 16:
                         continue
-                    offset, ext = self._find_payload(data)
-                    if offset is None:
-                        continue
-                    payload   = data[offset:]
+                    
+                    payload = None
                     suggested = None
+                    
                     if sname.lower() in ("\x01ole10native", "ole10native"):
+                        payload, suggested = self._parse_ole10native(data)
+                        
+                    if payload is None:
+                        # Fallback to existing signature-based extraction logic
+                        offset, ext = self._find_payload(data)
+                        if offset is None:
+                            continue
+                        payload = data[offset:]
+                        
+                        suggested_old = None
                         try:
                             end = data.find(b"\x00", 4)
                             if end != -1 and end - 4 < 260:
-                                suggested = data[4:end].decode(errors="ignore")
+                                val = data[4:end].decode(errors="ignore")
+                                val_san = "".join(ch for ch in val if ch.isprintable() and ord(ch) > 31).strip()
+                                if val_san:
+                                    suggested_old = val
                         except Exception:
                             pass
-                    suggested = suggested or f"embedded_file{ext}"
+                        suggested = suggested_old or f"embedded_file{ext}"
+                        
                     target = self.unique_path(out, self.with_prefix(self.sanitize(suggested)))
                     with open(target, "wb") as f:
                         f.write(payload)
@@ -746,19 +820,32 @@ class FileExtractor:
                     data  = ole.openstream(entry).read()
                     if not data or len(data) < 16:
                         continue
-                    offset, ext = self._find_payload(data)
-                    if offset is None:
-                        continue
-                    payload   = data[offset:]
+                    
+                    payload = None
                     suggested = None
+                    
                     if sname.lower() in ("\x01ole10native", "ole10native"):
+                        payload, suggested = self._parse_ole10native(data)
+                        
+                    if payload is None:
+                        # Fallback to existing signature-based extraction logic
+                        offset, ext = self._find_payload(data)
+                        if offset is None:
+                            continue
+                        payload = data[offset:]
+                        
+                        suggested_old = None
                         try:
                             end = data.find(b"\x00", 4)
                             if end != -1 and end - 4 < 260:
-                                suggested = data[4:end].decode(errors="ignore")
+                                val = data[4:end].decode(errors="ignore")
+                                val_san = "".join(ch for ch in val if ch.isprintable() and ord(ch) > 31).strip()
+                                if val_san:
+                                    suggested_old = val
                         except Exception:
                             pass
-                    suggested = suggested or f"embedded_file{ext}"
+                        suggested = suggested_old or f"embedded_file{ext}"
+                        
                     target = self.unique_path(out, self.with_prefix(self.sanitize(suggested)))
                     with open(target, "wb") as f:
                         f.write(payload)
