@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
-import time
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -14,6 +15,12 @@ from loguru import logger
 from agentcore.custom import Node
 from agentcore.io import BoolInput, DataInput, IntInput, MessageInput, MessageTextInput, MultilineInput, Output
 from agentcore.schema.data import Data
+
+
+# pyodbc pooling is on by default; set explicitly so the behaviour is visible.
+# Short-lived connections (FK toggle, per-failure status writes, smoke tests)
+# benefit most — they get reused instead of doing a full ODBC handshake.
+pyodbc.pooling = True
 
 
 class AgentCoreETLSync(Node):
@@ -298,15 +305,14 @@ class AgentCoreETLSync(Node):
                         pass
                 if attempt >= retries or not self._is_transient(exc):
                     try:
-                        conn2 = self._connect(tgt_cs)
-                        cur2  = conn2.cursor()
-                        self._write_status(cur2, etl_id, "Failed", result["rows"], str(exc))
-                        conn2.commit()
-                        conn2.close()
+                        with contextlib.closing(self._connect(tgt_cs)) as conn2:
+                            cur2 = conn2.cursor()
+                            self._write_status(cur2, etl_id, "Failed", result["rows"], str(exc))
+                            conn2.commit()
                     except Exception:
-                        pass
+                        logger.exception(f"{tag} failed to record 'Failed' status row")
                     result["error"] = str(exc)
-                    logger.error(f"{tag} ✗ FAILED (attempt {attempt+1}): {exc}")
+                    logger.exception(f"{tag} ✗ FAILED (attempt {attempt+1})")
                     return result
                 delay = 2 ** attempt
                 logger.warning(
@@ -336,35 +342,38 @@ class AgentCoreETLSync(Node):
             src_cs  = self._sqlserver_conn_str(src_cfg)
             tgt_cs  = self._sqlserver_conn_str(tgt_cfg)
         except Exception as exc:
-            logger.error(f"[ETL] connection config error: {exc}")
+            logger.exception("[ETL] connection config error")
             return Data(data={"success": False, "error": f"Connection config error: {exc}"})
 
         for label, cs in [("source", src_cs), ("target", tgt_cs)]:
             try:
-                c = self._connect(cs)
-                c.close()
+                with contextlib.closing(self._connect(cs)):
+                    pass
                 logger.info(f"[ETL] {label} DB connection OK")
             except Exception as exc:
-                logger.error(f"[ETL] cannot connect to {label} DB: {exc}")
+                logger.exception(f"[ETL] cannot connect to {label} DB")
                 return Data(data={"success": False, "error": f"Cannot connect to {label} DB: {exc}"})
 
-        filters    = json.loads(self.table_filters_json     or "{}")
-        exclusions = json.loads(self.column_exclusions_json or "{}")
+        try:
+            filters    = json.loads(self.table_filters_json     or "{}")
+            exclusions = json.loads(self.column_exclusions_json or "{}")
+        except Exception as exc:
+            logger.exception("[ETL] invalid filters / exclusions JSON")
+            return Data(data={"success": False, "error": f"Invalid filters/exclusions JSON: {exc}"})
 
         # ── read control table ─────────────────────────────────────────
         logger.info(f"[ETL] reading control table: {self.sync_control_table}")
         try:
-            ctrl = self._connect(tgt_cs)
-            cur  = ctrl.cursor()
-            cur.execute(
-                f"SELECT ETLId, Source, Destination, SyncHours "
-                f"FROM {self._quote(self.sync_control_table)} "
-                f"WHERE EnableSync = 1 ORDER BY ETLId"
-            )
-            configs = cur.fetchall()
-            ctrl.close()
+            with contextlib.closing(self._connect(tgt_cs)) as ctrl:
+                cur = ctrl.cursor()
+                cur.execute(
+                    f"SELECT ETLId, Source, Destination, SyncHours "
+                    f"FROM {self._quote(self.sync_control_table)} "
+                    f"WHERE EnableSync = 1 ORDER BY ETLId"
+                )
+                configs = cur.fetchall()
         except Exception as exc:
-            logger.error(f"[ETL] cannot read control table: {exc}")
+            logger.exception("[ETL] cannot read control table")
             return Data(data={"success": False, "error": f"Cannot read control table: {exc}"})
 
         if not configs:
@@ -426,81 +435,100 @@ def _run_full_sync(node, src_cs, tgt_cs, filters, exclusions, configs,
         f"{[row[2] for row in configs]}"
     )
 
-    # ── disable FK constraints ─────────────────────────────────────────
-    if node.disable_constraints:
-        logger.info(f"[ETL job={job_id}] disabling FK constraints on all target tables")
-        try:
-            fk = node._connect(tgt_cs)
-            fc = fk.cursor()
-            for _, _, tgt_tbl, _ in configs:
-                node._toggle_constraints(fc, tgt_tbl, enable=False)
-                logger.info(f"[ETL job={job_id}] FK disabled: {tgt_tbl}")
-            fk.commit()
-            fk.close()
-        except Exception as exc:
-            logger.warning(f"[ETL job={job_id}] FK disable failed (continuing): {exc}")
+    results: list[dict] = []
+    try:
+        # ── disable FK constraints ─────────────────────────────────────
+        if node.disable_constraints:
+            logger.info(f"[ETL job={job_id}] disabling FK constraints on all target tables")
+            try:
+                with contextlib.closing(node._connect(tgt_cs)) as fk:
+                    fc = fk.cursor()
+                    for _, _, tgt_tbl, _ in configs:
+                        node._toggle_constraints(fc, tgt_tbl, enable=False)
+                        logger.info(f"[ETL job={job_id}] FK disabled: {tgt_tbl}")
+                    fk.commit()
+            except Exception:
+                logger.exception(f"[ETL job={job_id}] FK disable failed (continuing)")
 
-    # ── sync all tables in parallel ────────────────────────────────────
-    logger.info(
-        f"[ETL job={job_id}] starting parallel sync "
-        f"({table_workers} tables at a time)"
-    )
-    results = []
-    with ThreadPoolExecutor(max_workers=table_workers) as pool:
-        futures = {
-            pool.submit(
-                node._sync_table,
-                src_cs, tgt_cs,
-                etl_id, src_tbl, tgt_tbl,
-                filters, exclusions, job_id,
-            ): tgt_tbl
-            for etl_id, src_tbl, tgt_tbl, _ in configs
-        }
-        for f in as_completed(futures):
-            result = f.result()
-            results.append(result)
-            status_icon = "✓" if result["status"] == "success" else "✗"
-            logger.info(
-                f"[ETL job={job_id}] {status_icon} table completed: "
-                f"{result['target']} — status={result['status']} "
-                f"rows={result['rows']:,}"
-                + (f" error={result['error']}" if result["error"] else "")
-            )
-
-    # ── re-enable FK constraints ───────────────────────────────────────
-    if node.disable_constraints:
-        logger.info(f"[ETL job={job_id}] re-enabling FK constraints")
-        try:
-            fk2 = node._connect(tgt_cs)
-            fc2 = fk2.cursor()
-            for _, _, tgt_tbl, _ in configs:
-                node._toggle_constraints(fc2, tgt_tbl, enable=True)
-                logger.info(f"[ETL job={job_id}] FK re-enabled: {tgt_tbl}")
-            fk2.commit()
-            fk2.close()
-        except Exception as exc:
-            logger.warning(f"[ETL job={job_id}] FK re-enable failed: {exc}")
-
-    # ── final summary ──────────────────────────────────────────────────
-    elapsed   = (datetime.now() - started_at).total_seconds()
-    succeeded = [r for r in results if r["status"] == "success"]
-    failed    = [r for r in results if r["status"] != "success"]
-    total_rows = sum(r["rows"] for r in results)
-
-    logger.info(
-        f"[ETL job={job_id}] ══ background sync finished in {elapsed:.1f}s ══"
-    )
-    logger.info(
-        f"[ETL job={job_id}] summary: "
-        f"{len(succeeded)}/{len(results)} tables succeeded | "
-        f"{total_rows:,} total rows synced"
-    )
-    if failed:
-        logger.error(
-            f"[ETL job={job_id}] FAILED tables ({len(failed)}): "
-            f"{[r['target'] for r in failed]}"
+        # ── sync all tables in parallel ────────────────────────────────
+        logger.info(
+            f"[ETL job={job_id}] starting parallel sync "
+            f"({table_workers} tables at a time)"
         )
-        for r in failed:
+        with ThreadPoolExecutor(max_workers=table_workers) as pool:
+            futures = {
+                pool.submit(
+                    node._sync_table,
+                    src_cs, tgt_cs,
+                    etl_id, src_tbl, tgt_tbl,
+                    filters, exclusions, job_id,
+                ): tgt_tbl
+                for etl_id, src_tbl, tgt_tbl, _ in configs
+            }
+            for f in as_completed(futures):
+                tgt_tbl = futures[f]
+                try:
+                    result = f.result()
+                except Exception as exc:
+                    logger.exception(
+                        f"[ETL job={job_id}] worker for {tgt_tbl} raised — recording failure"
+                    )
+                    result = {
+                        "etl_id": None, "source": "?", "target": tgt_tbl,
+                        "status": "failed", "rows": 0, "error": str(exc),
+                    }
+                results.append(result)
+                status_icon = "✓" if result["status"] == "success" else "✗"
+                logger.info(
+                    f"[ETL job={job_id}] {status_icon} table completed: "
+                    f"{result['target']} — status={result['status']} "
+                    f"rows={result['rows']:,}"
+                    + (f" error={result['error']}" if result["error"] else "")
+                )
+
+    except Exception:
+        logger.exception(f"[ETL job={job_id}] background sync crashed with unhandled exception")
+    finally:
+        # ── re-enable FK constraints ───────────────────────────────────
+        # Always runs, even if the parallel sync block above raised, so the
+        # target DB never gets left with constraints disabled.
+        if node.disable_constraints:
+            logger.info(f"[ETL job={job_id}] re-enabling FK constraints")
+            try:
+                with contextlib.closing(node._connect(tgt_cs)) as fk2:
+                    fc2 = fk2.cursor()
+                    for _, _, tgt_tbl, _ in configs:
+                        try:
+                            node._toggle_constraints(fc2, tgt_tbl, enable=True)
+                            logger.info(f"[ETL job={job_id}] FK re-enabled: {tgt_tbl}")
+                        except Exception:
+                            logger.exception(
+                                f"[ETL job={job_id}] FK re-enable failed for {tgt_tbl} (continuing)"
+                            )
+                    fk2.commit()
+            except Exception:
+                logger.exception(f"[ETL job={job_id}] FK re-enable connection failed")
+
+        # ── final summary ──────────────────────────────────────────────
+        elapsed   = (datetime.now() - started_at).total_seconds()
+        succeeded = [r for r in results if r["status"] == "success"]
+        failed    = [r for r in results if r["status"] != "success"]
+        total_rows = sum(r["rows"] for r in results)
+
+        logger.info(
+            f"[ETL job={job_id}] ══ background sync finished in {elapsed:.1f}s ══"
+        )
+        logger.info(
+            f"[ETL job={job_id}] summary: "
+            f"{len(succeeded)}/{len(results)} tables succeeded | "
+            f"{total_rows:,} total rows synced"
+        )
+        if failed:
             logger.error(
-                f"[ETL job={job_id}]   ✗ {r['target']}: {r['error']}"
+                f"[ETL job={job_id}] FAILED tables ({len(failed)}): "
+                f"{[r['target'] for r in failed]}"
             )
+            for r in failed:
+                logger.error(
+                    f"[ETL job={job_id}]   ✗ {r['target']}: {r['error']}"
+                )
