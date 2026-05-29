@@ -982,7 +982,7 @@ _CLASSIFICATION_MAP = {"E-Auction": "E-Auction Results", "Other": "Others"}
 _SUPPORTED_CLASSIFY_EXTS = {
     ".xlsx", ".xls", ".csv", ".pdf", ".docx", ".doc",
     ".pptx", ".ppt", ".txt", ".html", ".htm",
-    ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
+    ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".msg",
 }
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 _MAX_CLASSIFY_CHARS = 100000  # safety cap inside each extractor only — the
@@ -5140,6 +5140,29 @@ def _strip_contact_suffix(name: str) -> str:
     ).strip()
 
 
+# Trailing legal-entity forms. Stripped before fuzzy comparison so a legal
+# suffix present on one quote but absent on another (e.g. "X S.A. de C.V."
+# vs "X") doesn't inflate the length difference and drag the SequenceMatcher
+# ratio below threshold. Anchored to end-of-string and applied repeatedly so
+# stacked forms ("Foo Co. Ltd.") peel off one at a time.
+_LEGAL_SUFFIX_RE = re.compile(
+    r'[\s,]*\b('
+    r's\.?a\.?\s*de\s*c\.?v\.?|pvt\.?\s*ltd\.?|private\s+limited|'
+    r'co\.?,?\s*ltd\.?|s\.?r\.?l\.?|gmbh|llc|ltd\.?|inc\.?|corp\.?|'
+    r's\.?a\.?|company|co\.?'
+    r')\.?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _strip_legal_suffix(s: str) -> str:
+    prev = None
+    while prev != s:
+        prev = s
+        s = _LEGAL_SUFFIX_RE.sub('', s).strip()
+    return s
+
+
 def _is_acronym_of(short: str, long_name: str) -> bool:
     """True if short is all-caps (≤ 6 chars) and matches the word initials of long_name."""
     if not short.isupper() or len(short) > 6:
@@ -5211,15 +5234,22 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
     supplier that quotes on multiple line items can have slightly different
     name spellings on each quote — e.g. "Motherson Automotive Technologies
     & Engineering (MATE - ROBIS)" vs "Motherson Automotive Technologies &
-    Engineering (A Division of Motherson Sumi Systems Ltd.)"). Five merge
-    rules — applied in this order so cheaper checks short-circuit:
+    Engineering (A Division of Motherson Sumi Systems Ltd.)"). Merge rules —
+    applied in this order so cheaper checks short-circuit:
       1. Exact (after contact-suffix strip + lowercase).
       2. Substring.
       3. Paren-stripped exact ("X (Branch A)" + "X (Branch B)" → both
          strip to "X" and merge — handles the Motherson case where
          qualifying parentheticals differ but the legal name is identical).
-      4. SequenceMatcher ratio >= _CANONICALIZE_THRESHOLD (0.82 default).
-      5. Acronym ("MATE" matches "Motherson Automotive Tech & Eng").
+      4. Legal-suffix-stripped exact ("X S.A. de C.V." + "X" → both strip
+         to "X" and merge).
+      5. SequenceMatcher ratio >= _CANONICALIZE_THRESHOLD (0.82 default) on
+         the full cleaned names.
+      6. SequenceMatcher ratio >= threshold on the legal-suffix-stripped
+         cores — catches a spelling variant plus a differing legal suffix,
+         where the suffix would drag the full-name ratio under threshold
+         ("Cumputadoras Megacentro" vs "Computadoras Megacentro S.A. de C.V.").
+      7. Acronym ("MATE" matches "Motherson Automotive Tech & Eng").
 
     Country guard — two names do NOT merge when either:
       - both have non-empty supplier_country and they differ, OR
@@ -5229,7 +5259,9 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
     LTD" stay separate even though every other rule would match them.
 
     Canonical preference within a cluster: RAS-known supplier_name first,
-    else the shortest member. After clustering, supplier_match_conf is
+    else the most frequently extracted spelling in this PR (longest on
+    ties, to keep the fuller legal name over a less-common typo). After
+    clustering, supplier_match_conf is
     recomputed for ALL items against the RAS supplier set so ranking uses
     canonical names (this also wipes the earlier _apply_price_alignment_boost,
     same as doc-intel).
@@ -5252,10 +5284,12 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
     # with the first non-empty country seen for each name.
     raw_names: list[str] = []
     name_country: dict[str, str] = {}
+    name_count: dict[str, int] = {}
     for it in items:
         n = (it.get("supplier_name") or "").strip()
         if not n:
             continue
+        name_count[n] = name_count.get(n, 0) + 1
         if n not in name_country:
             raw_names.append(n)
             name_country[n] = (it.get("supplier_country") or "").strip().lower()
@@ -5291,11 +5325,13 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
         a_country = name_country.get(a, "")
         a_geo     = _name_geo_tokens(a_clean)
         a_paren   = _strip_parens(a_clean)
+        a_core    = _strip_legal_suffix(a_paren)
         for b in raw_names[i + 1:]:
             b_clean   = _strip_contact_suffix(b).lower()
             b_country = name_country.get(b, "")
             b_geo     = _name_geo_tokens(b_clean)
             b_paren   = _strip_parens(b_clean)
+            b_core    = _strip_legal_suffix(b_paren)
 
             # Country-branch guard — keeps "ACME Corp India" and
             # "ACME Corp China" separate even when the LLM forgot to
@@ -5311,7 +5347,17 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
                 _union(a, b)
             elif a_paren and b_paren and a_paren == b_paren:
                 _union(a, b)
+            elif a_core and b_core and a_core == b_core:
+                # Legal-suffix-only difference ("X S.A. de C.V." vs "X").
+                _union(a, b)
             elif SequenceMatcher(None, a_clean, b_clean).ratio() >= threshold:
+                _union(a, b)
+            elif a_core and b_core and SequenceMatcher(None, a_core, b_core).ratio() >= threshold:
+                # Fuzzy on legal-stripped cores — catches a spelling variant
+                # combined with a differing legal suffix, where the suffix
+                # would otherwise pull the full-name ratio under threshold
+                # ("Cumputadoras Megacentro" vs "Computadoras Megacentro
+                # S.A. de C.V.").
                 _union(a, b)
             elif _is_acronym_of(a.strip(), b) or _is_acronym_of(b.strip(), a):
                 _union(a, b)
@@ -5324,7 +5370,12 @@ def _canonicalize_supplier_names(items: list[dict], ctx, thresholds: dict | None
     canonical_names: dict[str, str] = {}
     for members in clusters.values():
         ras_match = next((m for m in members if m.lower() in ras_known), None)
-        canonical = ras_match if ras_match else min(members, key=len)
+        # Prefer a RAS-known name; otherwise the most frequently extracted
+        # spelling in this PR, breaking ties toward the longest (keeps the
+        # fuller legal name and avoids picking a less-common typo as canonical).
+        canonical = ras_match if ras_match else max(
+            members, key=lambda m: (name_count.get(m, 0), len(m))
+        )
         for m in members:
             canonical_names[m] = canonical
 
