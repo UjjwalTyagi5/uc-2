@@ -2174,6 +2174,27 @@ PART A — UNIVERSAL RULES (apply in order to EVERY candidate)
    installation service, AMC, or warranty — and the source is the parent
    product itself (or vice versa).
 
+   FUNCTIONAL PURPOSE IS A HARD BARRIER FOR EVERY CATEGORY — this applies
+   universally, and is especially important for services, software,
+   licenses and other intangibles where the item_level chain is coarse and
+   numeric specs are sparse. Two items are comparable ONLY when they do the
+   SAME job. Determine the functional purpose from item_name + commodity_tag
+   + item_description + the item_level_3..5 chain — NEVER from a single
+   generic shared attribute such as license_term_months, contract duration,
+   warranty period, validity, currency or price band. A shared generic
+   attribute is NEVER sufficient on its own to call two items comparable.
+   When the functional purpose differs, REJECT with rule="PRODUCT_TYPE"
+   (attr = "item_level_3" or "commodity_tag", src = source's function,
+   cand = candidate's function) even if every numeric attribute and the
+   price band match. Examples of items that share a term/duration yet do
+   DIFFERENT jobs and MUST NOT match:
+     - a digital-signature (e-sign) desktop subscription vs a CAD
+       subscription — both 12-month single-user software licenses, but
+       completely different functions → REJECT.
+     - an HVAC AMC vs a security-guarding AMC — both 12-month service
+       contracts → REJECT.
+     - a 1-year forklift lease vs a 1-year software subscription → REJECT.
+
 3. SPEC-TO-PRICE RATIO SANITY.
 
    When the source has at least one critical numeric attribute, compute
@@ -2403,6 +2424,52 @@ marked it merely "important"; mismatch beyond the stated band → REJECT.
    For SERVICES: scope of work (preventive vs breakdown vs overhaul),
             duration / hours, response SLA, AMC vs CMC, parts inclusive.
 
+▸ SOFTWARE AND LICENSING  (software, licenses, subscriptions, SaaS, maintenance — mostly INTANGIBLE)
+   FUNCTIONAL FAMILY IS THE HARD BARRIER, and it is checked BEFORE any
+   numeric, term or price comparison. Software is comparable ONLY to
+   software that performs the SAME function. Read what the software DOES
+   from item_name + commodity_tag + item_description + the item_level_3..5
+   chain — NEVER infer comparability from license term, seat count, currency
+   or price alone. Distinct functional families that MUST NEVER be crossed
+   (non-exhaustive — infer the family for anything not listed):
+     - Digital signature / e-signature / e-sign
+     - CAD (computer-aided design / drafting)
+     - CAM (computer-aided manufacturing)
+     - CAE / simulation / FEA / CFD
+     - PLM / PDM (product / data lifecycle)
+     - ERP / MRP
+     - Office / productivity suite (word processor, spreadsheet, email)
+     - Operating system / OS / server CAL / device CAL
+     - Database / data platform
+     - Antivirus / endpoint security / firewall / VPN
+     - Backup / storage / archival
+     - Video conferencing / collaboration / video hosting
+     - BI / analytics / reporting
+     - Project / PPM / workflow management
+     - Developer tools / IDE / version control
+     - GIS / mapping
+   CROSS-FAMILY = REJECT with rule="PRODUCT_TYPE", attr="item_level_3" (or
+   "commodity_tag"), src = source family, cand = candidate family — even when
+   license_term_months, seats, currency and price band all match. An e-sign
+   desktop subscription is NOT a benchmark for a CAD subscription just
+   because both are 12-month single-user licenses.
+   ONLY AFTER the functional family matches, refine WITHIN that family:
+     LICENSE MODEL (do not cross): subscription / SaaS vs perpetual license
+       vs annual maintenance-only (AMC / support) vs term license. A
+       perpetual license that has no term (license_term_months absent) is
+       NOT comparable to a 12-month subscription — use rule="VARIANT_MISMATCH"
+       or "ABSENCE" per Part A; do not force a numeric match.
+     LOCK-ON: license_term_months — keep the strict critical band (the same
+       ±critical band used elsewhere). A 36 / 49 / 56-month multi-year deal
+       is NOT a 12-month benchmark → CRITICAL_BARRIER. This is the existing
+       time / validity limit and it stays in force.
+     SECONDARY (penalties per Part A rule 4): seat / user count, named vs
+       concurrent, deployment (desktop / server / cloud / on-prem), edition
+       or tier, support level.
+   PRICE INTUITION: normalise to price-per-seat-per-month within the SAME
+   functional family before comparing; raw annual totals across different
+   software functions are meaningless.
+
 ═════════════════════════════════════════════════════════════════════════
 PART C — OUTPUT
 ═════════════════════════════════════════════════════════════════════════
@@ -2478,6 +2545,14 @@ Hard rules for the output:
                                           location_tier + duration_months
        Maintenance Repair and Operation→ scope (services) OR parent_machine
                                           (spares); part_number where present
+       Software / Licensing            → functional family (e-sign / CAD /
+                                          CAM / ERP / office / OS / database /
+                                          security / backup / video / BI /
+                                          dev-tools — see the Software and
+                                          Licensing playbook) is the PRIMARY
+                                          lock-on and a HARD family barrier;
+                                          license_term_months is the numeric
+                                          secondary, not the primary signal
 
      Look in source.critical_attributes for an attribute whose name
      semantically matches one of the lock-on names above. That attribute's
